@@ -43,6 +43,7 @@
   "dependencies": {
     "@roughdraft/rfm": "file:packages/rfm",
     "express": "^5.1.0",
+    "ws": "^8.22.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

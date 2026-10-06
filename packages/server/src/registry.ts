@@ -13,7 +13,19 @@ export interface TabPresence {
   connectedAt: string;
   lastSeenAt: string;
   visible: boolean;
+  /** The tab holds text that has not reached disk. */
+  dirty: boolean;
+  conflict: boolean;
+  /** Content hash the tab's draft is based on. */
+  baseHash: string | null;
 }
+
+export type TabPresenceUpdate = Partial<
+  Pick<TabPresence, "visible" | "dirty" | "conflict" | "baseHash">
+>;
+
+export type RegistryChange = "tabs" | "watchers";
+export type RegistryListener = (key: string, change: RegistryChange) => void;
 
 export interface WatcherPresence {
   watcherId: string;
@@ -25,6 +37,11 @@ export interface WatcherPresence {
 
 export interface DocumentView extends DocumentRecord {
   tabs: number;
+  /**
+   * Tabs that reported unsaved text. Always set by the registry; optional so
+   * views rebuilt from the log file on disk (no presence) still type-check.
+   */
+  tabsDirty?: number;
   watchers: number;
   pendingHandoffs: number;
   url: string;
@@ -33,6 +50,7 @@ export interface DocumentView extends DocumentRecord {
 interface TabEntry extends TabPresence {
   connections: number;
   disconnectedAt: number | null;
+  dropTimer: NodeJS.Timeout | null;
 }
 
 interface Presence {
@@ -53,12 +71,22 @@ export const DOCUMENT_IDLE_MS = 60 * 60 * 1000;
 
 /**
  * The key every lookup uses, so `/tmp/x.md` and `/private/tmp/x.md` meet.
+ * A missing file keys on its real parent directory, so the key does not
+ * change when the file disappears and comes back.
  */
 export function documentKey(absolutePath: string): string {
   try {
     return fs.realpathSync.native(absolutePath);
   } catch {
-    return path.resolve(absolutePath);
+    const resolved = path.resolve(absolutePath);
+    try {
+      return path.join(
+        fs.realpathSync.native(path.dirname(resolved)),
+        path.basename(resolved),
+      );
+    } catch {
+      return resolved;
+    }
   }
 }
 
@@ -92,6 +120,7 @@ export class DocumentRegistry {
   private readonly now: () => number;
   private readonly tabGraceMs: number;
   private readonly documentIdleMs: number;
+  private readonly listeners = new Set<RegistryListener>();
 
   constructor(options: RegistryOptions) {
     this.log = options.log;
@@ -131,14 +160,21 @@ export class DocumentRegistry {
       connectedAt: at,
       lastSeenAt: at,
       visible: tab.visible,
+      dirty: false,
+      conflict: false,
+      baseHash: null,
       connections: 0,
       disconnectedAt: null,
+      dropTimer: null,
     };
     entry.connections += 1;
     entry.disconnectedAt = null;
+    if (entry.dropTimer) clearTimeout(entry.dropTimer);
+    entry.dropTimer = null;
     entry.lastSeenAt = at;
     entry.visible = tab.visible;
     tabs.set(tab.tabId, entry);
+    this.emit(identity.key, "tabs");
 
     let disconnected = false;
     return () => {
@@ -146,9 +182,54 @@ export class DocumentRegistry {
       disconnected = true;
       entry.connections -= 1;
       entry.lastSeenAt = new Date(this.now()).toISOString();
-      if (entry.connections <= 0) entry.disconnectedAt = this.now();
+      if (entry.connections <= 0) {
+        entry.disconnectedAt = this.now();
+        // Dropped after the grace period unless the tab reconnects first.
+        if (entry.dropTimer) clearTimeout(entry.dropTimer);
+        entry.dropTimer = setTimeout(() => {
+          entry.dropTimer = null;
+          if (entry.connections > 0 || tabs.get(entry.tabId) !== entry) return;
+          tabs.delete(entry.tabId);
+          this.emit(identity.key, "tabs");
+        }, this.tabGraceMs);
+        entry.dropTimer.unref?.();
+      }
       this.touch(identity, { keepExistingIdentity: true });
     };
+  }
+
+  /** Presence reported by a tab over its channel. Unknown tabs are ignored. */
+  updateTab(key: string, tabId: string, update: TabPresenceUpdate): boolean {
+    const entry = this.presence.get(key)?.tabs.get(tabId);
+    if (!entry) return false;
+    if (update.visible !== undefined) entry.visible = update.visible;
+    if (update.dirty !== undefined) entry.dirty = update.dirty;
+    if (update.conflict !== undefined) entry.conflict = update.conflict;
+    if (update.baseHash !== undefined) entry.baseHash = update.baseHash;
+    entry.lastSeenAt = new Date(this.now()).toISOString();
+    this.emit(key, "tabs");
+    return true;
+  }
+
+  tabs(key: string): TabPresence[] {
+    return [...(this.presence.get(key)?.tabs.values() ?? [])].map((tab) => ({
+      tabId: tab.tabId,
+      connectedAt: tab.connectedAt,
+      lastSeenAt: tab.lastSeenAt,
+      visible: tab.visible,
+      dirty: tab.dirty,
+      conflict: tab.conflict,
+      baseHash: tab.baseHash,
+    }));
+  }
+
+  tabsDirty(key: string): number {
+    return this.tabs(key).filter((tab) => tab.dirty).length;
+  }
+
+  onChange(listener: RegistryListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   addWatcher(
@@ -163,11 +244,13 @@ export class DocumentRegistry {
       watcherId,
       connectedAt: new Date(this.now()).toISOString(),
     });
+    this.emit(identity.key, "watchers");
     return {
       watcherId,
       remove: () => {
         if (watchers.delete(watcherId)) {
           this.touch(identity, { keepExistingIdentity: true });
+          this.emit(identity.key, "watchers");
         }
       },
     };
@@ -187,6 +270,7 @@ export class DocumentRegistry {
     return {
       ...structuredClone(document),
       tabs: this.tabCount(key),
+      tabsDirty: this.tabsDirty(key),
       watchers: this.watcherCount(key),
       pendingHandoffs: document.handoffs.filter(isUnacknowledged).length,
       url: documentUrl(this.publicBaseUrl, document.documentPath),
@@ -209,6 +293,7 @@ export class DocumentRegistry {
           tab.disconnectedAt !== null &&
           now - tab.disconnectedAt >= this.tabGraceMs
         ) {
+          if (tab.dropTimer) clearTimeout(tab.dropTimer);
           presence.tabs.delete(tabId);
         }
       }
@@ -219,6 +304,14 @@ export class DocumentRegistry {
       if (document.session === null && document.handoffs.length === 0) {
         this.log.remove(document.key);
       }
+    }
+  }
+
+  private emit(key: string, change: RegistryChange): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(key, change);
+      } catch {}
     }
   }
 

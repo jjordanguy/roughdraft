@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -233,6 +234,156 @@ describe("createApp", () => {
       },
     });
     expect(fs.readFileSync(filePath, "utf-8")).toBe("# External\n");
+  });
+
+  describe("markdown-file equality on content", () => {
+    const sha256 = (content: string | Buffer) =>
+      crypto.createHash("sha256").update(content).digest("hex");
+
+    function appFor() {
+      return createApp({ homeDir, staticDirPath: projectDir }).app;
+    }
+
+    function read(app: ReturnType<typeof appFor>, file = "draft.md") {
+      return request(app)
+        .get("/api/markdown-file")
+        .query({ projectPath: projectDir, path: file });
+    }
+
+    function write(
+      app: ReturnType<typeof appFor>,
+      body: Record<string, unknown>,
+      file = "draft.md",
+    ) {
+      return request(app)
+        .put("/api/markdown-file")
+        .query({ projectPath: projectDir, path: file })
+        .send(body);
+    }
+
+    it("PUT accepts a version whose content hash matches after a metadata-only change", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Original\n");
+      const app = appFor();
+      const page = await read(app);
+
+      const later = new Date(Date.now() + 60_000);
+      fs.utimesSync(filePath, later, later);
+
+      const saved = await write(app, {
+        content: "# Saved\n",
+        expectedVersion: page.body.version,
+      });
+
+      expect(saved.status).toBe(200);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("# Saved\n");
+    });
+
+    it("PUT decides on expectedContentHash and answers 409 with contentHash and seq", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Original\n");
+      const app = appFor();
+      const page = await read(app);
+      fs.writeFileSync(filePath, "# Outside\n");
+
+      const stale = await write(app, {
+        content: "# Mine\n",
+        expectedContentHash: page.body.contentHash,
+      });
+
+      expect(stale.status).toBe(409);
+      expect(stale.body).toMatchObject({
+        error: "Markdown file changed on disk",
+        current: {
+          id: "draft",
+          content: "# Outside\n",
+          contentHash: sha256("# Outside\n"),
+          seq: page.body.seq + 1,
+        },
+      });
+
+      const retried = await write(app, {
+        content: "# Mine\n",
+        expectedContentHash: stale.body.current.contentHash,
+        // A stale expectedVersion is ignored when the hash is given.
+        expectedVersion: page.body.version,
+      });
+      expect(retried.status).toBe(200);
+      expect(retried.body).toMatchObject({
+        content: "# Mine\n",
+        contentHash: sha256("# Mine\n"),
+        seq: page.body.seq + 2,
+      });
+    });
+
+    it("GET and PUT agree on the version of a file with an invalid UTF-8 byte (probe F)", async () => {
+      const filePath = path.join(projectDir, "latin1.md");
+      const bytes = Buffer.from([0x23, 0x20, 0x43, 0x61, 0x66, 0xe9, 0x0a]);
+      fs.writeFileSync(filePath, bytes);
+      const app = appFor();
+
+      const page = await read(app, "latin1.md");
+      expect(page.body.contentHash).toBe(sha256(bytes));
+      expect(page.body.version.split(":").at(-1)).toBe(sha256(bytes));
+
+      const saved = await write(
+        app,
+        {
+          content: `${page.body.content}more\n`,
+          expectedVersion: page.body.version,
+        },
+        "latin1.md",
+      );
+
+      expect(saved.status).toBe(200);
+      expect(fs.readFileSync(filePath, "utf8")).toBe("# Caf�\nmore\n");
+    });
+
+    it("an identical-content PUT does not rewrite the file", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      const fixed = new Date("2026-01-01T00:00:00.000Z");
+      fs.writeFileSync(filePath, "# Same\n");
+      fs.utimesSync(filePath, fixed, fixed);
+      const app = appFor();
+      const page = await read(app);
+      const statBefore = fs.statSync(filePath);
+
+      const saved = await write(app, {
+        content: "# Same\n",
+        expectedVersion: page.body.version,
+      });
+
+      expect(saved.status).toBe(200);
+      expect(saved.body).toMatchObject({
+        content: "# Same\n",
+        version: page.body.version,
+        contentHash: page.body.contentHash,
+        seq: page.body.seq,
+      });
+      const statAfter = fs.statSync(filePath);
+      expect(statAfter.mtimeMs).toBe(fixed.getTime());
+      expect(statAfter.ctimeMs).toBe(statBefore.ctimeMs);
+    });
+
+    it("overlapping PUTs with the same base: one lands, the other conflicts (probe H)", async () => {
+      const filePath = path.join(projectDir, "draft.md");
+      fs.writeFileSync(filePath, "# Base\n");
+      const app = appFor();
+      const page = await read(app);
+
+      const [first, second] = await Promise.all([
+        write(app, {
+          content: "# Base\none\n",
+          expectedVersion: page.body.version,
+        }),
+        write(app, {
+          content: "# Base\none\ntwo\n",
+          expectedVersion: page.body.version,
+        }),
+      ]);
+
+      expect([first.status, second.status].sort()).toEqual([200, 409]);
+    });
   });
 
   it("rejects markdown-file reads outside the project directory", async () => {

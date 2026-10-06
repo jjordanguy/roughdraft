@@ -688,7 +688,9 @@ describe("review event routes on a real listener", () => {
       const events = await openStream(
         `${server.url}/api/markdown-file/events?${query({ projectPath: projectDir, path: "draft.md" })}`,
       );
-      await events.waitFor((text) => text.includes("retry:"));
+      // Batch 2: the stream opens with the current state.
+      const initial = await events.next("change");
+      expect(initial.data).toMatchObject({ exists: true, available: true });
 
       fs.writeFileSync(filePath, "# Draft, changed\n");
       fs.chmodSync(filePath, 0o000);
@@ -698,6 +700,16 @@ describe("review event routes on a real listener", () => {
           exists: true,
           version: null,
           available: false,
+        });
+        const status = await getJson(`${server.url}/api/status`);
+        expect(status.status).toBe(200);
+
+        fs.chmodSync(filePath, 0o644);
+        const recovered = await events.next("change", 3_000);
+        expect(recovered.data).toMatchObject({
+          exists: true,
+          available: true,
+          version: expect.stringMatching(/:17:[0-9a-f]{64}$/),
         });
       } finally {
         fs.chmodSync(filePath, 0o644);

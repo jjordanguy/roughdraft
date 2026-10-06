@@ -1,6 +1,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { createServer as createHttpServer } from "node:http";
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+} from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +18,13 @@ import express, {
   type Request,
   type Response,
 } from "express";
+import {
+  type DocumentChange,
+  type DocumentRead,
+  type DocumentState,
+  DocumentWatcher,
+  hashFromVersion,
+} from "./document-watcher.js";
 import {
   type DocumentIdentity,
   type DocumentRecord,
@@ -40,6 +51,7 @@ import {
   type ReviewCompletedEvent,
   ReviewEventQueue,
 } from "./review-events.js";
+import { TabChannel, type TargetResult } from "./tab-channel.js";
 import { resolveUpdateStatus } from "./update-status.js";
 import {
   doneMessage,
@@ -130,11 +142,21 @@ interface CreateAppOptions {
   openRequestAckMs?: number;
   deliveryWaitMs?: number;
   wakeTimeoutMs?: number;
+  /** Document watcher stat poll (default 1 s). */
+  watchPollMs?: number;
+  /** Document watcher rehash while subscribed (default 10 s). */
+  watchRehashMs?: number;
+  /** How long a document watch outlives its last subscriber (default 30 s). */
+  watchReleaseMs?: number;
+  /** Tab channel `ping` interval (default 15 s). */
+  tabPingMs?: number;
 }
 
 interface CreateAppResult {
   app: Express;
   port: number;
+  /** Serves the `/api/tab` WebSocket on an http server running `app`. */
+  attachTabChannel: (server: Server) => void;
 }
 
 interface OpenRequestClient {
@@ -253,18 +275,52 @@ function fileVersionFromContent(
   return `${stats.mtimeMs}:${stats.size}:${contentHash}`;
 }
 
-function fileVersionFromFile(filePath: string): string {
-  const content = fs.readFileSync(filePath);
-  const stats = fs.statSync(filePath);
-  return fileVersionFromContent(stats, content);
+/** The markdown-file page for a watcher read of a readable file. */
+function pageFromRead(
+  relativePath: string,
+  read: DocumentRead,
+  instanceId: string,
+) {
+  const content = read.content ?? "";
+  return {
+    id: pageIdFromRelativePath(relativePath),
+    title: titleFromContent(content, path.basename(relativePath, ".md")),
+    content,
+    version: read.state.version ?? "",
+    contentHash: read.state.contentHash ?? "",
+    seq: read.state.seq,
+    instanceId,
+  };
 }
 
-async function readFileVersion(filePath: string): Promise<string> {
-  const [content, stats] = await Promise.all([
-    fs.promises.readFile(filePath),
-    fs.promises.stat(filePath),
-  ]);
-  return fileVersionFromContent(stats, content);
+/** The fields of a change, shared by the tab channel and the legacy stream. */
+function changeFromState(
+  state: DocumentState,
+  origin: DocumentChange["origin"],
+): DocumentChange {
+  return {
+    seq: state.seq,
+    exists: state.exists,
+    available: state.available,
+    reason: state.reason,
+    version: state.version,
+    contentHash: state.contentHash,
+    origin,
+  };
+}
+
+/**
+ * The content hash a write is based on: `expectedContentHash`, else the hash
+ * segment of `expectedVersion`, else null (no check).
+ */
+function expectedHashFromBody(body: unknown): string | null {
+  const fields = (body ?? {}) as Record<string, unknown>;
+  const explicit = optionalString(fields.expectedContentHash);
+  if (explicit) return explicit.toLowerCase();
+  const version = optionalString(fields.expectedVersion);
+  if (!version) return null;
+  // A version without a hash segment can never match: keep the old 409.
+  return hashFromVersion(version) ?? version;
 }
 
 function normalizeOverallComment(input: unknown): string | undefined {
@@ -512,6 +568,42 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     seed: log.unacknowledgedEvents(),
   });
   const wakeRoutes = new WakeRouteStore({ stateDir: stateDir ?? undefined });
+  const documents = new DocumentWatcher({
+    pollMs: options.watchPollMs,
+    rehashMs: options.watchRehashMs,
+    releaseMs: options.watchReleaseMs,
+  });
+  const tabChannel = new TabChannel({
+    watcher: documents,
+    registry,
+    log,
+    instanceId,
+    latestSequence: () => reviewEvents.latestSequence(),
+    resolveTarget: (url) =>
+      resolveMarkdownTarget(
+        url.searchParams.get("projectPath") ?? "",
+        url.searchParams.get("path") ?? "",
+        { allowMissing: true },
+      ),
+    authorize: (req: IncomingMessage, url: URL) => {
+      if (!apiToken) return true;
+      const header = req.headers.authorization ?? "";
+      const supplied = header.startsWith("Bearer ")
+        ? header.slice("Bearer ".length).trim()
+        : (url.searchParams.get("token") ?? "");
+      return tokenMatches(supplied, apiToken);
+    },
+    acknowledgeOpenRequest: (requestId) => openRequestAcks.get(requestId)?.(),
+    pingMs: options.tabPingMs ?? keepaliveMs,
+  });
+
+  /** Tells the tabs on a document that one of its handoffs changed. */
+  function announceHandoff(handoff: HandoffRecord | null | undefined): void {
+    if (!handoff) return;
+    const found = log.findHandoff({ handoffId: handoff.handoffId });
+    if (found) tabChannel.broadcastHandoff(found.document.key, found.handoff);
+  }
+
   const wakeRunOptions = (): RunWakeOptions => ({
     timeoutMs: options.wakeTimeoutMs,
     fetchImpl,
@@ -574,32 +666,94 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     return resolvedProjectDir;
   }
 
-  function markdownPathFromRequest(
+  interface MarkdownLocation {
+    relativePath: string;
+    absolutePath: string;
+    projectDir: string;
+  }
+
+  type Located =
+    | { ok: true; location: MarkdownLocation }
+    | { ok: false; status: number; error: string };
+
+  /** A `.md` path inside an existing project; the file may be missing when allowed. */
+  function locateMarkdown(
+    projectPath: string,
+    relativePath: string,
+    options: { allowMissing?: boolean } = {},
+  ): Located {
+    if (projectPath.trim().length === 0) {
+      return { ok: false, status: 400, error: "projectPath is required" };
+    }
+    const projectDir = path.resolve(projectPath.trim());
+    if (!isExistingDirectory(projectDir)) {
+      return { ok: false, status: 404, error: "Project directory not found" };
+    }
+    const absolutePath = ensureProjectPath(projectDir, relativePath);
+    if (!absolutePath?.toLowerCase().endsWith(".md")) {
+      return { ok: false, status: 404, error: "Markdown file not found" };
+    }
+    if (!options.allowMissing && !fs.existsSync(absolutePath)) {
+      return { ok: false, status: 404, error: "Markdown file not found" };
+    }
+    return { ok: true, location: { relativePath, absolutePath, projectDir } };
+  }
+
+  function resolveMarkdownTarget(
+    projectPath: string,
+    relativePath: string,
+    options: { allowMissing?: boolean } = {},
+  ): TargetResult {
+    const located = locateMarkdown(projectPath, relativePath, options);
+    if (!located.ok) return located;
+    const { absolutePath, projectDir } = located.location;
+    return {
+      ok: true,
+      target: {
+        absolutePath,
+        identity: identityFor(absolutePath, projectDir, relativePath),
+      },
+    };
+  }
+
+  function markdownTargetFromRequest(
     req: Request,
     res: Response,
-  ): { relativePath: string; absolutePath: string; projectDir: string } | null {
-    const projectDir = projectDirFromRequest(req, res);
-    if (!projectDir) return null;
-
+    options: { allowMissing?: boolean } = {},
+  ): MarkdownLocation | null {
     const relativePath =
       typeof req.query.path === "string"
         ? req.query.path
         : typeof req.body?.path === "string"
           ? req.body.path
           : "";
-    const absolutePath = ensureProjectPath(projectDir, relativePath);
-
-    if (!absolutePath?.toLowerCase().endsWith(".md")) {
-      res.status(404).json({ error: "Markdown file not found" });
+    const located = locateMarkdown(
+      requestedProjectPath(req) ?? "",
+      relativePath,
+      options,
+    );
+    if (!located.ok) {
+      res.status(located.status).json({ error: located.error });
       return null;
     }
+    return located.location;
+  }
 
-    if (!fs.existsSync(absolutePath)) {
-      res.status(404).json({ error: "Markdown file not found" });
-      return null;
-    }
+  function markdownPathFromRequest(
+    req: Request,
+    res: Response,
+  ): MarkdownLocation | null {
+    return markdownTargetFromRequest(req, res);
+  }
 
-    return { relativePath, absolutePath, projectDir };
+  function unavailableBody(state: DocumentState) {
+    return {
+      error: "Markdown file could not be read",
+      exists: state.exists,
+      available: false,
+      reason: state.reason,
+      instanceId,
+    };
   }
 
   type MarkdownTarget = NonNullable<ReturnType<typeof markdownPathFromRequest>>;
@@ -632,6 +786,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     for (const event of events) {
       const handoff = log.markDelivered(event.sequence, watcherId);
       if (handoff && ackedBy) log.acknowledge(handoff, ackedBy);
+      announceHandoff(handoff);
     }
   }
 
@@ -715,6 +870,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         at: at(),
         error: `No wake route for ${session.harness}`,
       });
+      announceHandoff(handoff);
       return;
     }
     const outcome = await runWakeRoute(
@@ -748,6 +904,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       at: at(),
       error: outcome.error,
     });
+    announceHandoff(handoff);
     wakeRoutes.recordOutcome(route.harness, outcome);
   }
 
@@ -798,104 +955,105 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.json({ id, title: titleFromContent(content, id), content });
   });
 
-  app.get("/api/markdown-file", (req, res) => {
-    const projectDir = projectDirFromRequest(req, res);
-    if (!projectDir) return;
+  app.get("/api/markdown-file", async (req, res) => {
+    const target = markdownTargetFromRequest(req, res);
+    if (!target) return;
 
-    const relativePath =
-      typeof req.query.path === "string" ? req.query.path : "";
-    const absolutePath = ensureProjectPath(projectDir, relativePath);
-
-    if (!absolutePath?.toLowerCase().endsWith(".md")) {
+    const read = await documents.read(target.absolutePath);
+    if (!read.state.exists) {
       res.status(404).json({ error: "Markdown file not found" });
       return;
     }
-
-    if (!fs.existsSync(absolutePath)) {
-      res.status(404).json({ error: "Markdown file not found" });
+    if (!read.state.available) {
+      res.status(503).json(unavailableBody(read.state));
       return;
     }
-
-    const page = markdownPageFromFile(relativePath, absolutePath);
-    registry.recordVersion(
-      identityFor(absolutePath, projectDir, relativePath),
-      page.version,
-    );
-    res.json(page);
+    registry.recordVersion(targetIdentity(target), read.state.version);
+    res.json(pageFromRead(target.relativePath, read, instanceId));
   });
 
-  app.get("/api/markdown-file/events", (req, res) => {
-    const projectDir = projectDirFromRequest(req, res);
-    if (!projectDir) return;
+  app.get("/api/markdown-file/state", async (req, res) => {
+    const target = markdownTargetFromRequest(req, res, { allowMissing: true });
+    if (!target) return;
 
-    const relativePath =
-      typeof req.query.path === "string" ? req.query.path : "";
-    const absolutePath = ensureProjectPath(projectDir, relativePath);
-
-    if (!absolutePath?.toLowerCase().endsWith(".md")) {
-      res.status(404).json({ error: "Markdown file not found" });
-      return;
-    }
-
-    if (!fs.existsSync(absolutePath)) {
-      res.status(404).json({ error: "Markdown file not found" });
-      return;
-    }
-
-    startEventStream(res, 1000);
-    const identity = identityFor(absolutePath, projectDir, relativePath);
-
-    const sendChange = async (stats: fs.Stats) => {
-      const exists = stats.nlink > 0;
-      let version: string | null = null;
-      let available = true;
-      if (exists) {
-        try {
-          version = await readFileVersion(absolutePath);
-        } catch {
-          available = false;
-        }
-      }
-      if (available) registry.recordVersion(identity, version);
-      if (!isOpen(res)) return;
-      writeSseEvent(res, "change", {
-        path: relativePath,
-        exists,
-        version,
-        available,
-      });
-    };
-
-    const listener = (current: fs.Stats, previous: fs.Stats) => {
-      if (
-        current.mtimeMs === previous.mtimeMs &&
-        current.size === previous.size &&
-        current.nlink === previous.nlink
-      ) {
-        return;
-      }
-
-      void sendChange(current);
-    };
-
-    fs.watchFile(absolutePath, { interval: 500 }, listener);
-
-    res.on("close", () => {
-      fs.unwatchFile(absolutePath, listener);
+    const state = await documents.refresh(target.absolutePath);
+    const key = targetIdentity(target).key;
+    res.json({
+      exists: state.exists,
+      available: state.available,
+      reason: state.reason,
+      version: state.version,
+      contentHash: state.contentHash,
+      seq: state.seq,
+      instanceId,
+      tabs: registry.tabCount(key),
+      tabsDirty: registry.tabsDirty(key),
     });
   });
 
-  app.get("/api/review-index", (req, res) => {
+  // Legacy stream, kept for one release. The fork's app uses /api/tab.
+  app.get("/api/markdown-file/events", async (req, res) => {
+    const target = markdownTargetFromRequest(req, res, { allowMissing: true });
+    if (!target) return;
+
+    startEventStream(res, 1000);
+    const identity = targetIdentity(target);
+    const send = (change: DocumentChange) => {
+      if (change.available && change.exists) {
+        registry.recordVersion(identity, change.version);
+      }
+      if (!isOpen(res)) return;
+      writeSseEvent(
+        res,
+        "change",
+        { path: target.relativePath, ...change, instanceId },
+        change.seq,
+      );
+    };
+
+    let closed = false;
+    let unsubscribe: (() => void) | null = null;
+    const ping = setInterval(() => {
+      if (!isOpen(res)) return;
+      writeSseEvent(res, "ping", {
+        seq: documents.current(target.absolutePath)?.seq ?? 0,
+      });
+    }, keepaliveMs);
+    res.on("close", () => {
+      closed = true;
+      clearInterval(ping);
+      unsubscribe?.();
+    });
+
+    const opened = await documents.open(target.absolutePath, send);
+    unsubscribe = opened.unsubscribe;
+    if (closed) {
+      unsubscribe();
+      return;
+    }
+    send(changeFromState(opened.state, "unknown"));
+    opened.start();
+  });
+
+  app.get("/api/review-index", async (req, res) => {
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
 
-    const markdown = fs.readFileSync(target.absolutePath, "utf-8");
+    const read = await documents.read(target.absolutePath);
+    if (!read.state.exists) {
+      res.status(404).json({ error: "Markdown file not found" });
+      return;
+    }
+    if (!read.state.available) {
+      res.status(503).json(unavailableBody(read.state));
+      return;
+    }
     res.json({
       documentPath: target.absolutePath,
       projectPath: target.projectDir,
       relativePath: target.relativePath,
-      fileVersion: fileVersionFromFile(target.absolutePath),
-      ...extractRoughdraftReviewIndex(markdown),
+      fileVersion: read.state.version,
+      ...extractRoughdraftReviewIndex(read.content ?? ""),
     });
   });
 
@@ -937,20 +1095,47 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    const markdown = fs.readFileSync(target.absolutePath, "utf-8");
-    const persistedMarkdown = overallComment
-      ? appendRoughdraftDocumentComment(markdown, {
-          message: overallComment,
-          author: "user",
-        })
-      : markdown;
-    if (persistedMarkdown !== markdown) {
-      fs.writeFileSync(target.absolutePath, persistedMarkdown);
+    // Optional: a tab that sends its base turns a Done on a file that moved
+    // under it into a 409 instead of handing off text it has not seen.
+    const expectedHash = expectedHashFromBody(req.body);
+    const written = overallComment
+      ? await documents.mutate(
+          target.absolutePath,
+          (markdown) =>
+            appendRoughdraftDocumentComment(markdown, {
+              message: overallComment,
+              author: "user",
+            }),
+          { expectedHash, tabId: optionalString(req.body?.tabId) },
+        )
+      : null;
+    const read = written?.read ?? (await documents.read(target.absolutePath));
+    if (!read.state.exists) {
+      res.status(404).json({ error: "Markdown file not found" });
+      return;
     }
+    if (!read.state.available) {
+      res.status(503).json(unavailableBody(read.state));
+      return;
+    }
+    if (
+      written?.status === "conflict" ||
+      (!written &&
+        expectedHash !== null &&
+        expectedHash !== read.state.contentHash)
+    ) {
+      res.status(409).json({
+        error: "Markdown file changed on disk",
+        current: pageFromRead(target.relativePath, read, instanceId),
+      });
+      return;
+    }
+    const persistedMarkdown = read.content ?? "";
 
     const identity = targetIdentity(target);
     const index = extractRoughdraftReviewIndex(persistedMarkdown);
-    const version = fileVersionFromFile(target.absolutePath);
+    const version = read.state.version ?? "";
+    const superseded = log.unacknowledged(identity.key);
     const handoff = log.recordHandoff(identity, {
       handoffId: suppliedHandoffId ?? crypto.randomUUID(),
       version,
@@ -958,6 +1143,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       overallComment: overallComment ?? null,
       wakeRouteId: wakeRouteIdFor(log.get(identity.key)?.session),
     });
+    for (const older of superseded) announceHandoff(older);
+    announceHandoff(handoff);
     const result = reviewEvents.emit(
       {
         documentPath: target.absolutePath,
@@ -1108,6 +1295,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
           { ...event, handoff },
           event.sequence,
         );
+        announceHandoff(handoff);
       }
       return true;
     };
@@ -1174,6 +1362,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       found.handoff,
       optionalString(req.body?.by),
     );
+    announceHandoff(handoff);
     res.json({ ok: true, handoff });
   });
 
@@ -1190,8 +1379,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       watching: watcherCount > 0,
       watcherCount,
       tabs: registry.tabCount(key),
+      tabsDirty: registry.tabsDirty(key),
       handoff: log.latestHandoff(key),
       session: log.get(key)?.session ?? null,
+      latestSequence: reviewEvents.latestSequence(),
       instanceId,
     });
   });
@@ -1260,44 +1451,38 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.json({ id, title: titleFromContent(content, id), content });
   });
 
-  app.put("/api/markdown-file", (req, res) => {
-    const projectDir = projectDirFromRequest(req, res);
-    if (!projectDir) return;
+  app.put("/api/markdown-file", async (req, res) => {
+    const target = markdownTargetFromRequest(req, res);
+    if (!target) return;
 
-    const relativePath =
-      typeof req.query.path === "string" ? req.query.path : "";
-    const absolutePath = ensureProjectPath(projectDir, relativePath);
+    const content = (req.body as { content?: unknown } | undefined)?.content;
+    if (typeof content !== "string") {
+      res.status(400).json({ error: "content must be a string" });
+      return;
+    }
 
-    if (!absolutePath?.toLowerCase().endsWith(".md")) {
+    // Equality is decided on the content hash, never on file metadata.
+    const result = await documents.write(target.absolutePath, content, {
+      expectedHash: expectedHashFromBody(req.body),
+      tabId: optionalString(req.body?.tabId),
+    });
+    const { read } = result;
+    if (result.status === "missing") {
       res.status(404).json({ error: "Markdown file not found" });
       return;
     }
-
-    if (!fs.existsSync(absolutePath)) {
-      res.status(404).json({ error: "Markdown file not found" });
+    if (result.status === "unavailable") {
+      res.status(503).json(unavailableBody(read.state));
       return;
     }
-
-    const { content, expectedVersion } = req.body as {
-      content: string;
-      expectedVersion?: string;
-    };
-    const currentVersion = fileVersionFromFile(absolutePath);
-
-    if (expectedVersion && expectedVersion !== currentVersion) {
-      res.status(409).json({
-        error: "Markdown file changed on disk",
-        current: markdownPageFromFile(relativePath, absolutePath),
-      });
+    const page = pageFromRead(target.relativePath, read, instanceId);
+    if (result.status === "conflict") {
+      res
+        .status(409)
+        .json({ error: "Markdown file changed on disk", current: page });
       return;
     }
-
-    fs.writeFileSync(absolutePath, content);
-    const page = markdownPageFromFile(relativePath, absolutePath);
-    registry.recordVersion(
-      identityFor(absolutePath, projectDir, relativePath),
-      page.version,
-    );
+    registry.recordVersion(targetIdentity(target), read.state.version);
     res.json(page);
   });
 
@@ -1425,21 +1610,27 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const clients = [...openRequestClients].filter(
       (client) => client.key === key && isOpen(client.response),
     );
-    const tabs = new Set(clients.map((client) => client.tabId)).size;
-    const matchingClient = clients.at(-1);
+    const tabs = new Set([
+      ...tabChannel.tabIds(key),
+      ...clients.map((client) => client.tabId),
+    ]).size;
 
-    if (!matchingClient) {
+    // A tab on the WebSocket channel first, then a legacy SSE client.
+    const requestId = crypto.randomUUID();
+    const acknowledged = waitForOpenRequestAck(requestId);
+    const request = { path: targetPath, url: targetUrl, requestId };
+    let delivered = tabChannel.sendOpenRequest(key, request);
+    const matchingClient = clients.at(-1);
+    if (!delivered && matchingClient) {
+      writeSseEvent(matchingClient.response, "open-request", request);
+      delivered = true;
+    }
+    if (!delivered) {
+      openRequestAcks.get(requestId)?.();
+      await acknowledged;
       res.json({ delivered: false, acknowledged: false, tabs });
       return;
     }
-
-    const requestId = crypto.randomUUID();
-    const acknowledged = waitForOpenRequestAck(requestId);
-    writeSseEvent(matchingClient.response, "open-request", {
-      path: targetPath,
-      url: targetUrl,
-      requestId,
-    });
     res.json({ delivered: true, acknowledged: await acknowledged, tabs });
   });
 
@@ -1598,7 +1789,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.sendFile(path.join(staticDirPath, "index.html"));
   });
 
-  return { app, port };
+  return {
+    app,
+    port,
+    attachTabChannel: (server: Server) => tabChannel.attach(server),
+  };
 }
 
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";
@@ -1635,7 +1830,7 @@ export async function createServer(
     );
   }
 
-  const { app } = createApp({
+  const { app, attachTabChannel } = createApp({
     port,
     projectDir,
     stateDir,
@@ -1648,6 +1843,7 @@ export async function createServer(
       (host) =>
         new Promise<void>((resolve, reject) => {
           const server = createHttpServer(app);
+          attachTabChannel(server);
 
           server.once("error", (error: NodeJS.ErrnoException) => {
             if (

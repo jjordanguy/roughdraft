@@ -87,35 +87,39 @@ describe("getReviewHandoffView", () => {
       expected: { kind: "ready-listening", buttonDisabled: false },
     },
     {
-      row: "blocked by a save conflict",
-      given: input({ watcherCount: 1, diskState: "conflict" }),
+      row: "blocked by one overlap with disk",
+      given: input({
+        watcherCount: 1,
+        diskState: "conflict",
+        conflictCount: 1,
+      }),
       expected: {
         kind: "blocked",
-        buttonLabel: "Approve",
+        buttonLabel: "Resolve 1 overlap first",
         buttonDisabled: true,
         triggerDisabled: true,
         dimmed: true,
-        blockedReason: "Save conflict. Resolve it before you finish.",
+        blockedReason:
+          "Resolve 1 overlap first: your edit overlaps a change on disk.",
       },
     },
     {
-      row: "blocked by a file changed on disk",
-      given: input({ diskState: "changed" }),
+      row: "blocked by several overlaps with disk",
+      given: input({ diskState: "conflict", conflictCount: 3 }),
+      expected: {
+        kind: "blocked",
+        buttonLabel: "Resolve 3 overlaps first",
+        buttonDisabled: true,
+      },
+    },
+    {
+      row: "blocked while the file is unavailable",
+      given: input({ diskState: "unavailable" }),
       expected: {
         kind: "blocked",
         buttonDisabled: true,
         blockedReason:
-          "This file changed on disk. Reload or overwrite it before you finish.",
-      },
-    },
-    {
-      row: "blocked while autosave is paused",
-      given: input({ diskState: "paused" }),
-      expected: {
-        kind: "blocked",
-        buttonDisabled: true,
-        blockedReason:
-          "Autosave is paused. Reload or overwrite the file before you finish.",
+          "The file is not available on disk. Roughdraft can finish when it is back.",
       },
     },
     {

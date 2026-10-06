@@ -7,9 +7,8 @@ import type {
 
 export type DiskChangeState =
   | "clean"
-  | "changed"
+  // The draft overlaps a change on disk; the banner lists the overlaps.
   | "conflict"
-  | "paused"
   // The file is missing or unreadable; edits wait in the tab.
   | "unavailable";
 
@@ -39,6 +38,8 @@ export interface ReviewHandoffViewInput {
   enabled: boolean;
   watcherCount: number;
   diskState: DiskChangeState;
+  // Open overlaps in the conflict banner (diskState "conflict").
+  conflictCount?: number;
   saveState: DocumentSaveState;
   phase: ReviewHandoffPhase;
   errorKind?: ReviewHandoffErrorKind | null;
@@ -82,21 +83,22 @@ function formatHandoffTime(iso: string): string {
   return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
+export function resolveOverlapsLabel(count: number): string {
+  const overlaps = Math.max(1, count);
+  return `Resolve ${overlaps} ${overlaps === 1 ? "overlap" : "overlaps"} first`;
+}
+
 function getReviewHandoffBlockedReason({
   diskState,
+  conflictCount,
   saveState,
 }: {
   diskState: DiskChangeState;
+  conflictCount?: number;
   saveState: DocumentSaveState;
 }): string | null {
   if (diskState === "conflict") {
-    return "Save conflict. Resolve it before you finish.";
-  }
-  if (diskState === "changed") {
-    return "This file changed on disk. Reload or overwrite it before you finish.";
-  }
-  if (diskState === "paused") {
-    return "Autosave is paused. Reload or overwrite the file before you finish.";
+    return `${resolveOverlapsLabel(conflictCount ?? 1)}: your edit overlaps a change on disk.`;
   }
   if (diskState === "unavailable") {
     return "The file is not available on disk. Roughdraft can finish when it is back.";
@@ -127,7 +129,7 @@ function describeWake(
 
 function handoffErrorBody(kind: ReviewHandoffErrorKind | null): string {
   if (kind === "file-changed") {
-    return "The file changed on disk before Roughdraft could record your Done. Reload or overwrite it, then retry.";
+    return "Your edit overlaps a change on disk, so Roughdraft did not record your Done. Choose a version for each overlap, then retry.";
   }
   if (kind === "no-answer") {
     return "The Roughdraft server did not answer, so your Done was not recorded. Retry when it is back.";
@@ -252,6 +254,10 @@ export function getReviewHandoffView(
     return {
       ...base,
       kind: "blocked",
+      buttonLabel:
+        input.diskState === "conflict"
+          ? resolveOverlapsLabel(input.conflictCount ?? 1)
+          : base.buttonLabel,
       buttonDisabled: true,
       blockedReason,
     };

@@ -1,9 +1,10 @@
 import type { JSONContent } from "@tiptap/core";
 import type {
+  Fragment,
   Mark as ProseMirrorMark,
   Node as ProseMirrorNode,
 } from "@tiptap/pm/model";
-import { TextSelection } from "@tiptap/pm/state";
+import { TextSelection, type Transaction } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import { AlertTriangle, Info, RefreshCcw } from "lucide-react";
@@ -26,9 +27,9 @@ import {
   createCriticChange,
   createCriticComment,
   criticMarkdownHasReviewRail,
-  findReviewDelimiter,
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
+  findReviewDelimiter,
   getCommentDescendantIds,
   getReviewBlockError,
   getReviewFormat,
@@ -124,9 +125,19 @@ interface PageCardProps {
   onReviewControllerChange?: (
     controller: DocumentReviewController | null,
   ) => void;
+  // "show me" on the Updated from disk notice: bring the last change that
+  // came from disk into view (and select the thread it touched).
+  revealRequest?: RevealChangeRequest | null;
+}
+
+export interface RevealChangeRequest {
+  key: number;
+  epoch: number;
+  commentId: string | null;
 }
 
 interface GlobalCommentProps {
+  revealRequest?: RevealChangeRequest | null;
   globalCommentRequest?: number | null;
   onGlobalCommentRequestHandled?: () => void;
   onReviewControllerChange?: (
@@ -186,6 +197,7 @@ interface CodeEditorSurfaceProps {
   layout: "default" | "embedded-demo";
   onMarkdownChange: (markdown: string) => void;
   externalApplyRef?: RefObject<ExternalContentApplier | null>;
+  revealRequest?: RevealChangeRequest | null;
 }
 
 export interface DraftSuggestionState {
@@ -194,6 +206,159 @@ export interface DraftSuggestionState {
   to: number;
   sourceText: string;
   text: string;
+}
+
+// The smallest replacement that turns `liveContent` (starting at `liveStart`
+// in the transaction's document) into `nextContent` (starting at
+// `nextStart` in `next`), from Fragment.findDiffStart and findDiffEnd.
+function replaceMinimal(
+  tr: Transaction,
+  liveStart: number,
+  liveContent: Fragment,
+  next: ProseMirrorNode,
+  nextStart: number,
+  nextContent: Fragment,
+): { from: number; to: number } | null {
+  const start = liveContent.findDiffStart(nextContent);
+  if (start === null || start === undefined) return null;
+  const end = liveContent.findDiffEnd(nextContent);
+  let endA = end?.a ?? liveContent.size;
+  let endB = end?.b ?? nextContent.size;
+  const overlap = start - Math.min(endA, endB);
+  if (overlap > 0) {
+    endA += overlap;
+    endB += overlap;
+  }
+  tr.replace(
+    liveStart + start,
+    liveStart + endA,
+    next.slice(nextStart + start, nextStart + endB),
+  );
+  // Where the new text sits, in the document after this step.
+  return { from: liveStart + start, to: liveStart + endB };
+}
+
+function childPositions(node: ProseMirrorNode): number[] {
+  const positions: number[] = [];
+  let position = 0;
+  node.forEach((child) => {
+    positions.push(position);
+    position += child.nodeSize;
+  });
+  positions.push(position);
+  return positions;
+}
+
+// Applies a document from disk to the live editor (`tr` on `live`) one
+// block at a time: only blocks that differ between what the editor's
+// markdown said before (`previous`) and `next` are touched, each with the
+// smallest replacement inside it. A caret in an untouched block stays put,
+// and whatever that block holds beyond its markdown (a trailing space just
+// typed) stays too. Returns the changed range in the new document.
+function replaceChangedBlocks(
+  tr: Transaction,
+  live: ProseMirrorNode,
+  previous: ProseMirrorNode | null,
+  next: ProseMirrorNode,
+): { from: number; to: number } | null {
+  // The editor keeps an empty paragraph after a closing list or table that
+  // the markdown does not have; it is not part of the comparison.
+  let liveCount = live.childCount;
+  while (
+    previous &&
+    liveCount > previous.childCount &&
+    live.child(liveCount - 1).type.name === "paragraph" &&
+    live.child(liveCount - 1).content.size === 0
+  ) {
+    liveCount -= 1;
+  }
+  if (!previous || previous.childCount !== liveCount) {
+    return replaceMinimal(tr, 0, live.content, next, 0, next.content);
+  }
+
+  const previousCount = previous.childCount;
+  const nextCount = next.childCount;
+  let head = 0;
+  while (
+    head < previousCount &&
+    head < nextCount &&
+    previous.child(head).eq(next.child(head))
+  ) {
+    head += 1;
+  }
+  let tail = 0;
+  while (
+    tail < previousCount - head &&
+    tail < nextCount - head &&
+    previous
+      .child(previousCount - 1 - tail)
+      .eq(next.child(nextCount - 1 - tail))
+  ) {
+    tail += 1;
+  }
+  if (head === previousCount && head === nextCount) return null;
+
+  const livePositions = childPositions(live);
+  const nextPositions = childPositions(next);
+  const liveAt = (index: number) => livePositions[index] ?? live.content.size;
+  const nextAt = (index: number) => nextPositions[index] ?? next.content.size;
+  let firstChanged: number | null = null;
+  let lastChangedEnd: number | null = null;
+
+  if (previousCount - tail - head === nextCount - tail - head) {
+    // Same blocks, some edited: each one on its own, last first so the
+    // earlier positions stay valid.
+    for (let index = previousCount - tail - 1; index >= head; index -= 1) {
+      if (previous.child(index).eq(next.child(index))) continue;
+      const liveBlock = live.child(index);
+      const nextBlock = next.child(index);
+      const livePos = liveAt(index);
+      if (
+        !liveBlock.sameMarkup(nextBlock) ||
+        liveBlock.isLeaf ||
+        nextBlock.isLeaf
+      ) {
+        tr.replaceWith(livePos, livePos + liveBlock.nodeSize, nextBlock);
+      } else if (
+        !replaceMinimal(
+          tr,
+          livePos + 1,
+          liveBlock.content,
+          next,
+          nextAt(index) + 1,
+          nextBlock.content,
+        )
+      ) {
+        continue;
+      }
+      firstChanged = livePos;
+      lastChangedEnd ??= livePos + liveBlock.nodeSize;
+    }
+  } else {
+    // Blocks added or removed: one replacement over the changed run.
+    const liveFrom = liveAt(head);
+    const liveTo = liveAt(previousCount - tail);
+    const nextFrom = nextAt(head);
+    const nextTo = nextAt(nextCount - tail);
+    if (
+      replaceMinimal(
+        tr,
+        liveFrom,
+        live.slice(liveFrom, liveTo).content,
+        next,
+        nextFrom,
+        next.slice(nextFrom, nextTo).content,
+      )
+    ) {
+      firstChanged = liveFrom;
+      lastChangedEnd = liveTo;
+    }
+  }
+  if (firstChanged === null || lastChangedEnd === null) return null;
+  return {
+    from: tr.mapping.map(firstChanged, 1),
+    to: tr.mapping.map(lastChangedEnd, -1),
+  };
 }
 
 function areCommentIdListsEqual(
@@ -790,8 +955,14 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   globalCommentRequest = null,
   onGlobalCommentRequestHandled,
   onReviewControllerChange,
+  revealRequest = null,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
+  // Where the last change from disk landed in the document (positions in
+  // the document after it), for "show me".
+  const lastExternalRangeRef = useRef<{ from: number; to: number } | null>(
+    null,
+  );
   const criticChangeFrameRef = useRef<number | null>(null);
   const interactionModeRef = useRef<DocumentInteractionMode>(interactionMode);
   const commentsRef = useRef<Map<string, CriticComment>>(new Map());
@@ -866,6 +1037,12 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     );
   }, [comments, criticChanges.length, onCommentRailPresenceChange]);
 
+  // The markdown the editor's document last stood for (loaded, emitted or
+  // applied from disk). A change from disk is compared with it block by
+  // block, so blocks it does not touch stay exactly as they are in the
+  // editor (a trailing space just typed, which the markdown drops, stays).
+  const editorMarkdownRef = useRef(sourceMarkdown);
+
   const emitMarkdownChange = useCallback(
     (doc?: JSONContent, nextComments?: Map<string, CriticComment>) => {
       const currentEditor = editorRef.current;
@@ -876,13 +1053,13 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       // serializer does not run on such a document.
       if (sourceRef.current.reviewError) return;
 
-      onMarkdownChange(
-        editorStateToCriticMarkdown(
-          currentDoc,
-          nextComments ?? commentsRef.current,
-          sourceRef.current,
-        ),
+      const markdown = editorStateToCriticMarkdown(
+        currentDoc,
+        nextComments ?? commentsRef.current,
+        sourceRef.current,
       );
+      editorMarkdownRef.current = markdown;
+      onMarkdownChange(markdown);
     },
     [onMarkdownChange],
   );
@@ -1529,9 +1706,10 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       .run();
   }, [editor, restoreSelection]);
 
-  // New markdown from disk, applied as one transaction that replaces only
-  // the range that differs, so the selection maps through and focus stays.
-  // (Batch 5 replaces this with full transaction mapping and merging.)
+  // New markdown from disk (a fast-forward, or the draft merged onto a disk
+  // change), applied as one transaction that replaces only the range that
+  // differs (`findDiffStart` and `findDiffEnd`), so the editor instance
+  // stays, the selection maps through and focus stays.
   const applyExternalMarkdown = useCallback(
     (nextMarkdown: string): boolean => {
       const currentEditor = editorRef.current;
@@ -1549,28 +1727,38 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         return false;
       }
 
+      let previousDoc: ProseMirrorNode | null = null;
+      try {
+        previousDoc = currentEditor.schema.nodeFromJSON(
+          criticMarkdownToEditorState(editorMarkdownRef.current, {
+            resolveFileUrl,
+            resolveLinkUrl,
+          }).doc,
+        );
+      } catch {
+        previousDoc = null;
+      }
+
       sourceRef.current = documentSourceOf(parsed);
       reservedIdsByEditor.set(currentEditor, parsed.reservedIds);
       commentsRef.current = parsed.comments;
       setComments(parsed.comments);
+      editorMarkdownRef.current = nextMarkdown;
 
       const { state, view } = currentEditor;
-      const start = state.doc.content.findDiffStart(nextDoc.content);
-      if (start !== null && start !== undefined) {
-        const end = state.doc.content.findDiffEnd(nextDoc.content);
-        let endA = end?.a ?? state.doc.content.size;
-        let endB = end?.b ?? nextDoc.content.size;
-        const overlap = start - Math.min(endA, endB);
-        if (overlap > 0) {
-          endA += overlap;
-          endB += overlap;
-        }
-        const transaction = state.tr
-          .replace(start, endA, nextDoc.slice(start, endB))
-          .setMeta("addToHistory", false);
+      const transaction = state.tr;
+      const changed = replaceChangedBlocks(
+        transaction,
+        state.doc,
+        previousDoc,
+        nextDoc,
+      );
+      if (changed) {
+        transaction.setMeta("addToHistory", false);
         suppressNextMarkdownUpdateRef.current = true;
         view.dispatch(transaction);
         suppressNextMarkdownUpdateRef.current = false;
+        lastExternalRangeRef.current = changed;
       }
       refreshCriticChanges();
       return true;
@@ -1587,6 +1775,82 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       }
     };
   }, [applyExternalMarkdown, externalApplyRef]);
+
+  // "show me": select the thread the change touched, and bring the changed
+  // text into view with a short highlight. The caret stays where it is.
+  // Keep the last change from disk pointing at the same text while typing
+  // goes on before and around it.
+  useEffect(() => {
+    if (!editor) return;
+    const mapRange = ({ transaction }: { transaction: Transaction }) => {
+      const range = lastExternalRangeRef.current;
+      if (!range || !transaction.docChanged) return;
+      lastExternalRangeRef.current = {
+        from: transaction.mapping.map(range.from, 1),
+        to: transaction.mapping.map(range.to, -1),
+      };
+    };
+    editor.on("transaction", mapRange);
+    return () => {
+      editor.off("transaction", mapRange);
+    };
+  }, [editor]);
+
+  const handledRevealKeyRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!editor || !revealRequest) return;
+    if (handledRevealKeyRef.current === revealRequest.key) return;
+    handledRevealKeyRef.current = revealRequest.key;
+
+    const commentId = revealRequest.commentId;
+    const comment = commentId ? commentsRef.current.get(commentId) : null;
+    const threadId = comment?.parentCommentId ?? commentId;
+    if (threadId && commentsRef.current.has(threadId)) {
+      setSelectedCommentId(threadId);
+    }
+
+    const range = lastExternalRangeRef.current;
+    if (!range) return;
+    const size = editor.state.doc.content.size;
+    const position = Math.max(0, Math.min(range.from, size));
+    // The changed range starts at a block boundary: the block's own element,
+    // else the element inside it.
+    let element: HTMLElement | null = null;
+    try {
+      const nodeElement = editor.view.nodeDOM(position);
+      if (nodeElement instanceof HTMLElement) {
+        element = nodeElement;
+      } else {
+        const { node } = editor.view.domAtPos(Math.min(position + 1, size));
+        element =
+          node instanceof HTMLElement ? node : (node.parentElement ?? null);
+      }
+    } catch {
+      element = null;
+    }
+    const block =
+      element?.closest<HTMLElement>(
+        "p, li, h1, h2, h3, h4, h5, h6, blockquote, pre, td, th",
+      ) ?? element;
+    if (
+      !block ||
+      block === editor.view.dom ||
+      !editor.view.dom.contains(block)
+    ) {
+      return;
+    }
+    block.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    // A short wash over the block. An animation, not a class: ProseMirror
+    // redraws attributes it did not set.
+    block.animate?.(
+      [
+        { backgroundColor: "rgb(224 242 254 / 0.9)", borderRadius: "4px" },
+        { backgroundColor: "rgb(224 242 254 / 0.9)", offset: 0.3 },
+        { backgroundColor: "transparent" },
+      ],
+      { duration: 2_000, easing: "ease-out" },
+    );
+  }, [editor, revealRequest]);
 
   useEffect(() => {
     if (selectedCommentId && !comments.has(selectedCommentId)) {
@@ -2573,6 +2837,7 @@ const CodeEditorSurface = memo(function CodeEditorSurface({
   layout,
   onMarkdownChange,
   externalApplyRef,
+  revealRequest = null,
   notice = null,
 }: CodeEditorSurfaceProps) {
   const documentShellClass = cn(
@@ -2622,6 +2887,7 @@ const CodeEditorSurface = memo(function CodeEditorSurface({
                 readOnly={interactionMode === "viewing"}
                 autoFocus
                 externalApplyRef={externalApplyRef}
+                revealRequest={revealRequest}
               />
             </div>
           </div>
@@ -2660,6 +2926,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   globalCommentRequest = null,
   onGlobalCommentRequestHandled,
   onReviewControllerChange,
+  revealRequest = null,
 }: PageCardEditorSurfaceProps) {
   const initialContent = sync ? sync.draft : page.content;
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -3023,6 +3290,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
         layout={layout}
         onMarkdownChange={handleMarkdownChange}
         externalApplyRef={codeApplyRef}
+        revealRequest={revealRequest}
       />
     );
   }
@@ -3055,6 +3323,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       globalCommentRequest={globalCommentRequest}
       onGlobalCommentRequestHandled={onGlobalCommentRequestHandled}
       onReviewControllerChange={onReviewControllerChange}
+      revealRequest={revealRequest}
     />
   );
 });
@@ -3150,6 +3419,7 @@ export function PageCard({
   globalCommentRequest,
   onGlobalCommentRequestHandled,
   onReviewControllerChange,
+  revealRequest,
 }: PageCardProps) {
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
 
@@ -3181,6 +3451,7 @@ export function PageCard({
         globalCommentRequest={globalCommentRequest}
         onGlobalCommentRequestHandled={onGlobalCommentRequestHandled}
         onReviewControllerChange={onReviewControllerChange}
+        revealRequest={revealRequest}
       />
     </div>
   );

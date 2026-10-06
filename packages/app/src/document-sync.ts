@@ -1,20 +1,42 @@
-// The tab's sync controller for one open document (batch 2 contract, "App").
+// The tab's sync controller for one open document (batch 2 contract, "App";
+// batch 5 contract, "Controller").
 //
 // It owns the draft and the base the draft is built on, the save queue, the
-// tab channel and every resync trigger. It has no React in it so the rules
-// can be tested with a fake backend and fake timers; App, DocumentWorkspace
-// and PageCard only render what it says and forward edits to it.
+// tab channel and every resync trigger. A newer disk version that arrives
+// while the tab has unsaved edits is merged into the draft with rfm's
+// `mergeReview` instead of blocking: edits in different places both land,
+// overlapping prose becomes Jordan's suggestion against the disk text, and
+// only an overlap no suggestion can hold waits for a choice, per hunk. The
+// draft and its base are also kept in IndexedDB until they reach disk.
+// It has no React in it so the rules can be tested with a fake backend and
+// fake timers; App, DocumentWorkspace and PageCard only render what it says
+// and forward edits to it.
 
+import {
+  type ConflictHunk,
+  mergeReview,
+  type RfmMergeChoice,
+  type RfmMergeReviewResult,
+} from "@roughdraft/rfm";
 import { contentHashForPage, localContentHash } from "./content-hash";
+import {
+  describeDiskChange,
+  findRemovedText,
+  restoreRemovedText as insertRemovedText,
+  type RemovedText,
+  recordSavedText,
+  type SavedRun,
+} from "./disk-changes";
+import type { DraftStore } from "./draft-store";
 import {
   type CompleteReviewOptions,
   type CompleteReviewResult,
   type HandoffRecord,
-  type RoundFlag,
   MarkdownFileConflictError,
   MarkdownFileNotFoundError,
   type MarkdownFileState,
   type Page,
+  type RoundFlag,
   ServerUnreachableError,
   type SessionRecord,
   type StorageBackend,
@@ -22,6 +44,8 @@ import {
   type TabServerMessage,
   UnsupportedRouteError,
 } from "./storage";
+
+export type { ConflictHunk } from "@roughdraft/rfm";
 
 export interface Snapshot {
   content: string;
@@ -36,10 +60,28 @@ export type SyncState =
   | { kind: "saving"; again: boolean }
   | { kind: "offline"; retryAt: number }
   | { kind: "unavailable"; reason: string }
-  // Dirty tab, newer disk. Batch 5 replaces this with rebasing.
-  | { kind: "changed"; theirs: Snapshot }
-  // 409 on save. Batch 5 replaces this with rebasing.
-  | { kind: "conflict"; theirs: Snapshot };
+  // The draft overlaps a change on disk in a way no suggestion can hold.
+  // The draft is kept and typing goes on; `theirs` is the disk version the
+  // hunks were computed against. Autosave waits until every hunk is chosen.
+  | { kind: "conflict"; hunks: ConflictHunk[]; theirs: Snapshot };
+
+// The notices of D5, plus the restored-draft line.
+export type SyncNotice =
+  // Quiet: "Updated from disk: <summary>" with "show me".
+  | {
+      id: number;
+      kind: "updated";
+      summary: string;
+      // The editor content the change arrived with, and the thread to
+      // select, for "show me".
+      epoch: number;
+      commentId: string | null;
+      suggestionsAdded: string[];
+    }
+  // Loud: "An outside write removed text you saved. Restore it?"
+  | { id: number; kind: "removed"; removed: RemovedText[] }
+  // "Restored unsaved edits from your last session"
+  | { id: number; kind: "restored" };
 
 export type ChannelConnection = "idle" | "connecting" | "open" | "closed";
 
@@ -47,10 +89,6 @@ export interface DocumentSyncView {
   state: SyncState;
   base: Snapshot;
   dirty: boolean;
-  // "Keep editing with autosave paused" was chosen in changed or conflict.
-  paused: boolean;
-  // Disk changes that arrived after the banner first showed.
-  theirsUpdates: number;
   connection: ChannelConnection;
   // True once the server has sent a hello, so it speaks the tab channel.
   channelSupported: boolean;
@@ -62,18 +100,20 @@ export interface DocumentSyncView {
   round: RoundFlag | null;
   latestSequence: number | null;
   lastError: string | null;
+  // At most one of each kind, newest last.
+  notices: SyncNotice[];
 }
 
 export type FlushResult =
   | { status: "saved" }
-  | { status: "blocked"; reason: "changed" | "conflict" | "unavailable" }
+  | { status: "blocked"; reason: "conflict" | "unavailable" }
   | { status: "conflict" }
   | { status: "error"; error: unknown };
 
 export interface ContentUpdate {
   content: string;
   epoch: number;
-  reason: "fast-forward" | "reload" | "rebase";
+  reason: "fast-forward" | "reload" | "rebase" | "restore";
 }
 
 // The editor applies the content in place when it can (PageCard).
@@ -97,6 +137,8 @@ export interface SyncEnvironmentHandlers {
   focus: () => void;
   online: () => void;
   pageshow: () => void;
+  // The page is going away: write a pending draft now.
+  pagehide?: () => void;
 }
 
 export interface SyncEnvironment {
@@ -115,15 +157,18 @@ export function browserSyncEnvironment(): SyncEnvironment {
       const onFocus = () => handlers.focus();
       const onOnline = () => handlers.online();
       const onPageShow = () => handlers.pageshow();
+      const onPageHide = () => handlers.pagehide?.();
       document.addEventListener("visibilitychange", onVisibility);
       window.addEventListener("focus", onFocus);
       window.addEventListener("online", onOnline);
       window.addEventListener("pageshow", onPageShow);
+      window.addEventListener("pagehide", onPageHide);
       return () => {
         document.removeEventListener("visibilitychange", onVisibility);
         window.removeEventListener("focus", onFocus);
         window.removeEventListener("online", onOnline);
         window.removeEventListener("pageshow", onPageShow);
+        window.removeEventListener("pagehide", onPageHide);
       };
     },
   };
@@ -145,9 +190,19 @@ export interface DocumentSyncOptions {
   initialPage: Page;
   environment?: SyncEnvironment;
   onOpenRequest?: (request: { requestId: string; url: string }) => void;
+  // Where unsaved drafts are kept, and this document's key there (its
+  // absolute path). Without both, drafts live only in memory.
+  draftStore?: DraftStore | null;
+  draftKey?: string | null;
+  // The clock for suggestion timestamps and the saved-text window (tests).
+  now?: () => number;
 }
 
 export const SAVE_DEBOUNCE_MS = 500;
+export const DRAFT_DEBOUNCE_MS = 250;
+// A conflict is merged again once typing pauses for this long: the edit may
+// have settled the overlap.
+export const REMERGE_DEBOUNCE_MS = 500;
 export const SAVE_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000];
 export const SAVE_RETRY_STEADY_MS = 30_000;
 export const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 5_000];
@@ -155,6 +210,8 @@ export const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 5_000];
 export const PING_TIMEOUT_MS = 35_000;
 export const HIDDEN_CLOSE_MS = 60_000;
 export const PRESENCE_INTERVAL_MS = 5_000;
+// A stored draft that IndexedDB does not return within this long is skipped.
+export const DRAFT_RESTORE_TIMEOUT_MS = 1_500;
 const OURS_LIMIT = 20;
 const EPOCH_HISTORY = 8;
 
@@ -172,60 +229,58 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
-function commonPrefixLength(a: string, b: string): number {
-  const limit = Math.min(a.length, b.length);
-  let index = 0;
-  while (index < limit && a.charCodeAt(index) === b.charCodeAt(index)) {
-    index += 1;
-  }
-  return index;
+// A choice for a hunk is remembered by what the hunk is, not by its id: the
+// ids are only stable for the same three inputs, and the draft keeps
+// changing while the banner is up.
+function hunkKey(hunk: ConflictHunk): string {
+  const entry = hunk.entry
+    ? `${hunk.entry.section}:${hunk.entry.id}:${hunk.entry.key ?? ""}`
+    : "";
+  return [
+    hunk.kind,
+    hunk.reason,
+    hunk.base ?? "",
+    hunk.theirs ?? "",
+    entry,
+  ].join("\u0000");
 }
 
-function commonSuffixLength(a: string, b: string, prefix: number): number {
-  const limit = Math.min(a.length, b.length) - prefix;
-  let index = 0;
-  while (
-    index < limit &&
-    a.charCodeAt(a.length - 1 - index) === b.charCodeAt(b.length - 1 - index)
-  ) {
-    index += 1;
-  }
-  return index;
+function documentConflict(ours: string, error: unknown): RfmMergeReviewResult {
+  return {
+    merged: ours,
+    conflicts: [
+      {
+        id: "document",
+        kind: "document",
+        reason: "result-invalid",
+        message: `The two versions could not be merged (${describeError(error)}); keep one of them.`,
+        choices: ["ours", "theirs"],
+        base: null,
+        ours: null,
+        theirs: null,
+        lines: null,
+        entry: null,
+      },
+    ],
+    suggestionsAdded: [],
+    rekeyed: {},
+  };
 }
 
-// Re-applies one contiguous local edit (old -> mine) on top of a newer text
-// (old -> theirs) when the two edits do not touch. Returns null when they
-// overlap, so the caller keeps the user's text and shows the disk change
-// instead of guessing. Batch 5 replaces this with the full merge.
-export function mergeSingleEdit(
-  old: string,
-  mine: string,
-  theirs: string,
-): string | null {
-  if (mine === old) return theirs;
-  if (theirs === old || theirs === mine) return mine;
-
-  const myPrefix = commonPrefixLength(old, mine);
-  const mySuffix = commonSuffixLength(old, mine, myPrefix);
-  const myStart = myPrefix;
-  const myEnd = old.length - mySuffix;
-  const myText = mine.slice(myPrefix, mine.length - mySuffix);
-
-  const theirPrefix = commonPrefixLength(old, theirs);
-  const theirSuffix = commonSuffixLength(old, theirs, theirPrefix);
-  const theirStart = theirPrefix;
-  const theirEnd = old.length - theirSuffix;
-
-  if (myEnd <= theirStart && myStart < theirStart) {
-    return theirs.slice(0, myStart) + myText + theirs.slice(myEnd);
-  }
-  if (myStart >= theirEnd && myStart > theirStart) {
-    const delta = theirs.length - old.length;
-    return (
-      theirs.slice(0, myStart + delta) + myText + theirs.slice(myEnd + delta)
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out")), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
     );
-  }
-  return null;
+  });
 }
 
 export class DocumentSync {
@@ -237,31 +292,41 @@ export class DocumentSync {
   private readonly backend: SyncBackend;
   private readonly environment: SyncEnvironment;
   private readonly onOpenRequest?: DocumentSyncOptions["onOpenRequest"];
+  private readonly draftStore: DraftStore | null;
+  private readonly draftKey: string | null;
+  private readonly now: () => number;
 
   private base: Snapshot;
   private draftContent: string;
   private state: SyncState = { kind: "synced" };
-  private paused = false;
-  private theirsUpdates = 0;
   private lastError: string | null = null;
   private readonly ours: string[] = [];
+  // Choices made in the conflict banner, by hunk content (see hunkKey).
+  private readonly resolutions = new Map<string, RfmMergeChoice>();
+  // Body lines this tab saved in the last five minutes (the loud notice).
+  private savedRuns: SavedRun[] = [];
+  private notices: SyncNotice[] = [];
+  private noticeSeq = 0;
 
   // Every content the controller pushes into the editor gets a new epoch.
   // Edits carry the epoch of the content they were typed on, so an edit made
   // on content the editor had not replaced yet can be moved onto the new one.
   private contentEpoch = 0;
-  private diskEpoch = 0;
   private readonly epochs = new Map<
     number,
     { content: string; base: Snapshot }
   >();
 
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private remergeTimer: ReturnType<typeof setTimeout> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryAttempt = 0;
   private inFlight: Promise<void> | null = null;
   private deferred: { state?: MarkdownFileState; snapshot?: Snapshot } | null =
     null;
+
+  private draftTimer: ReturnType<typeof setTimeout> | null = null;
+  private draftWrites: Promise<void> = Promise.resolve();
 
   private resyncing: Promise<void> | null = null;
   private resyncAgain = false;
@@ -306,6 +371,9 @@ export class DocumentSync {
     this.title = options.initialPage.title;
     this.environment = options.environment ?? browserSyncEnvironment();
     this.onOpenRequest = options.onOpenRequest;
+    this.draftStore = options.draftStore ?? null;
+    this.draftKey = options.draftKey ?? null;
+    this.now = options.now ?? Date.now;
     this.base = snapshotFromPage(options.initialPage);
     this.draftContent = this.base.content;
     this.epochs.set(0, { content: this.base.content, base: this.base });
@@ -352,6 +420,7 @@ export class DocumentSync {
       focus: () => void this.resync(),
       online: () => this.handleOnline(),
       pageshow: () => this.handlePageShow(),
+      pagehide: () => this.flushDraftWrite(),
     });
     if (this.visible) {
       this.connect();
@@ -362,10 +431,12 @@ export class DocumentSync {
 
   dispose(): void {
     if (this.disposed) return;
+    this.flushDraftWrite();
     this.disposed = true;
     this.stopListening?.();
     this.stopListening = null;
     this.clearSaveTimer();
+    this.clearRemergeTimer();
     this.clearRetryTimer();
     this.clearTimer("reconnectTimer");
     this.clearTimer("hiddenTimer");
@@ -423,27 +494,29 @@ export class DocumentSync {
     };
   }
 
-  private blockedReason(): "changed" | "conflict" | "unavailable" | null {
+  private blockedReason(): "conflict" | "unavailable" | null {
     const kind = this.state.kind;
-    if (kind === "changed" || kind === "conflict" || kind === "unavailable") {
-      return kind;
-    }
+    if (kind === "conflict" || kind === "unavailable") return kind;
     return null;
   }
 
   private afterDraftChange(): void {
     const dirty = this.draftContent !== this.base.content;
     const state = this.state;
+    this.scheduleDraftWrite();
 
-    if (state.kind === "changed" || state.kind === "conflict") {
+    if (state.kind === "conflict") {
       if (!dirty) {
         // The user undid their edits; nothing is left to protect.
-        const theirs = state.theirs;
-        this.paused = false;
+        this.clearRemergeTimer();
+        this.resolutions.clear();
         this.setState({ kind: "synced" });
-        this.applySnapshot(theirs);
+        this.applySnapshot(state.theirs);
         return;
       }
+      // Typing goes on beside the banner. Once it pauses, merge again: the
+      // edit may have settled an overlap, or moved it.
+      this.armRemergeTimer();
       this.notify();
       return;
     }
@@ -489,6 +562,16 @@ export class DocumentSync {
     }, SAVE_DEBOUNCE_MS);
   }
 
+  private armRemergeTimer(): void {
+    this.clearRemergeTimer();
+    this.remergeTimer = setTimeout(() => {
+      this.remergeTimer = null;
+      if (this.disposed || this.state.kind !== "conflict") return;
+      if (this.inFlight) return;
+      this.rebase(this.state.theirs);
+    }, REMERGE_DEBOUNCE_MS);
+  }
+
   private runSave(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     if (this.inFlight) {
@@ -519,6 +602,7 @@ export class DocumentSync {
   }
 
   private async performSave(content: string, expected: Snapshot) {
+    const previousBase = this.base;
     try {
       const page = await this.backend.saveMarkdownFile(
         this.path,
@@ -536,6 +620,12 @@ export class DocumentSync {
             seq: expected.seq,
           };
       this.rememberOurs(saved.contentHash);
+      this.savedRuns = recordSavedText(
+        this.savedRuns,
+        previousBase.content,
+        content,
+        this.now(),
+      );
       // Keep the text we sent as the base content so the editor's draft
       // compares equal, and the server's hash so the next PUT matches disk.
       this.base = { ...saved, content };
@@ -553,11 +643,10 @@ export class DocumentSync {
           this.lastError = null;
           return;
         }
+        // Disk moved under the save: merge onto the version in the answer.
         this.clearSaveTimer();
         this.clearRetryTimer();
-        this.paused = false;
-        this.theirsUpdates = 0;
-        this.setState({ kind: "conflict", theirs });
+        this.rebase(theirs);
         return;
       }
       if (error instanceof MarkdownFileNotFoundError) {
@@ -577,17 +666,6 @@ export class DocumentSync {
     this.deferred = null;
 
     const state = this.state;
-    if (state.kind === "changed") {
-      // A newer disk version arrived while the save was out.
-      if (this.draftContent === this.base.content) {
-        this.setState({ kind: "synced" });
-        this.applySnapshot(state.theirs);
-      } else {
-        this.notify();
-      }
-      this.processDeferred(deferred);
-      return;
-    }
     if (
       state.kind === "conflict" ||
       state.kind === "unavailable" ||
@@ -597,14 +675,16 @@ export class DocumentSync {
       return;
     }
 
-    // The save succeeded. Disk news that arrived meanwhile goes first so the
-    // dirty check below sees the final base.
+    // The save succeeded (or merged). Disk news that arrived meanwhile goes
+    // first so the dirty check below sees the final base.
     this.processDeferred(deferred);
     if (this.blockedReason()) return;
 
     if (this.draftContent === this.base.content) {
       this.clearSaveTimer();
       this.setState({ kind: "synced" });
+      // The draft reached disk: nothing to keep in the browser.
+      this.flushDraftWrite();
       return;
     }
     if (this.saveTimer) {
@@ -661,6 +741,50 @@ export class DocumentSync {
     }
   }
 
+  // "Recreate from my draft": the file is gone; write the draft back to its
+  // path. Needs a server that accepts `create` on PUT.
+  async recreateFromDraft(): Promise<boolean> {
+    if (this.disposed || this.state.kind !== "unavailable") return false;
+    if (this.inFlight) await this.inFlight;
+    const content = this.draftContent;
+    try {
+      const page = await this.backend.saveMarkdownFile(
+        this.path,
+        content,
+        undefined,
+        { tabId: this.tabId, create: true },
+      );
+      if (this.disposed) return false;
+      const saved = page
+        ? snapshotFromPage(page)
+        : {
+            content,
+            version: "",
+            contentHash: localContentHash(content),
+            seq: this.base.seq,
+          };
+      this.rememberOurs(saved.contentHash);
+      this.base = { ...saved, content };
+      this.lastError = null;
+      if (this.draftContent === this.base.content) {
+        this.setState({ kind: "synced" });
+        this.flushDraftWrite();
+      } else {
+        this.armSaveTimer();
+        this.setState({ kind: "pending" });
+      }
+      return true;
+    } catch (error) {
+      if (this.disposed) return false;
+      this.lastError =
+        error instanceof MarkdownFileNotFoundError
+          ? "This Roughdraft server cannot recreate a missing file. Update Roughdraft, or save the text elsewhere from the code view."
+          : describeError(error);
+      this.notify();
+      return false;
+    }
+  }
+
   // --- Incoming disk state -------------------------------------------------
 
   private async handleState(state: MarkdownFileState): Promise<void> {
@@ -687,7 +811,7 @@ export class DocumentSync {
       return;
     }
     if (
-      (this.state.kind === "changed" || this.state.kind === "conflict") &&
+      this.state.kind === "conflict" &&
       state.contentHash === this.state.theirs.contentHash
     ) {
       return;
@@ -738,21 +862,21 @@ export class DocumentSync {
       this.leaveUnavailable();
       return;
     }
+    if (
+      this.state.kind === "conflict" &&
+      snapshot.contentHash === this.state.theirs.contentHash
+    ) {
+      return;
+    }
     if (snapshot.content === this.draftContent) {
       // Disk already holds the draft.
       this.base = snapshot;
       this.clearSaveTimer();
+      this.clearRemergeTimer();
       this.clearRetryTimer();
+      this.resolutions.clear();
       this.setState({ kind: "synced" });
-      return;
-    }
-
-    const state = this.state;
-    if (state.kind === "changed" || state.kind === "conflict") {
-      if (snapshot.contentHash !== state.theirs.contentHash) {
-        this.theirsUpdates += 1;
-        this.setState({ kind: state.kind, theirs: snapshot });
-      }
+      this.flushDraftWrite();
       return;
     }
 
@@ -761,26 +885,130 @@ export class DocumentSync {
       return;
     }
 
-    // Dirty: never move the base while the draft depends on it.
-    this.clearSaveTimer();
-    this.clearRetryTimer();
-    this.paused = false;
-    this.theirsUpdates = 0;
-    this.setState({ kind: "changed", theirs: snapshot });
+    // Dirty: merge the draft onto the new disk version.
+    this.rebase(snapshot);
   }
 
   private fastForward(snapshot: Snapshot): void {
+    const oldBase = this.base.content;
+    const oldDraft = this.draftContent;
     this.clearSaveTimer();
     this.clearRetryTimer();
     this.base = snapshot;
     this.draftContent = snapshot.content;
     this.setState({ kind: "synced" });
     this.pushContent("fast-forward");
+    this.noteIncoming(oldBase, oldDraft, snapshot, []);
+  }
+
+  // The batch 5 merge: the draft (built on `base`) onto a newer disk version.
+  // Clean: the merge becomes the draft, the editor takes it in place and a
+  // save follows. Otherwise the draft is kept and the hunks wait for a choice.
+  private rebase(theirs: Snapshot, options: { quiet?: boolean } = {}): void {
+    const result = this.runMerge(this.base.content, this.draftContent, theirs);
+    if (result.conflicts.length === 0) {
+      this.applyMerged(theirs, result, options);
+      return;
+    }
+    this.clearSaveTimer();
+    this.clearRemergeTimer();
+    this.clearRetryTimer();
+    this.setState({ kind: "conflict", hunks: result.conflicts, theirs });
+    this.scheduleDraftWrite();
+  }
+
+  private runMerge(
+    base: string,
+    ours: string,
+    theirs: Snapshot,
+  ): RfmMergeReviewResult {
+    const now = new Date(this.now()).toISOString();
+    try {
+      const first = mergeReview(base, ours, theirs.content, { now });
+      if (first.conflicts.length === 0 || this.resolutions.size === 0) {
+        return first;
+      }
+      const chosen: Record<string, RfmMergeChoice> = {};
+      for (const hunk of first.conflicts) {
+        const choice = this.resolutions.get(hunkKey(hunk));
+        if (choice && hunk.choices.includes(choice)) chosen[hunk.id] = choice;
+      }
+      if (Object.keys(chosen).length === 0) return first;
+      return mergeReview(base, ours, theirs.content, {
+        now,
+        resolutions: chosen,
+      });
+    } catch (error) {
+      return documentConflict(ours, error);
+    }
+  }
+
+  private applyMerged(
+    theirs: Snapshot,
+    result: RfmMergeReviewResult,
+    options: { quiet?: boolean } = {},
+  ): void {
+    const oldBase = this.base.content;
+    const oldDraft = this.draftContent;
+    this.clearRemergeTimer();
+    this.resolutions.clear();
+    this.base = theirs;
+    this.draftContent = result.merged;
+    this.pushContent("rebase");
+    if (!options.quiet) {
+      this.noteIncoming(oldBase, oldDraft, theirs, result.suggestionsAdded);
+    }
+    if (this.inFlight) {
+      // A 409 answer: the save that is ending arms the next one.
+      this.armSaveTimer();
+      this.scheduleDraftWrite();
+      return;
+    }
+    if (this.draftContent === this.base.content) {
+      this.clearSaveTimer();
+      this.setState({ kind: "synced" });
+      this.flushDraftWrite();
+      return;
+    }
+    this.armSaveTimer();
+    this.setState({ kind: "pending" });
+    this.scheduleDraftWrite();
+  }
+
+  // The notices for a change that arrived from disk (D5).
+  private noteIncoming(
+    oldBase: string,
+    oldDraft: string,
+    theirs: Snapshot,
+    suggestionsAdded: string[],
+  ): void {
+    const change = describeDiskChange(oldBase, theirs.content);
+    const summary =
+      suggestionsAdded.length > 0
+        ? `${change.summary}; your overlapping edit is kept as a suggestion`
+        : change.summary;
+    this.pushNotice({
+      id: 0,
+      kind: "updated",
+      summary,
+      epoch: this.contentEpoch,
+      commentId: change.commentId,
+      suggestionsAdded,
+    });
+    const removed = findRemovedText(
+      this.savedRuns,
+      oldBase,
+      oldDraft,
+      this.draftContent,
+      this.now(),
+    );
+    if (removed.length > 0) {
+      this.pushNotice({ id: 0, kind: "removed", removed });
+    }
   }
 
   private pushContent(reason: ContentUpdate["reason"]): void {
     this.contentEpoch += 1;
-    if (reason !== "rebase") this.diskEpoch = this.contentEpoch;
     this.epochs.set(this.contentEpoch, {
       content: this.draftContent,
       base: this.base,
@@ -799,41 +1027,217 @@ export class DocumentSync {
   }
 
   // An edit typed on content the editor had not replaced yet (the editor
-  // was resetting when the new content arrived).
+  // was resetting when the new content arrived). The keystrokes are merged
+  // onto the current draft; if they overlap what changed, they are kept on
+  // the base they were typed on and merged onto disk like any draft.
   private editOnStaleContent(markdown: string, epoch: number): void {
     const typedOn = this.epochs.get(epoch);
-    // The old editor reports everything typed since `epoch`, so the edit is
-    // replayed on the newest disk content, not on an earlier replay.
-    const target = this.epochs.get(this.diskEpoch);
-    const merged =
-      typedOn && target && this.diskEpoch > epoch
-        ? mergeSingleEdit(typedOn.content, markdown, target.content)
-        : null;
-
-    if (merged !== null) {
-      this.draftContent = merged;
+    if (!typedOn) {
+      this.draftContent = markdown;
+      this.pushContent("rebase");
+      this.afterDraftChange();
+      return;
+    }
+    let merged: RfmMergeReviewResult | null = null;
+    try {
+      merged = mergeReview(typedOn.content, markdown, this.draftContent, {
+        now: new Date(this.now()).toISOString(),
+      });
+    } catch {
+      merged = null;
+    }
+    if (merged && merged.conflicts.length === 0) {
+      this.draftContent = merged.merged;
       this.pushContent("rebase");
       this.afterDraftChange();
       return;
     }
 
-    // Cannot place the keystrokes: keep them on the base they were typed on
-    // and show the newer disk text as a change, so nothing is lost.
-    const theirs = target?.base ?? this.base;
-    this.base = typedOn?.base ?? this.base;
+    const current = this.base;
+    this.base = typedOn.base;
     this.draftContent = markdown;
-    this.pushContent("rebase");
-    if (
-      this.draftContent === this.base.content ||
-      theirs.contentHash === this.base.contentHash
-    ) {
+    if (typedOn.base.contentHash === current.contentHash) {
+      this.pushContent("rebase");
       this.afterDraftChange();
       return;
     }
+    this.rebase(current, { quiet: true });
+    if (this.state.kind === "conflict") this.pushContent("rebase");
+  }
+
+  // --- The conflict banner -------------------------------------------------
+
+  // A choice for one hunk of the banner. Settled hunks drop out; when none
+  // is left the merge applies like a clean one.
+  resolveHunk(hunkId: string, choice: RfmMergeChoice): void {
+    if (this.disposed || this.state.kind !== "conflict") return;
+    const hunk = this.state.hunks.find((candidate) => candidate.id === hunkId);
+    if (!hunk?.choices.includes(choice)) return;
+    if (this.inFlight) return;
+    this.resolutions.set(hunkKey(hunk), choice);
+    this.rebase(this.state.theirs, { quiet: true });
+  }
+
+  // The explicit overwrite, behind a confirmation that shows the diff: the
+  // draft replaces exactly the version the dialog showed. If disk moved
+  // again since, the server refuses and the draft merges onto the newer one.
+  async overwrite(shown: Snapshot): Promise<void> {
+    if (this.inFlight) await this.inFlight;
+    if (this.disposed || this.state.kind !== "conflict") return;
     this.clearSaveTimer();
-    this.paused = false;
-    this.theirsUpdates = 0;
-    this.setState({ kind: "changed", theirs });
+    this.clearRemergeTimer();
+    this.resolutions.clear();
+    await this.startSave(this.draftContent, shown);
+  }
+
+  // Reload from disk: drop the draft and take the current file (the review
+  // block error's Reload).
+  async reloadFromDisk(): Promise<void> {
+    if (this.inFlight) await this.inFlight;
+    const page = await this.backend.getMarkdownFile(this.path);
+    if (this.disposed) return;
+    this.clearSaveTimer();
+    this.clearRemergeTimer();
+    this.clearRetryTimer();
+    this.resolutions.clear();
+    this.base = snapshotFromPage(page);
+    this.draftContent = this.base.content;
+    this.setState({ kind: "synced" });
+    this.pushContent("reload");
+    this.flushDraftWrite();
+  }
+
+  // --- Notices -------------------------------------------------------------
+
+  private pushNotice(notice: SyncNotice): void {
+    this.noticeSeq += 1;
+    const next = { ...notice, id: this.noticeSeq } as SyncNotice;
+    this.notices = [
+      ...this.notices.filter((current) => current.kind !== notice.kind),
+      next,
+    ];
+    this.notify();
+  }
+
+  dismissNotice(id: number): void {
+    const next = this.notices.filter((notice) => notice.id !== id);
+    if (next.length === this.notices.length) return;
+    this.notices = next;
+    this.notify();
+  }
+
+  // Restore from the loud notice: each removed piece goes back in as
+  // Jordan's insertion suggestion, and the draft saves.
+  restoreRemovedText(noticeId: number): void {
+    const notice = this.notices.find((current) => current.id === noticeId);
+    if (!notice || notice.kind !== "removed") return;
+    let next = this.draftContent;
+    const at = new Date(this.now()).toISOString();
+    for (const removed of notice.removed) {
+      next = insertRemovedText(next, removed, at);
+    }
+    this.dismissNotice(noticeId);
+    if (next === this.draftContent) return;
+    this.draftContent = next;
+    this.pushContent("restore");
+    this.afterDraftChange();
+  }
+
+  // --- Drafts kept in the browser ------------------------------------------
+
+  // On load: a draft this browser kept for the document goes back into the
+  // editor, merged onto the file as it is now. App calls it before the
+  // editor mounts. True when a draft was restored.
+  async restoreDraft(): Promise<boolean> {
+    const store = this.draftStore;
+    const key = this.draftKey;
+    if (!store || !key || this.disposed) return false;
+    let stored: Awaited<ReturnType<DraftStore["get"]>>;
+    try {
+      stored = await withTimeout(store.get(key), DRAFT_RESTORE_TIMEOUT_MS);
+    } catch {
+      return false;
+    }
+    if (!stored || this.disposed) return false;
+    // Typed already, or the draft is what disk holds now.
+    if (this.draftContent !== this.base.content) return false;
+    if (stored.draft === this.base.content) {
+      this.flushDraftWrite();
+      return false;
+    }
+
+    const current = this.base;
+    if (
+      stored.base.contentHash === current.contentHash ||
+      stored.base.content === current.content
+    ) {
+      this.draftContent = stored.draft;
+      this.pushContent("restore");
+      this.afterDraftChange();
+    } else {
+      this.base = stored.base;
+      this.draftContent = stored.draft;
+      this.rebase(current, { quiet: true });
+      if (this.state.kind === "conflict") this.pushContent("restore");
+    }
+    this.pushNotice({ id: 0, kind: "restored" });
+    return true;
+  }
+
+  private scheduleDraftWrite(): void {
+    if (!this.draftStore || !this.draftKey || this.disposed) return;
+    if (this.draftTimer) clearTimeout(this.draftTimer);
+    this.draftTimer = setTimeout(() => {
+      this.draftTimer = null;
+      this.writeDraftNow();
+    }, DRAFT_DEBOUNCE_MS);
+  }
+
+  // Writes the pending draft (or removes the record once the draft is on
+  // disk) right away.
+  private flushDraftWrite(): void {
+    if (!this.draftStore || !this.draftKey || this.disposed) return;
+    if (this.draftTimer) {
+      clearTimeout(this.draftTimer);
+      this.draftTimer = null;
+    }
+    this.writeDraftNow();
+  }
+
+  private writeDraftNow(): void {
+    const store = this.draftStore;
+    const key = this.draftKey;
+    if (!store || !key) return;
+    const dirty = this.draftContent !== this.base.content;
+    const base = this.base;
+    const record = dirty
+      ? {
+          key,
+          draft: this.draftContent,
+          base,
+          tabId: this.tabId,
+          savedAt: this.now(),
+        }
+      : null;
+    this.draftWrites = this.draftWrites
+      .then(() =>
+        record
+          ? store.put(record)
+          : store.delete(
+              key,
+              // Another tab's newer draft for the same file stays.
+              (stored) =>
+                stored.tabId === this.tabId || stored.draft === base.content,
+            ),
+      )
+      .catch((error) => {
+        console.warn("Could not keep the draft in this browser:", error);
+      });
+  }
+
+  // Resolves once every draft write queued so far is done (tests).
+  whenDraftsWritten(): Promise<void> {
+    return this.draftWrites;
   }
 
   // --- Resync --------------------------------------------------------------
@@ -877,43 +1281,6 @@ export class DocumentSync {
     await this.handleState(state);
   }
 
-  // --- Banner actions ------------------------------------------------------
-
-  // Reload from disk: drop the draft and take the current file.
-  async reloadFromDisk(): Promise<void> {
-    if (this.inFlight) await this.inFlight;
-    const page = await this.backend.getMarkdownFile(this.path);
-    if (this.disposed) return;
-    this.clearSaveTimer();
-    this.clearRetryTimer();
-    this.base = snapshotFromPage(page);
-    this.draftContent = this.base.content;
-    this.paused = false;
-    this.theirsUpdates = 0;
-    this.setState({ kind: "synced" });
-    this.pushContent("reload");
-  }
-
-  keepEditing(): void {
-    if (this.state.kind !== "changed" && this.state.kind !== "conflict") {
-      return;
-    }
-    this.paused = true;
-    this.notify();
-  }
-
-  // Overwrite the version the banner shows. If disk moved again since, the
-  // server answers 409 and the banner shows the newer version instead.
-  async overwrite(): Promise<void> {
-    if (this.inFlight) await this.inFlight;
-    const state = this.state;
-    if (state.kind !== "changed" && state.kind !== "conflict") return;
-    this.clearSaveTimer();
-    this.paused = false;
-    this.theirsUpdates = 0;
-    await this.startSave(this.draftContent, state.theirs);
-  }
-
   // --- Handoff -------------------------------------------------------------
 
   async completeReview(
@@ -921,27 +1288,26 @@ export class DocumentSync {
   ): Promise<CompleteReviewResult> {
     if (!this.backend.completeReview) return { delivered: false };
 
-    const flushed = await this.flush();
-    if (flushed.status === "blocked") {
-      throw new HandoffError(
-        flushed.reason === "unavailable" ? "failed" : "file-changed",
-        flushed.reason === "unavailable"
-          ? "The file is not available on disk."
-          : "The file changed on disk.",
-      );
-    }
-    if (flushed.status === "conflict") {
-      throw new HandoffError("file-changed", "The file changed on disk.");
-    }
-    if (flushed.status === "error") {
-      throw new HandoffError(
-        "no-answer",
-        this.lastError ?? "The Roughdraft server did not answer.",
-        flushed.error,
-      );
-    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const flushed = await this.flush();
+      if (flushed.status === "blocked" || flushed.status === "conflict") {
+        const unavailable =
+          flushed.status === "blocked" && flushed.reason === "unavailable";
+        throw new HandoffError(
+          unavailable ? "failed" : "file-changed",
+          unavailable
+            ? "The file is not available on disk."
+            : "Your edit overlaps a change on disk.",
+        );
+      }
+      if (flushed.status === "error") {
+        throw new HandoffError(
+          "no-answer",
+          this.lastError ?? "The Roughdraft server did not answer.",
+          flushed.error,
+        );
+      }
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
       const expected = this.base;
       try {
         return await this.backend.completeReview(this.path, {
@@ -952,21 +1318,23 @@ export class DocumentSync {
       } catch (error) {
         if (error instanceof MarkdownFileConflictError) {
           const theirs = snapshotFromPage(error.current);
-          if (theirs.content === this.draftContent && attempt === 0) {
-            // Same text under a new hash: adopt it and try once more.
+          if (theirs.content === this.draftContent) {
+            // Same text under a new hash: adopt it and try again.
             this.base = theirs;
             this.notify();
             continue;
           }
-          this.clearSaveTimer();
-          this.paused = false;
-          this.theirsUpdates = 0;
-          this.setState({ kind: "conflict", theirs });
-          throw new HandoffError(
-            "file-changed",
-            "The file changed on disk.",
-            error,
-          );
+          // Disk moved after the flush: take the change (merging any
+          // draft), save, and send Done again.
+          this.applySnapshot(theirs);
+          if (this.state.kind === "conflict") {
+            throw new HandoffError(
+              "file-changed",
+              "Your edit overlaps a change on disk.",
+              error,
+            );
+          }
+          continue;
         }
         if (error instanceof ServerUnreachableError) {
           throw new HandoffError("no-answer", error.message, error);
@@ -1109,7 +1477,7 @@ export class DocumentSync {
     const presence = {
       visible: this.visible,
       dirty,
-      conflict: this.state.kind === "changed" || this.state.kind === "conflict",
+      conflict: this.state.kind === "conflict",
       baseHash: this.base.contentHash || null,
     };
     const key = JSON.stringify(presence);
@@ -1146,6 +1514,7 @@ export class DocumentSync {
     if (this.disposed) return;
     this.visible = visible;
     if (!visible) {
+      this.flushDraftWrite();
       this.clearTimer("hiddenTimer");
       this.hiddenTimer = setTimeout(() => {
         this.hiddenTimer = null;
@@ -1200,6 +1569,13 @@ export class DocumentSync {
     }
   }
 
+  private clearRemergeTimer(): void {
+    if (this.remergeTimer) {
+      clearTimeout(this.remergeTimer);
+      this.remergeTimer = null;
+    }
+  }
+
   private clearRetryTimer(): void {
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
@@ -1227,8 +1603,6 @@ export class DocumentSync {
       state: this.state,
       base: this.base,
       dirty: this.draftContent !== this.base.content,
-      paused: this.paused,
-      theirsUpdates: this.theirsUpdates,
       connection: this.connection,
       channelSupported: this.channelSupported,
       watchers: this.watchers,
@@ -1237,6 +1611,7 @@ export class DocumentSync {
       round: this.round,
       latestSequence: this.latestSequence,
       lastError: this.lastError,
+      notices: this.notices,
     };
   }
 

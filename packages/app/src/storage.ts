@@ -84,6 +84,9 @@ export interface MarkdownFileState {
 export interface SaveMarkdownFileOptions {
   expectedContentHash?: string;
   tabId?: string;
+  // "Recreate from my draft": write the file even though it is missing.
+  // Needs a server that accepts `create` on PUT; an older one answers 404.
+  create?: boolean;
 }
 
 // The "AI editing" flag of a document (batch 3b round route): `roughdraft

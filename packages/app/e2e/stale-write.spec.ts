@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import {
   appendInCodeEditor,
   blockTabChannel,
@@ -10,10 +10,35 @@ import {
   fireWindowFocus,
   logE2eEvent,
   openMarkdownFile,
+  placeCodeCaretAfter,
   readProjectFile,
   removeMarkdownProject,
   writeProjectFile,
 } from "./helpers";
+
+// Batch 5: a write from outside never blocks the tab. Edits in different
+// places merge; only an overlap inside review markup waits in the banner,
+// and the explicit overwrite sits behind a confirmation that shows the diff.
+
+const ENTRY =
+  '  c1:\n    body: "Why?"\n    by: user\n    at: "2026-01-01T00:00:00.000Z"\n';
+const markupDocument = (highlight: string, after = "") =>
+  `# T\n\nHi {==${highlight}==}{#c1}.\n\n${after}---\ncomments:\n${ENTRY}`;
+
+// With the tab channel down, the tab learns about the outside write from
+// its own save's 409 and merges there.
+async function overlapInsideMarkup(
+  page: Page,
+  filePath: string,
+  theirs: string,
+) {
+  await placeCodeCaretAfter(page, "there");
+  fs.writeFileSync(filePath, theirs);
+  await page.keyboard.type(" you");
+  await expect(fileConflictNotice(page)).toContainText(
+    "Your edit overlaps a change on disk",
+  );
+}
 
 test.describe("stale writes", () => {
   let projectDir: string;
@@ -26,7 +51,7 @@ test.describe("stale writes", () => {
     removeMarkdownProject(projectDir);
   });
 
-  test("surfaces a save conflict when the file changed externally @smoke", async ({
+  test("merges an outside change into an edit typed on the older text @smoke", async ({
     page,
   }) => {
     await blockTabChannel(page);
@@ -43,51 +68,37 @@ test.describe("stale writes", () => {
     fs.writeFileSync(filePath, "# Conflict\n\nExternal body.\n");
     await appendInCodeEditor(page, "\nLocal body.\n");
 
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Save conflict",
-    );
-    await expect(page.getByTestId("file-conflict-action-reload")).toBeVisible();
-    await expect(
-      page.getByTestId("file-conflict-action-keep-editing"),
-    ).toBeVisible();
-    expect(readProjectFile(projectDir, "conflict.md")).toBe(
-      "# Conflict\n\nExternal body.\n",
-    );
-
-    await page.getByTestId("file-conflict-action-keep-editing").click();
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Autosave paused",
-    );
-    await appendInCodeEditor(page, "\nStill local.\n");
-    await expect(codeEditor(page)).toContainText("Local body.");
-    await expect(codeEditor(page)).toContainText("Still local.");
     await expect
       .poll(() => readProjectFile(projectDir, "conflict.md"))
-      .toBe("# Conflict\n\nExternal body.\n");
-
-    // A later outside write is shown, not ignored, and still not overwritten.
-    await expect(page.getByTestId("file-conflict-later-change")).toHaveCount(0);
-    fs.writeFileSync(filePath, "# Conflict\n\nExternal body, again.\n");
-    await fireWindowFocus(page);
-    await expect(page.getByTestId("file-conflict-later-change")).toContainText(
-      "The file changed on disk again while autosave was paused.",
-    );
+      .toBe("# Conflict\n\nExternal body.\n\nLocal body.\n");
+    await expect(codeEditor(page)).toContainText("External body.");
     await expect(documentSaveStatus(page)).toHaveAttribute(
       "aria-label",
-      "Autosave paused",
+      "Saved",
     );
-    expect(readProjectFile(projectDir, "conflict.md")).toBe(
-      "# Conflict\n\nExternal body, again.\n",
+    await expect(fileConflictNotice(page)).toHaveCount(0);
+    await expect(page.getByTestId("disk-update-notice")).toContainText(
+      "Updated from disk: text changed in Conflict",
     );
 
-    logE2eEvent("stale-write.conflict-surfaced", {
-      file: "conflict.md",
-    });
+    // A later outside write comes in too, and typing goes on after it.
+    fs.writeFileSync(
+      filePath,
+      "# Conflict\n\nExternal body, again.\n\nLocal body.\n",
+    );
+    await fireWindowFocus(page);
+    await expect(codeEditor(page)).toContainText("External body, again.");
+    await appendInCodeEditor(page, "Still local.\n");
+    await expect
+      .poll(() => readProjectFile(projectDir, "conflict.md"))
+      .toBe(
+        "# Conflict\n\nExternal body, again.\n\nLocal body.\nStill local.\n",
+      );
+
+    logE2eEvent("stale-write.merged", { file: "conflict.md" });
   });
 
-  test("overwrite after conflict marks the current draft saved", async ({
+  test("overwrite after an overlap asks first, then saves the shown version", async ({
     page,
   }) => {
     await blockTabChannel(page);
@@ -95,11 +106,11 @@ test.describe("stale writes", () => {
     const filePath = writeProjectFile(
       projectDir,
       "overwrite-conflict.md",
-      "# Conflict\n\nOriginal body.\n",
+      markupDocument("there"),
     );
 
     await openMarkdownFile(page, filePath, "code");
-    await expect(codeEditor(page)).toContainText("Original body.");
+    await expect(codeEditor(page)).toContainText("Hi {==there==}{#c1}.");
 
     const conflictAnswer = page.waitForResponse(
       (response) =>
@@ -107,43 +118,46 @@ test.describe("stale writes", () => {
         response.request().method() === "PUT" &&
         response.status() === 409,
     );
-    fs.writeFileSync(filePath, "# Conflict\n\nExternal body.\n");
-    await appendInCodeEditor(page, "\nLocal overwrite body.\n");
-
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Save conflict",
-    );
+    await overlapInsideMarkup(page, filePath, markupDocument("there me"));
     const shownVersion = (
       (await (await conflictAnswer).json()) as { current: { version: string } }
     ).current.version;
-    await expect(page.getByTestId("file-conflict-disk-version")).toBeVisible();
+    await expect(documentSaveStatus(page)).toHaveAttribute(
+      "aria-label",
+      "Overlaps a change on disk",
+    );
+    expect(readProjectFile(projectDir, "overwrite-conflict.md")).toBe(
+      markupDocument("there me"),
+    );
+
+    await page.getByTestId("file-conflict-action-overwrite").click();
+    const dialog = page.getByTestId("overwrite-confirm-dialog");
+    await expect(dialog).toBeVisible();
+    await expect(page.getByTestId("overwrite-diff-row-removed")).toHaveText(
+      "- Hi {==there me==}{#c1}.",
+    );
+    await expect(page.getByTestId("overwrite-diff-row-added")).toHaveText(
+      "+ Hi {==there you==}{#c1}.",
+    );
 
     const overwriteRequest = page.waitForRequest(
       (request) =>
         request.url().includes("/api/markdown-file?") &&
         request.method() === "PUT",
     );
-    await page.getByTestId("file-conflict-action-overwrite").click();
+    await page.getByTestId("overwrite-confirm-submit").click();
     expect((await overwriteRequest).postDataJSON()).toMatchObject({
       expectedVersion: shownVersion,
     });
 
     await expect
       .poll(() => readProjectFile(projectDir, "overwrite-conflict.md"))
-      .toContain("Local overwrite body.");
+      .toBe(markupDocument("there you"));
     await expect(documentSaveStatus(page)).toHaveAttribute(
       "aria-label",
       "Saved",
     );
-    await expect(documentSaveStatus(page)).not.toHaveAttribute(
-      "aria-label",
-      "Save failed",
-    );
-    await expect(documentSaveStatus(page)).not.toHaveAttribute(
-      "aria-label",
-      "Unsaved changes",
-    );
+    await expect(fileConflictNotice(page)).toHaveCount(0);
 
     logE2eEvent("stale-write.overwrite-saved", {
       file: "overwrite-conflict.md",
@@ -159,33 +173,29 @@ test.describe("stale writes", () => {
     const filePath = writeProjectFile(
       projectDir,
       "newer-than-shown.md",
-      "# Conflict\n\nOriginal body.\n",
+      markupDocument("there"),
     );
 
     await openMarkdownFile(page, filePath, "code");
-    await expect(codeEditor(page)).toContainText("Original body.");
+    await expect(codeEditor(page)).toContainText("Hi {==there==}{#c1}.");
+    await overlapInsideMarkup(page, filePath, markupDocument("there me"));
 
-    fs.writeFileSync(filePath, "# Conflict\n\nExternal body.\n");
-    await appendInCodeEditor(page, "\nLocal body.\n");
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Save conflict",
-    );
-
-    // Another write lands after the banner showed its version.
-    fs.writeFileSync(filePath, "# Conflict\n\nNewest external body.\n");
     await page.getByTestId("file-conflict-action-overwrite").click();
+    await expect(page.getByTestId("overwrite-confirm-dialog")).toBeVisible();
+    // Another write lands after the dialog showed its version.
+    fs.writeFileSync(filePath, markupDocument("there us"));
+    await page.getByTestId("overwrite-confirm-submit").click();
 
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Save conflict",
+    await expect(fileConflictNotice(page)).toBeVisible();
+    await expect(page.getByTestId("file-conflict-hunk-h1-disk")).toHaveText(
+      "Hi {==there us==}{#c1}.",
     );
     expect(readProjectFile(projectDir, "newer-than-shown.md")).toBe(
-      "# Conflict\n\nNewest external body.\n",
+      markupDocument("there us"),
     );
   });
 
-  test("manual save preserves expected-version conflict behavior", async ({
+  test("manual save merges an outside change instead of overwriting it", async ({
     page,
   }) => {
     await blockTabChannel(page);
@@ -205,23 +215,17 @@ test.describe("stale writes", () => {
       process.platform === "darwin" ? "Meta+S" : "Control+S",
     );
 
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Save conflict",
-    );
-    await expect(fileConflictNotice(page)).toContainText(
-      "This file changed on disk while you have unsaved edits.",
-    );
-    expect(readProjectFile(projectDir, "manual-conflict.md")).toBe(
-      "# Manual Conflict\n\nExternal body.\n",
-    );
+    await expect
+      .poll(() => readProjectFile(projectDir, "manual-conflict.md"))
+      .toBe("# Manual Conflict\n\nExternal body.\n\nLocal body.\n");
+    await expect(fileConflictNotice(page)).toHaveCount(0);
 
-    logE2eEvent("stale-write.manual-conflict", {
+    logE2eEvent("stale-write.manual-merged", {
       file: "manual-conflict.md",
     });
   });
 
-  test("rejects autosave after external content changes with stable metadata", async ({
+  test("merges an external content change that kept the same metadata", async ({
     page,
   }) => {
     await blockTabChannel(page);
@@ -240,20 +244,19 @@ test.describe("stale writes", () => {
     fs.utimesSync(filePath, fixedTimestamp, fixedTimestamp);
     await appendInCodeEditor(page, "\nLocal body.\n");
 
-    await expect(documentSaveStatus(page)).toHaveAttribute(
-      "aria-label",
-      "Save conflict",
-    );
-    expect(readProjectFile(projectDir, "metadata-conflict.md")).toBe(
-      "# External\n",
-    );
+    // The content hash, not the mtime, says disk moved: the save is
+    // refused and the edit is merged onto the new text, never written over it.
+    await expect
+      .poll(() => readProjectFile(projectDir, "metadata-conflict.md"))
+      .toBe("# External\n\nLocal body.\n");
+    await expect(fileConflictNotice(page)).toHaveCount(0);
 
-    logE2eEvent("stale-write.metadata-conflict-surfaced", {
+    logE2eEvent("stale-write.metadata-merged", {
       file: "metadata-conflict.md",
     });
   });
 
-  test("keeps explanatory conflict choices visible while scrolled in a long document", async ({
+  test("keeps the overlap choices visible while scrolled in a long document", async ({
     page,
   }) => {
     await blockTabChannel(page);
@@ -265,38 +268,34 @@ test.describe("stale writes", () => {
     const filePath = writeProjectFile(
       projectDir,
       "long-conflict.md",
-      `# Long conflict\n\n${longBody}\n`,
+      markupDocument("there", `${longBody}\n\n`),
     );
 
     await openMarkdownFile(page, filePath, "code");
     await expect(codeEditor(page)).toContainText("Paragraph 1");
-
-    await codeEditor(page).click();
-    await page.keyboard.press(
-      process.platform === "darwin" ? "Meta+End" : "Control+End",
-    );
-    fs.writeFileSync(
+    await overlapInsideMarkup(
+      page,
       filePath,
-      "# Long conflict\n\nExternal body from another editor.\n",
+      markupDocument("there me", `${longBody}\n\n`),
     );
-    await page.keyboard.type("\nLocal draft at the bottom.\n");
 
+    await page.mouse.wheel(0, 20_000);
     const conflictNotice = fileConflictNotice(page);
     await expect(conflictNotice).toBeVisible();
     await expect(conflictNotice).toHaveCSS("position", "fixed");
     await expect(conflictNotice).toContainText(
-      "This file changed on disk while you have unsaved edits.",
+      "Your edit overlaps a change on disk",
     );
-    await expect(conflictNotice).toContainText(
-      "Autosave is paused so your draft will not overwrite those changes.",
-    );
-    await expect(page.getByTestId("file-conflict-action-reload")).toBeVisible();
     await expect(
-      page.getByTestId("file-conflict-action-keep-editing"),
+      page.getByTestId("file-conflict-hunk-h1-theirs"),
     ).toBeVisible();
+    await expect(page.getByTestId("file-conflict-hunk-h1-ours")).toBeVisible();
     await expect(
       page.getByTestId("file-conflict-action-overwrite"),
     ).toBeVisible();
+    await expect(
+      page.getByTestId("file-conflict-action-keep-editing"),
+    ).toHaveCount(0);
   });
 
   test("keeps conflict banner and save status stack from overlapping", async ({
@@ -307,20 +306,19 @@ test.describe("stale writes", () => {
     const filePath = writeProjectFile(
       projectDir,
       "layout-conflict.md",
-      "# Layout conflict\n\nOriginal body.\n",
+      markupDocument("there"),
     );
 
     for (const viewport of [
       { width: 1280, height: 720 },
       { width: 390, height: 844 },
     ]) {
-      fs.writeFileSync(filePath, "# Layout conflict\n\nOriginal body.\n");
+      fs.writeFileSync(filePath, markupDocument("there"));
       await page.setViewportSize(viewport);
       await openMarkdownFile(page, filePath, "code");
-      await expect(codeEditor(page)).toContainText("Original body.");
+      await expect(codeEditor(page)).toContainText("Hi {==there==}{#c1}.");
 
-      fs.writeFileSync(filePath, "# Layout conflict\n\nExternal body.\n");
-      await appendInCodeEditor(page, `\nLocal body ${viewport.width}.\n`);
+      await overlapInsideMarkup(page, filePath, markupDocument("there me"));
 
       const conflictNotice = fileConflictNotice(page);
       const statusStack = page.getByTestId("document-status-stack");
@@ -343,7 +341,7 @@ test.describe("stale writes", () => {
         conflictBox.y + conflictBox.height > stackBox.y;
 
       expect(intersects).toBe(false);
-      await page.getByTestId("file-conflict-action-reload").click();
+      await page.getByTestId("file-conflict-hunk-h1-theirs").click();
       await expect(conflictNotice).toBeHidden();
     }
   });

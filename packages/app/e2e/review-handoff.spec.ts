@@ -8,6 +8,7 @@ import {
   createMarkdownProject,
   logE2eEvent,
   openMarkdownFile,
+  placeCodeCaretAfter,
   readProjectFile,
   removeMarkdownProject,
   writeProjectFile,
@@ -152,31 +153,38 @@ test.describe("review handoff", () => {
     ).toHaveAttribute("data-handoff-state", "ready-no-agent");
   });
 
-  test("a save conflict disables Done and the tooltip names the reason", async ({
+  test("an overlap with disk disables Done and the tooltip names the reason", async ({
     page,
   }) => {
     await blockTabChannel(page);
+    const entry =
+      '  c1:\n    body: "Why?"\n    by: user\n    at: "2026-01-01T00:00:00.000Z"\n';
     const filePath = writeProjectFile(
       projectDir,
       "blocked.md",
-      "# Blocked\n\nOriginal body.\n",
+      `# Blocked\n\nHi {==there==}{#c1}.\n\n---\ncomments:\n${entry}`,
     );
 
     await openMarkdownFile(page, filePath, "code");
-    await expect(codeEditor(page)).toContainText("Original body.");
+    await expect(codeEditor(page)).toContainText("Hi {==there==}{#c1}.");
 
-    fs.writeFileSync(filePath, "# Blocked\n\nExternal body.\n");
-    await appendInCodeEditor(page, "\nLocal body.\n");
+    await placeCodeCaretAfter(page, "there");
+    fs.writeFileSync(
+      filePath,
+      `# Blocked\n\nHi {==there me==}{#c1}.\n\n---\ncomments:\n${entry}`,
+    );
+    await page.keyboard.type(" you");
 
     const button = page.getByTestId("review-handoff-button");
     await expect(button).toHaveAttribute("aria-disabled", "true");
+    await expect(button).toHaveText("Resolve 1 overlap first");
     await expect(
       page.getByTestId("review-handoff-split-button"),
     ).toHaveAttribute("data-handoff-state", "blocked");
 
     await button.hover();
     await expect(page.getByTestId("review-handoff-tooltip")).toHaveText(
-      "Save conflict. Resolve it before you finish.",
+      "Resolve 1 overlap first: your edit overlaps a change on disk.",
     );
   });
 

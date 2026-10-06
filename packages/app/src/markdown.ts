@@ -1,9 +1,8 @@
 import { tables, taskListItems } from "@joplin/turndown-plugin-gfm";
-import {
-  type RfmEndmatterStatus,
-  type RfmYamlError,
-  type RoughdraftDocumentSplit,
-  splitRoughdraftDocument,
+import type {
+  RfmEndmatterStatus,
+  RfmYamlError,
+  RoughdraftDocumentSplit,
 } from "@roughdraft/rfm";
 import { marked } from "marked";
 import TurndownService from "turndown";
@@ -238,12 +237,6 @@ export function prependYamlFrontmatter(
 // An `invalid` block (unparsable YAML, a duplicate key, two review blocks) is
 // still kept out of the body, so the editor never shows it as prose and the
 // serializer never flattens it.
-export function splitYamlDocumentMetadata(
-  markdown: string,
-): YamlDocumentMetadataSplit {
-  return yamlDocumentMetadataFromSplit(splitRoughdraftDocument(markdown));
-}
-
 export function yamlDocumentMetadataFromSplit(
   split: RoughdraftDocumentSplit,
 ): YamlDocumentMetadataSplit {

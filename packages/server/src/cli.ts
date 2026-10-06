@@ -192,7 +192,7 @@ interface ResolvedTargetPath {
   openPath: string;
 }
 
-interface ReusableServer {
+export interface ReusableServer {
   port: number;
   url: string;
   tracked: boolean;
@@ -263,7 +263,7 @@ const currentServerRoot = path.resolve(
   fileURLToPath(new URL("../../..", import.meta.url)),
 );
 
-function readPackageVersion(): string {
+export function readPackageVersion(): string {
   try {
     const packageJsonPath = path.join(currentServerRoot, "package.json");
     const parsed = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
@@ -1036,7 +1036,7 @@ function printHelp(log: (message: string) => void) {
   log("  ack <id>...        Acknowledge Dones by handoff id");
   log("  log                Show the session log");
   log("  route <action>     List, add, remove or test wake routes");
-  log("  mcp                Start the experimental stdio MCP server");
+  log("  mcp                Start the stdio MCP server for agent tools");
   log("  doctor [path]      Diagnose setup or validate Markdown");
   log("  doctor --fix <file> Convert an older review format (after --dry-run)");
   log("  feedback <file>    List every review thread with its context");
@@ -1287,7 +1287,15 @@ function printCommandHelp(
     log("Usage:");
     log("  roughdraft mcp");
     log("");
-    log("Starts Roughdraft's experimental stdio MCP server.");
+    log(
+      "Starts Roughdraft's stdio MCP server (one per agent session). It speaks",
+    );
+    log(
+      "newline-delimited JSON-RPC and Content-Length framing, never starts a",
+    );
+    log(
+      "Roughdraft server, and exits when stdin ends or its parent process goes away.",
+    );
     return;
   }
 
@@ -1977,7 +1985,8 @@ async function normalizeTrackedState(
   return normalizedState;
 }
 
-async function findReusableServer(
+/** Shared with the MCP server, so both find the same running server. */
+export async function findReusableServer(
   deps: CliDependencies,
   options: { serverRoot?: string } = {},
 ): Promise<ReusableServer | null> {
@@ -3953,9 +3962,17 @@ export async function runCli(
         throw usageError("Usage: roughdraft mcp");
       }
 
+      // Settles when the MCP server exits (stdin ended, the parent went
+      // away), so the bin exits with its code instead of hanging on a
+      // promise that never settles.
       const { startMcpServer } = await import("./mcp.js");
-      startMcpServer({ env: deps.env, fetchImpl: deps.fetchImpl });
-      return new Promise<number>(() => {});
+      return await new Promise<number>((resolve) => {
+        startMcpServer({
+          env: deps.env,
+          fetchImpl: deps.fetchImpl,
+          exit: resolve,
+        });
+      });
     }
 
     if (THREAD_COMMANDS.has(command)) {

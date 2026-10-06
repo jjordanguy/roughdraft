@@ -34,3 +34,20 @@ The mitigation is a shared bearer token, `ROUGHDRAFT_TOKEN`:
 - The viewerUrl printed by the CLI includes `?token=...` so the browser tab can authenticate. The frontend forwards the token as a header on fetches and as `?token=` on the EventSource.
 
 Loopback-only deployments stay back-compatible: no token required, no behavior change. The token is the contract that lets non-loopback deployments be safe; the secure-by-default startup guard is the contract that lets us ship the feature without expecting users to read documentation before exposing the endpoints.
+
+## Superseded (2026-10-06): Remote Document Sessions Removed
+
+Jordan's fork removed remote document mode (fork plan, ruling R1), so the in-memory remote-document sessions and their `/api/remote-document/*` endpoints are gone. `ROUGHDRAFT_TOKEN` stays, with a wider job: when set, the server requires `Authorization: Bearer <token>` on every `/api` request, and the server refuses to bind a non-loopback host (`ROUGHDRAFT_BIND_HOST`) without it. A GET request (an event stream) may pass it as `?token=` instead. The CLI and the MCP server send the header whenever the token is set.
+
+## Clarification (2026-10-06): The State Directory Holds Delivery State
+
+The state directory (`~/.roughdraft` by default, `ROUGHDRAFT_STATE_DIR` or the folder of `ROUGHDRAFT_STATE_FILE` otherwise) now holds more than `server.json`:
+
+- `review-log.json`, the session log: per document, the chat session that opened it (harness, label, link, session id) and its Done handoffs with their delivery state (pending, delivered, acknowledged, superseded) and the result of the wake. Unacknowledged Dones are kept 14 days, acknowledged ones 2 days, at most 50 per document and 500 overall.
+- `wake-routes.json`: one wake route per harness (a shell command or a URL), with when it was last verified and its last error.
+- `rounds/<roundId>/`: an agent's review round (the round list, the clean copy, the response template, the file as it was) until `apply` lands it, and `rounds/index.json`, the open rounds the guard hook reads.
+- `backups/`: the copies `roughdraft doctor --fix` makes before it converts a file.
+
+All of this is delivery and agent-handoff state. None of it is a document model: no file's content is stored as the source of truth (a round folder holds working copies the agent edits, and `apply` writes the result back to the Markdown file; a backup is a copy). The Markdown file on disk stays the only record of the document and its review data, and deleting the state directory loses waiting Dones, wake routes and unfinished rounds, never a document or a comment.
+
+The CLI and the MCP server find the running server the same way (`findReusableServer`: the tracked pid plus a status check, then the preferred port when it serves the same install) and never trust `server.json` alone. The MCP server never starts a server; it reports `SERVER_UNREACHABLE` instead.

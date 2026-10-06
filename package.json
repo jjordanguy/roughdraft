@@ -1,6 +1,6 @@
 {
   "name": "roughdraft",
-  "version": "0.1.10",
+  "version": "0.2.0-jordan.1",
   "description": "A local markdown review app",
   "license": "MIT",
   "author": "Nathan Baschez",
@@ -28,7 +28,8 @@
     "test:coverage": "pnpm --filter @roughdraft/app exec vitest run --coverage && pnpm --filter @roughdraft/server exec vitest run --coverage",
     "check": "pnpm lint && pnpm test:selectors && pnpm test && pnpm build",
     "build": "pnpm --filter @roughdraft/rfm build && pnpm --filter @roughdraft/app build && pnpm --filter @roughdraft/server build",
-    "preview": "node packages/server/bin/roughdraft.mjs open README.md"
+    "preview": "node packages/server/bin/roughdraft.mjs open README.md",
+    "test:pack": "node scripts/verify-pack.mjs"
   },
   "files": [
     "packages/app/dist",
@@ -41,7 +42,8 @@
   ],
   "dependencies": {
     "@roughdraft/rfm": "file:packages/rfm",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",

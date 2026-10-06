@@ -27,7 +27,7 @@ describe("resolveUpdateStatus", () => {
     tempPaths.length = 0;
   });
 
-  it("reports when the installed version is behind npm", async () => {
+  it("never contacts npm in the fork and reports no update", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "roughdraft-pkg-"));
     const packageJsonPath = path.join(tempDir, "package.json");
     tempPaths.push(tempDir);
@@ -36,20 +36,24 @@ describe("resolveUpdateStatus", () => {
       JSON.stringify({ name: "roughdraft", version: "0.1.0" }),
     );
 
+    let fetchCalls = 0;
     const status = await resolveUpdateStatus({
       packageJsonPath,
-      fetchImpl: async () =>
-        new Response(JSON.stringify({ version: "0.2.0" }), {
+      fetchImpl: async () => {
+        fetchCalls += 1;
+        return new Response(JSON.stringify({ version: "0.2.0" }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
-        }),
+        });
+      },
     });
 
+    expect(fetchCalls).toBe(0);
     expect(status).toEqual({
       packageName: "roughdraft",
       currentVersion: "0.1.0",
-      latestVersion: "0.2.0",
-      updateAvailable: true,
+      latestVersion: null,
+      updateAvailable: false,
       updateCommand: "npm i -g roughdraft@latest",
     });
   });

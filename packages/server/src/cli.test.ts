@@ -82,6 +82,11 @@ describe("cli", () => {
   const serverRoot = path.resolve(
     fileURLToPath(new URL("../../..", import.meta.url)),
   );
+  const cliVersion = (
+    JSON.parse(
+      fs.readFileSync(path.join(serverRoot, "package.json"), "utf8"),
+    ) as { version: string }
+  ).version;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "roughdraft-cli-"));
@@ -355,6 +360,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
               serverRoot,
@@ -633,6 +639,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               projectDir,
               serverRoot,
             }),
@@ -719,6 +726,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               port: 3000,
               projectDir,
               serverRoot,
@@ -947,6 +955,10 @@ describe("cli", () => {
       startedAt: result.server.startedAt,
       stateFile: getServerStateFilePath(test.deps.env),
       managed: true,
+      serverVersion: cliVersion,
+      cliVersion,
+      versionMatches: true,
+      instanceId: expect.stringMatching(/^srv_/),
     });
   });
 
@@ -1161,6 +1173,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
               serverRoot,
@@ -1254,6 +1267,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
               serverRoot,
@@ -1314,6 +1328,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               pid: 4242,
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
@@ -1689,6 +1704,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir: path.join(tempDir, "other-project"),
               serverRoot: otherServerRoot,
@@ -1704,6 +1720,7 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              version: cliVersion,
               port: ROUGHDRAFT_DEFAULT_PORT + 1,
               projectDir,
               serverRoot,
@@ -1737,6 +1754,149 @@ describe("cli", () => {
     expect(spawnedPort).toBe(ROUGHDRAFT_DEFAULT_PORT + 1);
     expect(spawnedProjectDir).toBe(projectDir);
     expect(result.server.port).toBe(ROUGHDRAFT_DEFAULT_PORT + 1);
+  });
+
+  it("refuses to reuse a running server of another version and points at restart", async () => {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const deps = createCliDependencies({
+      env: { ...process.env, ROUGHDRAFT_STATE_DIR: stateDir },
+      cwd: projectDir,
+      fetchImpl: async (input) => {
+        const url =
+          input instanceof URL
+            ? input
+            : new URL(
+                typeof input === "string" ? input : input.url,
+                "http://localhost",
+              );
+        if (
+          url.pathname === "/api/status" &&
+          url.port === String(ROUGHDRAFT_DEFAULT_PORT)
+        ) {
+          return new Response(
+            JSON.stringify({
+              backend: "local-files",
+              version: "0.1.10",
+              port: ROUGHDRAFT_DEFAULT_PORT,
+              projectDir,
+              serverRoot,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        throw new Error("connect ECONNREFUSED");
+      },
+      log: (message) => logs.push(message),
+      error: (message) => errors.push(message),
+      resolveUpdateStatus: noUpdateStatus,
+      spawnServerProcess: async () => {
+        throw new Error("should not spawn while a mismatched server runs");
+      },
+      isProcessRunning: () => false,
+    });
+
+    expect(await runCli(["start"], deps)).toBe(3);
+    expect(errors[0]).toContain("version 0.1.10");
+    expect(errors[1]).toContain("roughdraft restart");
+
+    const jsonExit = await runCli(["start", "--json"], deps);
+    expect(jsonExit).toBe(3);
+    const payload = JSON.parse(logs.at(-1) ?? "{}") as {
+      ok: boolean;
+      exitCode: number;
+      error: { code: string; hint: string };
+    };
+    expect(payload.ok).toBe(false);
+    expect(payload.exitCode).toBe(3);
+    expect(payload.error.code).toBe("SERVER_VERSION_MISMATCH");
+    expect(payload.error.hint).toContain("roughdraft restart");
+
+    const statusExit = await runCli(["status", "--json"], deps);
+    expect(statusExit).toBe(0);
+    const status = JSON.parse(logs.at(-1) ?? "{}") as {
+      running: boolean;
+      serverVersion: string;
+      cliVersion: string;
+      versionMatches: boolean;
+    };
+    expect(status.running).toBe(true);
+    expect(status.serverVersion).toBe("0.1.10");
+    expect(status.cliVersion).toBe(cliVersion);
+    expect(status.versionMatches).toBe(false);
+  });
+
+  it("treats a server without a version as older and refuses it", async () => {
+    const errors: string[] = [];
+    const deps = createCliDependencies({
+      env: { ...process.env, ROUGHDRAFT_STATE_DIR: stateDir },
+      cwd: projectDir,
+      fetchImpl: async (input) => {
+        const url =
+          input instanceof URL
+            ? input
+            : new URL(
+                typeof input === "string" ? input : input.url,
+                "http://localhost",
+              );
+        if (url.pathname === "/api/status") {
+          return new Response(
+            JSON.stringify({
+              backend: "local-files",
+              port: ROUGHDRAFT_DEFAULT_PORT,
+              projectDir,
+              serverRoot,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        throw new Error("connect ECONNREFUSED");
+      },
+      log: () => {},
+      error: (message) => errors.push(message),
+      resolveUpdateStatus: noUpdateStatus,
+      spawnServerProcess: async () => {
+        throw new Error("should not spawn");
+      },
+      isProcessRunning: () => false,
+    });
+
+    expect(await runCli(["start"], deps)).toBe(3);
+    expect(errors[0]).toContain("older than 0.2.0");
+  });
+
+  it("restart stops the managed server and starts this version", async () => {
+    const { deps, logs, getSpawnCount } = createTestDependencies();
+
+    expect(await runCli(["start", "--json"], deps)).toBe(0);
+    const started = JSON.parse(logs.at(-1) ?? "{}") as {
+      pid: number;
+      serverVersion: string;
+      versionMatches: boolean;
+    };
+    expect(started.versionMatches).toBe(true);
+    expect(started.serverVersion).toBe(cliVersion);
+
+    expect(await runCli(["restart", "--json"], deps)).toBe(0);
+    const restarted = JSON.parse(logs.at(-1) ?? "{}") as {
+      running: boolean;
+      pid: number;
+      restarted: boolean;
+      stoppedPid: number | null;
+    };
+    expect(restarted.running).toBe(true);
+    expect(restarted.restarted).toBe(true);
+    expect(restarted.stoppedPid).toBe(started.pid);
+    expect(restarted.pid).not.toBe(started.pid);
+    expect(getSpawnCount()).toBe(2);
+    expect(runningPids.has(started.pid)).toBe(false);
+    expect(runningPids.has(restarted.pid)).toBe(true);
+  });
+
+  it("restart with no server running simply starts one", async () => {
+    const { deps, logs } = createTestDependencies();
+    expect(await runCli(["restart"], deps)).toBe(0);
+    expect(logs.at(-1)).toMatch(/^Roughdraft running at http:\/\/localhost:/);
   });
 });
 

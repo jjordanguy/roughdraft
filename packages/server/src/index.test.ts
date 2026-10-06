@@ -540,6 +540,8 @@ describe("createApp", () => {
       pid: process.pid,
       port: 4312,
       serverRoot,
+      version: expect.any(String),
+      instanceId: expect.stringMatching(/^srv_/),
       stateless: true,
       capabilities: {
         projectPathRequired: true,
@@ -551,7 +553,7 @@ describe("createApp", () => {
     expect(response.body).not.toHaveProperty("projectDir");
   });
 
-  it("reports update status from npm metadata", async () => {
+  it("reports update status with the registry check disabled", async () => {
     const packageJsonPath = path.join(projectDir, "package.json");
     fs.writeFileSync(
       packageJsonPath,
@@ -575,8 +577,8 @@ describe("createApp", () => {
     expect(response.body).toEqual({
       packageName: "roughdraft",
       currentVersion: "0.1.0",
-      latestVersion: "0.2.0",
-      updateAvailable: true,
+      latestVersion: null,
+      updateAvailable: false,
       updateCommand: "npm i -g roughdraft@latest",
     });
   });

@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { type CliDependencies, createCliDependencies, runCli } from "./cli";
 import { readRoundIndex } from "./guard";
+import { callToolResult } from "./mcp";
 import { createApp } from "./index";
 
 // The review commands driven through `runCli` against real `createApp`
@@ -528,6 +529,31 @@ describe("review commands", () => {
       expect(entries().filter((item) => item.id === "a1")).toHaveLength(1);
     });
 
+    it("reruns when the file changes inside the server's write, between its read and its rename", async () => {
+      let races = 0;
+      await startServer({
+        beforeWriteCommit: () => {
+          if (races > 0) return;
+          races += 1;
+          // An agent's Edit tool writes while the server is mid-write.
+          const text = fs.readFileSync(doc, "utf8");
+          fs.writeFileSync(
+            doc,
+            text.replace(
+              "The pilot is small on purpose.",
+              "The pilot is small on purpose (edited mid-write).",
+            ),
+          );
+        },
+      });
+      const result = await run(["reply", doc, "c1", "Cited.", "--json"]);
+      expect(result.exitCode).toBe(0);
+      expect(races).toBe(1);
+      expect(result.json).toMatchObject({ writtenVia: "server", attempts: 2 });
+      expect(fs.readFileSync(doc, "utf8")).toContain("(edited mid-write)");
+      expect(entries().filter((item) => item.id === "a1")).toHaveLength(1);
+    });
+
     it("gives up after three reruns with nothing of its own written", async () => {
       await startServer();
       const race = racingFetch(100);
@@ -889,6 +915,58 @@ describe("review commands", () => {
         "--json",
       ]);
       expect(waited.exitCode).toBe(0);
+    });
+
+    it("shows tabsDirty and tabsConflict in `status` and roughdraft_get_open_documents", async () => {
+      const server = await startServer();
+      const tab = await openTab(server);
+      tab.presence({ dirty: true });
+      await waitFor(
+        async () => (await documentView(server)).body.tabsDirty,
+        (count) => count === 1,
+      );
+
+      const human = await run(["status"]);
+      expect(human.exitCode).toBe(0);
+      expect(human.logs).toContain(
+        "plan.md: 1 tab (1 with unsaved edits), no agent listening, no Done yet",
+      );
+      const json = await run(["status", "--json"]);
+      expect(json.json.documents).toEqual([
+        expect.objectContaining({
+          documentPath: doc,
+          tabs: 1,
+          tabsDirty: 1,
+          tabsConflict: 0,
+        }),
+      ]);
+
+      tab.presence({ dirty: false, conflict: true });
+      await waitFor(
+        async () => (await documentView(server)).body.tabsConflict,
+        (count) => count === 1,
+      );
+      const tool = await callToolResult(
+        "roughdraft_get_open_documents",
+        {},
+        {
+          HOME: tempDir,
+          ROUGHDRAFT_STATE_DIR: stateDir,
+          ROUGHDRAFT_PORT: String(unusedPort),
+        },
+      );
+      const listed = JSON.parse(tool.content[0]?.text ?? "null");
+      expect(listed.documents).toEqual([
+        expect.objectContaining({
+          documentPath: doc,
+          tabs: 1,
+          tabsDirty: 0,
+          tabsConflict: 1,
+        }),
+      ]);
+      expect((await run(["status"])).logs).toContain(
+        "plan.md: 1 tab (1 with a conflict), no agent listening, no Done yet",
+      );
     });
 
     it("uses a browser save after the round as the baseline, so Jordan's edit is his", async () => {

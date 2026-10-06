@@ -10,9 +10,11 @@
  *
  * Every write goes through `PUT /api/markdown-file` with
  * `expectedContentHash` when a fork server is running, rerun up to three
- * times on 409; with no server it writes a temp file in the same folder,
- * re-checks the target's hash and renames. Nothing here ever writes a file
- * the engine refused.
+ * times on 409 (the server re-checks the hash right before its rename, so a
+ * write that lands between its read and its rename is a 409 too); with no
+ * server it uses the same atomic write (`atomic-write.ts`) directly, where a
+ * changed hash also means a rerun. Nothing here ever writes a file the
+ * engine refused.
  */
 
 import crypto from "node:crypto";
@@ -33,6 +35,7 @@ import {
   RoughdraftFormatError,
   validateRoughdraftMarkdown,
 } from "@roughdraft/rfm";
+import { writeFileAtomic } from "./atomic-write.js";
 import { CliError, usageError } from "./errors.js";
 import { clearOpenRound, recordOpenRound, roundsDir } from "./guard.js";
 import {
@@ -191,30 +194,13 @@ async function writeDocument(
     };
   }
 
-  // No server: temp file beside the target, hash re-check, rename.
-  const dir = path.dirname(target.path);
-  const temp = path.join(
-    dir,
-    `.${path.basename(target.path)}.roughdraft-${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`,
-  );
-  const mode = fs.statSync(target.path).mode & 0o777;
-  const fd = fs.openSync(temp, "w", mode);
-  try {
-    fs.writeFileSync(fd, content);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    if (sha256(fs.readFileSync(target.path)) !== expectedHash) {
-      fs.rmSync(temp, { force: true });
-      return { status: "conflict" };
-    }
-    fs.renameSync(temp, target.path);
-  } catch (error) {
-    fs.rmSync(temp, { force: true });
-    throw error;
-  }
+  // No server: the same atomic write the server uses (temp file beside the
+  // real file, fsync, hash re-check, rename; or in place with
+  // ROUGHDRAFT_WRITE_MODE=inplace).
+  const outcome = await writeFileAtomic(target.path, content, {
+    expectedHash,
+  });
+  if (outcome.status === "conflict") return { status: "conflict" };
   const written = readSnapshot(target.path);
   return {
     status: "written",

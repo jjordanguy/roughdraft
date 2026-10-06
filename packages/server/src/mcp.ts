@@ -91,7 +91,7 @@ const tools: ToolDefinition[] = [
   {
     name: "roughdraft_get_open_documents",
     description:
-      "List the documents in Roughdraft's session log: path, link, open tabs, listening agents, the session that opened each one, and its handoffs. Reads the log on disk when the server is not running (server.running is then false).",
+      "List the documents in Roughdraft's session log: path, link, open tabs, tabsDirty (tabs with unsaved edits) and tabsConflict (tabs holding an unsettled conflict), listening agents, the session that opened each one, and its handoffs. Before writing to a document whose tabsDirty is above zero, wait for the tab to save (Jordan is typing). Reads the log on disk when the server is not running (server.running is then false, and the tab counts are 0).",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -525,9 +525,11 @@ export async function callTool(
     }
     const disk = readReviewLogFromDisk(server?.stateDir ?? getStateDir(env));
     return {
-      documents: disk.documents.map((record) =>
-        documentViewFromRecord(record, null),
-      ),
+      documents: disk.documents.map((record) => ({
+        ...documentViewFromRecord(record, null),
+        tabsDirty: 0,
+        tabsConflict: 0,
+      })),
       server: server
         ? {
             running: true,

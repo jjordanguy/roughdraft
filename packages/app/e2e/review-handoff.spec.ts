@@ -55,8 +55,10 @@ test.describe("review handoff", () => {
       .fill(overallComment);
     await page.getByTestId("review-handoff-button").click();
 
+    // A legacy long-poll watcher acknowledges the Done as soon as it returns,
+    // so the status may already read "picked up" by the time it is checked.
     await expect(page.getByTestId("review-handoff-status")).toContainText(
-      "Your agent is now working",
+      /Your agent (is now working|picked this up)/,
     );
 
     await expect
@@ -99,7 +101,9 @@ test.describe("review handoff", () => {
     await openMarkdownFile(page, filePath);
     await page.getByTestId("review-handoff-button").click();
 
-    await expect(page.getByTestId("review-handoff-button")).toHaveText("Sent");
+    await expect(page.getByTestId("review-handoff-button")).toHaveText(
+      /^(Sent|Picked up)$/,
+    );
     await expect(page.getByTestId("review-handoff-status")).toBeVisible();
 
     await page.keyboard.press("Escape");

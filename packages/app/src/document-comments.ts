@@ -2,6 +2,7 @@ import {
   buildCommentThreads,
   type CriticComment,
   flattenCommentThreads,
+  getCommentDescendantIds,
 } from "./critic-markup";
 
 interface CommentAnchorMeasurement {
@@ -192,36 +193,62 @@ export function groupCommentAnchorMeasurements(
   );
 }
 
+// Threads come from the comment map, not from the ids an anchor carries: one
+// entry per root, placed at its primary anchor (the smallest top across every
+// anchor that carries the root, continuations included), with every reply
+// under the root wherever the file stores it.
 export function buildCommentThreadRailItems(
   groups: CommentGroupAnchor[],
   comments: ReadonlyMap<string, CriticComment>,
+  options?: { excludeRootIds?: ReadonlySet<string> },
 ): CommentThreadRailItem[] {
-  const items: CommentThreadRailItem[] = [];
+  const placements = new Map<
+    string,
+    { groupKey: string; anchorTop: number; anchorBottom: number }
+  >();
 
   for (const group of groups) {
-    const visibleComments = group.commentIds
-      .map((commentId) => comments.get(commentId))
-      .filter((comment): comment is CriticComment => Boolean(comment));
+    for (const commentId of group.commentIds) {
+      const rootId = getRootThreadIdForCommentId(commentId, comments);
+      if (!rootId || options?.excludeRootIds?.has(rootId)) continue;
 
-    if (visibleComments.length === 0) continue;
-
-    for (const thread of buildCommentThreads(visibleComments)) {
-      const threadComments = flattenCommentThreads([thread]);
-
-      if (threadComments.length === 0) continue;
-
-      items.push({
-        key: thread.comment.id,
-        anchorGroupKey: group.key,
-        rootCommentId: thread.comment.id,
-        commentIds: threadComments.map((comment) => comment.id),
+      const current = placements.get(rootId);
+      if (current && current.anchorTop <= group.anchorTop) continue;
+      placements.set(rootId, {
+        groupKey: group.key,
         anchorTop: group.anchorTop,
         anchorBottom: group.anchorBottom,
       });
     }
   }
 
-  return items;
+  return [...placements]
+    .map(([rootId, placement]) => {
+      const root = comments.get(rootId);
+      const threadComments = root
+        ? flattenCommentThreads(
+            buildCommentThreads([
+              root,
+              ...getCommentDescendantIds(rootId, comments)
+                .map((id) => comments.get(id))
+                .filter((comment): comment is CriticComment =>
+                  Boolean(comment),
+                ),
+            ]),
+          )
+        : [];
+
+      return {
+        key: rootId,
+        anchorGroupKey: placement.groupKey,
+        rootCommentId: rootId,
+        commentIds: threadComments.map((comment) => comment.id),
+        anchorTop: placement.anchorTop,
+        anchorBottom: placement.anchorBottom,
+      };
+    })
+    .filter((item) => item.commentIds.length > 0)
+    .sort((left, right) => left.anchorTop - right.anchorTop);
 }
 
 export function resolveCommentRailLayouts(

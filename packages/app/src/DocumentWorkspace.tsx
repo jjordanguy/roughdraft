@@ -1405,6 +1405,7 @@ export function DocumentWorkspace({
                         ({ value, label, Icon }) => (
                           <SelectItem
                             key={value}
+                            data-testid={`document-mode-option-${value}`}
                             value={value}
                             label={label}
                             className="text-[0.8rem]"

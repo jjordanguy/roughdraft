@@ -1,7 +1,15 @@
 import type { Editor } from "@tiptap/react";
-import { Check, Reply, X } from "lucide-react";
+import {
+  Check,
+  ChevronRight,
+  FileText,
+  Reply,
+  RotateCcw,
+  X,
+} from "lucide-react";
 import {
   type CSSProperties,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -10,15 +18,18 @@ import {
   useState,
 } from "react";
 import {
-  CommentEditorList,
   type CommentActionDefinition,
   type CommentActionsRenderContext,
   type CommentContentRenderContext,
+  CommentEditorList,
 } from "./CommentEditorList";
-import type {
-  CriticChangeAttrs,
-  CriticChangeKind,
-  CriticComment,
+import {
+  type CriticChangeAttrs,
+  type CriticChangeKind,
+  type CriticComment,
+  getThreadComments,
+  isGlobalThreadRoot,
+  isResolvedComment,
 } from "./critic-markup";
 import {
   buildCommentThreadRailItems,
@@ -64,6 +75,8 @@ interface DocumentReviewRailProps {
   onSelectComment: (commentId: string) => void;
   onFocusComment: (commentId: string) => void;
   onHoverComment: (commentId: string | null) => void;
+  onResolveComment?: (commentId: string) => void;
+  onReopenComment?: (commentId: string) => void;
   onAcceptSuggestion: (changeId: string) => void;
   onRejectSuggestion: (changeId: string) => void;
   onReplySuggestion: (changeId: string) => void;
@@ -182,6 +195,340 @@ function SuggestionCommentContent({
   );
 }
 
+const GLOBAL_SECTION_KEY = "__global_comments__";
+const RESOLVED_THREADS_KEY = "__resolved_comments__";
+
+export interface CommentThreadHandlers {
+  selectedCommentId: string | null;
+  hoveredCommentId: string | null;
+  onDeleteComment: (commentId: string) => void;
+  onUpdateComment: (commentId: string, nextContent: string) => void;
+  onReplyComment: (commentId: string) => void;
+  onSelectComment: (commentId: string) => void;
+  onFocusComment: (commentId: string) => void;
+  onHoverComment: (commentId: string | null) => void;
+  onResolveComment?: (commentId: string) => void;
+  onReopenComment?: (commentId: string) => void;
+  pendingFocusCommentId?: string | null;
+  newCommentDraftIds?: string[];
+  onAutoFocusComment?: (commentId: string) => void;
+}
+
+function sortNewestFirst(comments: CriticComment[]) {
+  return [...comments].sort((left, right) => {
+    const leftTime = Date.parse(left.createdAt);
+    const rightTime = Date.parse(right.createdAt);
+    if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) {
+      return right.createdAt.localeCompare(left.createdAt);
+    }
+    return rightTime - leftTime;
+  });
+}
+
+/** Roots shown in the global section: open ones newest first, resolved ones folded. */
+export function getGlobalThreadRoots(
+  comments: ReadonlyMap<string, CriticComment>,
+) {
+  const roots = sortNewestFirst(
+    [...comments.values()].filter(
+      (comment) => !comment.literal && isGlobalThreadRoot(comment, comments),
+    ),
+  );
+
+  return {
+    open: roots.filter((root) => !isResolvedComment(root)),
+    resolved: roots.filter((root) => isResolvedComment(root)),
+  };
+}
+
+function ThreadRootContent({
+  comment,
+  defaultContent,
+}: {
+  comment: CriticComment;
+  defaultContent: ReactNode;
+}) {
+  return (
+    <>
+      {comment.lostAnchor ? (
+        <span
+          data-testid={`comment-lost-anchor-${comment.id}`}
+          className="mb-0.5 block text-[11px] font-medium text-amber-700 dark:text-amber-400"
+        >
+          Anchor lost: the highlighted text is no longer in the document.
+        </span>
+      ) : null}
+      {comment.scope === "code" && comment.quote ? (
+        <span
+          data-testid={`comment-code-quote-${comment.id}`}
+          className="mb-1 block truncate rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600 dark:bg-slate-800 dark:text-slate-300"
+        >
+          {comment.codeLines
+            ? `Lines ${comment.codeLines[0]}-${comment.codeLines[1]}: `
+            : ""}
+          {comment.quote.split("\n")[0]}
+        </span>
+      ) : null}
+      {defaultContent}
+      {isResolvedComment(comment) ? (
+        <span
+          data-testid={`comment-resolved-summary-${comment.id}`}
+          className="mt-1 flex items-start gap-1 text-[12px] text-emerald-700 dark:text-emerald-400"
+        >
+          <Check className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+          <span>Resolved{comment.resolved ? `: ${comment.resolved}` : ""}</span>
+        </span>
+      ) : null}
+    </>
+  );
+}
+
+// One thread (a root and every reply under it, from the comment map) as a
+// card. Collapsed until selected, like an anchored thread.
+export function CommentThreadCard({
+  rootId,
+  comments,
+  handlers,
+  variant = "rail",
+  testId,
+  className,
+  style,
+  selected,
+  muted = false,
+  cardRef,
+  onActivate,
+}: {
+  rootId: string;
+  comments: ReadonlyMap<string, CriticComment>;
+  handlers: CommentThreadHandlers;
+  variant?: "rail" | "banner";
+  testId: string;
+  className?: string;
+  style?: CSSProperties;
+  selected: boolean;
+  muted?: boolean;
+  cardRef?: (node: HTMLDivElement | null) => void;
+  onActivate?: (commentId: string) => void;
+}) {
+  const threadComments = getThreadComments(rootId, comments);
+  if (threadComments.length === 0) return null;
+
+  const primaryCommentId =
+    getPreferredCommentId(
+      threadComments.map((comment) => comment.id),
+      handlers.selectedCommentId,
+    ) ?? rootId;
+
+  return (
+    <div
+      ref={cardRef}
+      data-testid={testId}
+      data-comment-thread-container="true"
+      data-thread-root-id={rootId}
+      className={cn(
+        "rounded-xl border border-transparent bg-transparent shadow-none transition-all duration-200 ease-out",
+        selected
+          ? "border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]"
+          : "cursor-pointer",
+        muted && !selected && "opacity-70",
+        className,
+      )}
+      style={style}
+      onMouseEnter={() => handlers.onHoverComment(primaryCommentId)}
+      onMouseLeave={() => handlers.onHoverComment(null)}
+      onClick={() => {
+        if (selected) return;
+        (onActivate ?? handlers.onFocusComment)(primaryCommentId);
+      }}
+    >
+      <CommentEditorList
+        comments={threadComments}
+        variant={variant}
+        className={cn(!selected && "pointer-events-none")}
+        interactive={selected}
+        selectedCommentId={handlers.selectedCommentId}
+        hoveredCommentId={handlers.hoveredCommentId}
+        onDeleteComment={handlers.onDeleteComment}
+        onUpdateComment={handlers.onUpdateComment}
+        onReplyComment={handlers.onReplyComment}
+        onSelectComment={handlers.onSelectComment}
+        onFocusComment={handlers.onFocusComment}
+        onHoverComment={handlers.onHoverComment}
+        pendingFocusCommentId={handlers.pendingFocusCommentId}
+        newCommentDraftIds={handlers.newCommentDraftIds}
+        onAutoFocusComment={handlers.onAutoFocusComment}
+        renderCommentContent={({ comment, depth, defaultContent }) =>
+          depth === 0 ? (
+            <ThreadRootContent
+              comment={comment}
+              defaultContent={defaultContent}
+            />
+          ) : (
+            defaultContent
+          )
+        }
+        getCommentActions={({ comment, depth, isEditing, defaultActions }) => {
+          if (depth !== 0 || isEditing) return defaultActions;
+          if (isResolvedComment(comment)) {
+            return handlers.onReopenComment
+              ? [
+                  ...defaultActions,
+                  {
+                    key: "reopen",
+                    label: "Reopen",
+                    icon: <RotateCcw className="size-3.5" />,
+                    onClick: (event) => {
+                      event.stopPropagation();
+                      handlers.onReopenComment?.(comment.id);
+                    },
+                  },
+                ]
+              : defaultActions;
+          }
+          return handlers.onResolveComment
+            ? [
+                ...defaultActions,
+                {
+                  key: "resolve",
+                  label: "Resolve",
+                  icon: <Check className="size-3.5" />,
+                  compact: true,
+                  onClick: (event) => {
+                    event.stopPropagation();
+                    handlers.onResolveComment?.(comment.id);
+                  },
+                },
+              ]
+            : defaultActions;
+        }}
+      />
+    </div>
+  );
+}
+
+// "N resolved", folded by default; opens on click or when one of its threads
+// is selected. Each thread inside keeps its Reopen action.
+function ResolvedThreadsFold({
+  rootIds,
+  comments,
+  handlers,
+  activeRootThreadId,
+  variant,
+  testId,
+}: {
+  rootIds: string[];
+  comments: ReadonlyMap<string, CriticComment>;
+  handlers: CommentThreadHandlers;
+  activeRootThreadId: string | null;
+  variant: "rail" | "banner";
+  testId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const containsActive =
+    !!activeRootThreadId && rootIds.includes(activeRootThreadId);
+  const expanded = open || containsActive;
+
+  if (rootIds.length === 0) return null;
+
+  return (
+    <div data-comment-thread-container="true" className="grid gap-2">
+      <button
+        type="button"
+        data-testid={testId}
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-1.5 rounded-lg px-3 py-1.5 text-left text-xs font-medium text-stone-500 transition hover:bg-stone-100 hover:text-stone-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-300 dark:text-stone-400 dark:hover:bg-slate-800 dark:hover:text-stone-200"
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen(!expanded);
+        }}
+      >
+        <ChevronRight
+          className={cn(
+            "size-3.5 transition-transform",
+            expanded && "rotate-90",
+          )}
+          aria-hidden="true"
+        />
+        {rootIds.length} resolved
+      </button>
+      {expanded
+        ? rootIds.map((rootId) => (
+            <CommentThreadCard
+              key={rootId}
+              rootId={rootId}
+              comments={comments}
+              handlers={handlers}
+              variant={variant}
+              testId={`resolved-comment-thread-${rootId}`}
+              selected={activeRootThreadId === rootId}
+              muted
+            />
+          ))
+        : null}
+    </div>
+  );
+}
+
+// The global section: document-level comments, comments whose anchor is
+// gone and replies whose parent is missing, newest first, resolved ones
+// folded into one row at the bottom.
+export function GlobalCommentsSection({
+  comments,
+  handlers,
+  activeRootThreadId,
+  variant = "rail",
+  testId = "document-comments-section",
+}: {
+  comments: ReadonlyMap<string, CriticComment>;
+  handlers: CommentThreadHandlers;
+  activeRootThreadId: string | null;
+  variant?: "rail" | "banner";
+  testId?: string;
+}) {
+  const { open, resolved } = getGlobalThreadRoots(comments);
+  if (open.length === 0 && resolved.length === 0) return null;
+
+  return (
+    <section
+      data-testid={testId}
+      aria-label="Global comments"
+      className="grid gap-2"
+    >
+      <div className="flex items-center gap-1.5 px-3 text-[11px] font-semibold tracking-[0.08em] text-stone-500 uppercase dark:text-stone-400">
+        <FileText className="size-3.5" aria-hidden="true" />
+        Global comments
+        {open.length > 0 ? (
+          <span
+            data-testid="document-comments-open-count"
+            className="rounded-full bg-stone-200/70 px-1.5 text-[10px] tracking-normal text-stone-600 dark:bg-slate-700 dark:text-slate-300"
+          >
+            {open.length}
+          </span>
+        ) : null}
+      </div>
+      {open.map((root) => (
+        <CommentThreadCard
+          key={root.id}
+          rootId={root.id}
+          comments={comments}
+          handlers={handlers}
+          variant={variant}
+          testId={`document-comment-thread-${root.id}`}
+          selected={activeRootThreadId === root.id}
+        />
+      ))}
+      <ResolvedThreadsFold
+        rootIds={resolved.map((root) => root.id)}
+        comments={comments}
+        handlers={handlers}
+        activeRootThreadId={activeRootThreadId}
+        variant={variant}
+        testId="document-comments-resolved-toggle"
+      />
+    </section>
+  );
+}
+
 export function DocumentReviewRail({
   commentGroups,
   comments,
@@ -200,6 +547,8 @@ export function DocumentReviewRail({
   onSelectComment,
   onFocusComment,
   onHoverComment,
+  onResolveComment,
+  onReopenComment,
   onAcceptSuggestion,
   onRejectSuggestion,
   onReplySuggestion,
@@ -229,51 +578,77 @@ export function DocumentReviewRail({
     [suggestions],
   );
 
-  const visibleCommentThreads = useMemo(
+  const globalRoots = useMemo(() => getGlobalThreadRoots(comments), [comments]);
+
+  const visibleCommentThreads = useMemo(() => {
+    const excludeRootIds = new Set<string>(suggestionCommentIds);
+    for (const comment of comments.values()) {
+      if (comment.literal || isGlobalThreadRoot(comment, comments)) {
+        excludeRootIds.add(comment.id);
+      }
+    }
+
+    return buildCommentThreadRailItems(commentGroups, comments, {
+      excludeRootIds,
+    })
+      .map((item) => {
+        const visibleComments = item.commentIds
+          .map((commentId) => comments.get(commentId))
+          .filter((comment): comment is CriticComment => Boolean(comment));
+
+        if (visibleComments.length === 0) return null;
+
+        return {
+          ...item,
+          visibleComments,
+        };
+      })
+      .filter(
+        (
+          item,
+        ): item is CommentThreadRailItem & {
+          visibleComments: CriticComment[];
+        } => Boolean(item),
+      );
+  }, [commentGroups, comments, suggestionCommentIds]);
+
+  const resolvedThreadRootIds = useMemo(
     () =>
-      buildCommentThreadRailItems(
-        commentGroups
-          .map((group) => ({
-            ...group,
-            commentIds: group.commentIds.filter(
-              (commentId) => !suggestionCommentIds.has(commentId),
-            ),
-          }))
-          .filter((group) => group.commentIds.length > 0),
-        comments,
-      )
-        .map((item) => {
-          const visibleComments = item.commentIds
-            .map((commentId) => comments.get(commentId))
-            .filter((comment): comment is CriticComment => Boolean(comment));
-
-          if (visibleComments.length === 0) return null;
-
-          return {
-            ...item,
-            visibleComments,
-          };
-        })
-        .filter(
-          (
-            item,
-          ): item is CommentThreadRailItem & {
-            visibleComments: CriticComment[];
-          } => Boolean(item),
-        ),
-    [commentGroups, comments, suggestionCommentIds],
+      visibleCommentThreads
+        .filter((thread) =>
+          isResolvedComment(comments.get(thread.rootCommentId)),
+        )
+        .map((thread) => thread.rootCommentId),
+    [comments, visibleCommentThreads],
   );
 
   const commentEntries = useMemo(
     () =>
-      visibleCommentThreads.map((thread) => ({
-        type: "comment" as const,
-        key: thread.key,
-        anchorTop: thread.anchorTop,
-        anchorBottom: thread.anchorBottom,
-        thread,
-      })),
-    [visibleCommentThreads],
+      visibleCommentThreads
+        .filter(
+          (thread) => !isResolvedComment(comments.get(thread.rootCommentId)),
+        )
+        .map((thread) => ({
+          type: "comment" as const,
+          key: thread.key,
+          anchorTop: thread.anchorTop,
+          anchorBottom: thread.anchorBottom,
+          thread,
+        })),
+    [comments, visibleCommentThreads],
+  );
+
+  const globalEntry = useMemo(
+    () =>
+      globalRoots.open.length > 0 || globalRoots.resolved.length > 0
+        ? {
+            type: "global" as const,
+            key: GLOBAL_SECTION_KEY,
+            anchorTop: 0,
+            anchorBottom: 0,
+          }
+        : null,
+    [globalRoots],
   );
 
   const suggestionEntries = useMemo(
@@ -321,16 +696,53 @@ export function DocumentReviewRail({
   );
 
   const layouts = useMemo(() => {
-    const entries = [
+    const anchoredEntries = [
       ...suggestionEntries,
       ...commentEntries,
       ...(draftEntry ? [draftEntry] : []),
-    ].sort((left, right) => left.anchorTop - right.anchorTop);
+    ];
+    // Resolved anchored threads fold into one row below every other card.
+    const lastAnchorTop = Math.max(
+      0,
+      ...anchoredEntries.map((entry) => entry.anchorTop),
+    );
+    const resolvedEntry =
+      resolvedThreadRootIds.length > 0
+        ? {
+            type: "resolved" as const,
+            key: RESOLVED_THREADS_KEY,
+            anchorTop: lastAnchorTop + 1,
+            anchorBottom: lastAnchorTop + 1,
+          }
+        : null;
+    const entries: Array<
+      | (typeof anchoredEntries)[number]
+      | NonNullable<typeof resolvedEntry>
+      | NonNullable<typeof globalEntry>
+    > = [...anchoredEntries, ...(resolvedEntry ? [resolvedEntry] : [])].sort(
+      (left, right) => left.anchorTop - right.anchorTop,
+    );
+    // The global section always sits first, at the top of the rail.
+    if (globalEntry) {
+      entries.unshift(globalEntry);
+    }
+    const activeRootIsGlobal =
+      !!activeRootThreadId &&
+      [...globalRoots.open, ...globalRoots.resolved].some(
+        (root) => root.id === activeRootThreadId,
+      );
+    const activeRootIsResolved =
+      !!activeRootThreadId &&
+      resolvedThreadRootIds.includes(activeRootThreadId);
     const activeKey =
       draftEntry?.key ??
       selectedChangeId ??
       activeSuggestionIdForComment ??
-      activeRootThreadId;
+      (activeRootIsGlobal
+        ? GLOBAL_SECTION_KEY
+        : activeRootIsResolved
+          ? RESOLVED_THREADS_KEY
+          : activeRootThreadId);
 
     return resolveAnchoredRailLayouts(entries, itemHeights, activeKey);
   }, [
@@ -338,10 +750,29 @@ export function DocumentReviewRail({
     activeSuggestionIdForComment,
     commentEntries,
     draftEntry,
+    globalEntry,
+    globalRoots,
     itemHeights,
+    resolvedThreadRootIds,
     selectedChangeId,
     suggestionEntries,
   ]);
+
+  const threadHandlers: CommentThreadHandlers = {
+    selectedCommentId,
+    hoveredCommentId,
+    onDeleteComment,
+    onUpdateComment,
+    onReplyComment,
+    onSelectComment,
+    onFocusComment,
+    onHoverComment,
+    onResolveComment,
+    onReopenComment,
+    pendingFocusCommentId,
+    newCommentDraftIds,
+    onAutoFocusComment,
+  };
 
   const setItemRef = useCallback((key: string, node: HTMLDivElement | null) => {
     if (node) {
@@ -431,61 +862,63 @@ export function DocumentReviewRail({
         style={railHeight ? { minHeight: railHeight } : undefined}
       >
         {layouts.map((layout) => {
-          if (layout.type === "comment") {
-            const isSelected =
-              !!activeRootThreadId &&
-              layout.thread.rootCommentId === activeRootThreadId;
-            const isExpanded = isSelected;
-            const primaryCommentId =
-              getPreferredCommentId(
-                layout.thread.commentIds,
-                selectedCommentId,
-              ) ?? layout.thread.visibleComments[0]?.id;
-
+          if (layout.type === "global") {
             return (
               <div
                 key={layout.key}
                 ref={(node) => setItemRef(layout.key, node)}
-                data-testid={`comment-thread-${layout.thread.rootCommentId}`}
-                data-comment-thread-container="true"
-                className={cn(
-                  railLayoutItemClass(railLayout),
-                  isSelected
-                    ? "border-[#DFDFDC] dark:border-slate-600 bg-white dark:bg-card shadow-[0_20px_48px_rgba(57,47,38,0.14)] dark:shadow-[0_20px_48px_rgba(0,0,0,0.4)]"
-                    : "",
-                  isSelected && "-translate-x-2",
-                  isExpanded ? "cursor-default" : "cursor-pointer",
-                )}
+                className={railLayoutItemClass(railLayout)}
                 style={railLayoutItemStyle(railLayout, layout.railTop)}
-                onMouseEnter={() => {
-                  if (primaryCommentId) {
-                    onHoverComment(primaryCommentId);
-                  }
-                }}
-                onMouseLeave={() => onHoverComment(null)}
-                onClick={() => {
-                  if (isExpanded || !primaryCommentId) return;
-                  onFocusComment(primaryCommentId);
-                }}
               >
-                <CommentEditorList
-                  comments={layout.thread.visibleComments}
-                  variant="rail"
-                  className={cn(!isExpanded && "pointer-events-none")}
-                  interactive={isExpanded}
-                  selectedCommentId={selectedCommentId}
-                  hoveredCommentId={hoveredCommentId}
-                  onDeleteComment={onDeleteComment}
-                  onUpdateComment={onUpdateComment}
-                  onReplyComment={onReplyComment}
-                  onSelectComment={onSelectComment}
-                  onFocusComment={onFocusComment}
-                  onHoverComment={onHoverComment}
-                  pendingFocusCommentId={pendingFocusCommentId}
-                  newCommentDraftIds={newCommentDraftIds}
-                  onAutoFocusComment={onAutoFocusComment}
+                <GlobalCommentsSection
+                  comments={comments}
+                  handlers={threadHandlers}
+                  activeRootThreadId={activeRootThreadId}
                 />
               </div>
+            );
+          }
+
+          if (layout.type === "resolved") {
+            return (
+              <div
+                key={layout.key}
+                ref={(node) => setItemRef(layout.key, node)}
+                className={railLayoutItemClass(railLayout)}
+                style={railLayoutItemStyle(railLayout, layout.railTop)}
+              >
+                <ResolvedThreadsFold
+                  rootIds={resolvedThreadRootIds}
+                  comments={comments}
+                  handlers={threadHandlers}
+                  activeRootThreadId={activeRootThreadId}
+                  variant="rail"
+                  testId="comment-threads-resolved-toggle"
+                />
+              </div>
+            );
+          }
+
+          if (layout.type === "comment") {
+            const isSelected =
+              !!activeRootThreadId &&
+              layout.thread.rootCommentId === activeRootThreadId;
+
+            return (
+              <CommentThreadCard
+                key={layout.key}
+                cardRef={(node) => setItemRef(layout.key, node)}
+                rootId={layout.thread.rootCommentId}
+                comments={comments}
+                handlers={threadHandlers}
+                testId={`comment-thread-${layout.thread.rootCommentId}`}
+                selected={isSelected}
+                className={cn(
+                  railLayoutItemClass(railLayout),
+                  isSelected && "-translate-x-2 cursor-default",
+                )}
+                style={railLayoutItemStyle(railLayout, layout.railTop)}
+              />
             );
           }
 

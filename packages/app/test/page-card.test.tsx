@@ -1891,8 +1891,10 @@ describe("PageCard editor integration", () => {
       page: {
         id: "doc-suggestion-reply-color-1",
         title: "Doc Suggestion Reply Color 1",
+        // A comment anchored on the suggestion (a root, so it sits on the
+        // mark); replies to a suggestion live in the comment map only.
         content:
-          'This sentence includes {++clearer wording++}{id="s1" by="user" at="2026-04-25T23:55:00.000Z"}{>>Looks good.<<}{id="c1" by="user" at="2026-04-25T23:56:00.000Z" re="s1"}',
+          'This sentence includes {++clearer wording++}{id="s1" by="user" at="2026-04-25T23:55:00.000Z"}{>>Looks good.<<}{id="c1" by="user" at="2026-04-25T23:56:00.000Z"}',
       },
       selected: true,
     });

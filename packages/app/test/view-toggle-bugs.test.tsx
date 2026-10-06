@@ -1,3 +1,4 @@
+import { appendRoughdraftDocumentComment } from "@roughdraft/rfm";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1427,12 +1428,27 @@ describe("review handoff watcher affordance", () => {
     ).toContain("No agent received this");
   });
 
-  it("submits an overall comment from the handoff popover", async () => {
+  it("submits an overall comment from the handoff popover and shows it in the global section", async () => {
+    let server: TestServer | null = null;
+    // The server writes the overall comment into the file as a document
+    // comment (rfm's writer, as the real Done route does).
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
-      .mockResolvedValue({ delivered: true });
+      .mockImplementation(async (options) => {
+        if (server && options?.overallComment) {
+          server.write(
+            appendRoughdraftDocumentComment(server.content, {
+              message: options.overallComment,
+              author: "user",
+              at: "2026-10-05T15:42:00.000Z",
+            }),
+          );
+        }
+        return { delivered: true };
+      });
 
-    await renderWorkspace({ watchers: 1, onCompleteReview });
+    const rendered = await renderWorkspace({ watchers: 1, onCompleteReview });
+    server = rendered.server;
 
     const textarea = await openOverallCommentPopover();
     expect(textarea.getAttribute("placeholder")).toBe("Overall comment");
@@ -1447,9 +1463,14 @@ describe("review handoff watcher affordance", () => {
         handoffId: expect.any(String),
       }),
     );
-    expect(document.body.textContent).not.toContain(
-      "Please prioritize the CLI contract.",
-    );
+
+    // The comment reaches the tab as an outside change and stays visible.
+    await act(async () => {
+      await rendered.sync.resync();
+    });
+    await settle();
+    const thread = getByTestId(container, "document-comment-thread-c1");
+    expect(thread.textContent).toContain("Please prioritize the CLI contract.");
   });
 
   it("includes an overall comment when finishing from the primary handoff button", async () => {

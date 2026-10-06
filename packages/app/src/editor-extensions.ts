@@ -1,4 +1,4 @@
-import { Extension, Mark, Node, mergeAttributes } from "@tiptap/core";
+import { Extension, Mark, mergeAttributes, Node } from "@tiptap/core";
 import Code from "@tiptap/extension-code";
 import CodeBlock from "@tiptap/extension-code-block";
 import Image from "@tiptap/extension-image";
@@ -17,7 +17,7 @@ import type {
 import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import StarterKit from "@tiptap/starter-kit";
-import { rawMarkdownBlockAttribute } from "./markdown";
+import { looseListAttribute, rawMarkdownBlockAttribute } from "./markdown";
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -51,6 +51,51 @@ export interface CriticChangeAttrs {
 
 export const SUGGESTED_PARAGRAPH_SENTINEL = "\u2060";
 
+// A comment anchored on a fenced code block: the ref sits on the fence line
+// (```ts {#c1}) and the entry names the highlighted lines.
+export interface CodeCommentAnchor {
+  id: string;
+  lines: [number, number] | null;
+}
+
+function parseJsonStringList(value: string | null): string[] {
+  if (!value) return [];
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function parseCodeCommentAnchors(
+  value: string | null,
+): CodeCommentAnchor[] {
+  if (!value) return [];
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const { id, lines } = entry as { id?: unknown; lines?: unknown };
+      if (typeof id !== "string") return [];
+      const range =
+        Array.isArray(lines) &&
+        lines.length === 2 &&
+        lines.every((line) => Number.isInteger(line))
+          ? ([lines[0], lines[1]] as [number, number])
+          : null;
+      return [{ id, lines: range }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 const CommentRef = Mark.create({
   name: "commentRef",
   priority: 1100,
@@ -75,6 +120,18 @@ const CommentRef = Mark.create({
         renderHTML: (attributes) =>
           attributes.commentIds?.length
             ? { "data-comment-ids": JSON.stringify(attributes.commentIds) }
+            : {},
+      },
+      // Ids this anchor carried as a bare `{#id}` ref in the file (a
+      // continuation anchor, or a root whose text lives in the review block),
+      // so a save writes the ref back instead of the comment text.
+      refOnlyIds: {
+        default: [],
+        parseHTML: (element) =>
+          parseJsonStringList(element.getAttribute("data-comment-ref-only")),
+        renderHTML: (attributes) =>
+          attributes.refOnlyIds?.length
+            ? { "data-comment-ref-only": JSON.stringify(attributes.refOnlyIds) }
             : {},
       },
     };
@@ -128,11 +185,21 @@ const CommentRef = Mark.create({
             const nextIds = (mark.attrs.commentIds as string[]).filter(
               (id) => id !== commentId,
             );
+            const nextRefOnlyIds = (
+              (mark.attrs.refOnlyIds as string[] | undefined) ?? []
+            ).filter((id) => id !== commentId);
 
             tr.removeMark(from, to, markType);
 
             if (nextIds.length > 0) {
-              tr.addMark(from, to, markType.create({ commentIds: nextIds }));
+              tr.addMark(
+                from,
+                to,
+                markType.create({
+                  commentIds: nextIds,
+                  refOnlyIds: nextRefOnlyIds,
+                }),
+              );
             }
           });
 
@@ -505,7 +572,79 @@ function createCommentHighlightDecorations(
     );
   });
 
+  decorations.push(
+    ...createCodeCommentAnchorDecorations(
+      doc,
+      selectedCommentId,
+      hoveredCommentId,
+    ),
+  );
+
   return DecorationSet.create(doc, decorations);
+}
+
+// The highlighted line range of each comment anchored on a fenced code block.
+// The decoration carries `comment-anchor` and `data-comment-ids` like a prose
+// anchor, so the rail measures it and a click selects the thread.
+function createCodeCommentAnchorDecorations(
+  doc: ProseMirrorNode,
+  selectedCommentId: string | null,
+  hoveredCommentId: string | null,
+) {
+  const decorations: Decoration[] = [];
+
+  doc.descendants((node: ProseMirrorNode, pos: number) => {
+    if (node.type.name !== "codeBlock") return;
+
+    const anchors = parseCodeCommentAnchors(
+      typeof node.attrs.codeAnchors === "string"
+        ? node.attrs.codeAnchors
+        : null,
+    );
+    if (anchors.length === 0) return false;
+
+    const text = node.textContent;
+    const lineStarts = [0];
+    for (let index = 0; index < text.length; index += 1) {
+      if (text[index] === "\n") lineStarts.push(index + 1);
+    }
+    const lineCount = lineStarts.length;
+
+    for (const anchor of anchors) {
+      const [first, last] = anchor.lines ?? [1, lineCount];
+      if (first < 1 || first > lineCount || last < first) continue;
+      const start = lineStarts[first - 1] ?? 0;
+      const endLine = Math.min(last, lineCount);
+      const end =
+        endLine < lineCount
+          ? (lineStarts[endLine] ?? text.length) - 1
+          : text.length;
+      if (end <= start) continue;
+
+      const classNames = [
+        "comment-anchor",
+        "comment-code-anchor",
+        "comment-decoration",
+      ];
+      if (selectedCommentId === anchor.id) {
+        classNames.push("comment-decoration-active");
+      } else if (hoveredCommentId === anchor.id) {
+        classNames.push("comment-decoration-hovered");
+      }
+
+      decorations.push(
+        Decoration.inline(pos + 1 + start, pos + 1 + end, {
+          class: classNames.join(" "),
+          "data-comment-ids": JSON.stringify([anchor.id]),
+          "data-testid": `comment-code-anchor-${anchor.id}`,
+        }),
+      );
+    }
+
+    return false;
+  });
+
+  return decorations;
 }
 
 const CommentHighlight = Extension.create({
@@ -679,6 +818,29 @@ const CriticChangeHighlight = Extension.create({
   },
 });
 
+// Whether a list was written loose (a blank line between items), so a save
+// writes it back the same way.
+const LooseLists = Extension.create({
+  name: "looseLists",
+
+  addGlobalAttributes() {
+    return [
+      {
+        types: ["bulletList", "orderedList", "taskList"],
+        attributes: {
+          loose: {
+            default: null,
+            parseHTML: (element) =>
+              element.getAttribute(looseListAttribute) === "true" ? true : null,
+            renderHTML: (attributes) =>
+              attributes.loose ? { [looseListAttribute]: "true" } : {},
+          },
+        },
+      },
+    ];
+  },
+});
+
 const MarkdownLink = Link.extend({
   addAttributes() {
     return {
@@ -713,8 +875,32 @@ const MarkdownCode = Code.extend({
   excludes: "bold italic strike link",
 });
 
+// Nothing inside a fence is review markup, so code takes no comment or
+// suggestion marks. A comment on code is anchored on the fence line: `info`
+// keeps the whole info string (refs included) for the save, `codeAnchors`
+// the ids and line ranges the editor highlights.
 const MarkdownCodeBlock = CodeBlock.extend({
-  marks: "commentRef criticChange",
+  marks: "",
+
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      info: {
+        default: null,
+        parseHTML: (element) => element.getAttribute("data-info"),
+        renderHTML: (attributes) =>
+          attributes.info ? { "data-info": attributes.info } : {},
+      },
+      codeAnchors: {
+        default: null,
+        parseHTML: (element) => element.getAttribute("data-code-anchors"),
+        renderHTML: (attributes) =>
+          attributes.codeAnchors
+            ? { "data-code-anchors": attributes.codeAnchors }
+            : {},
+      },
+    };
+  },
 });
 
 const MarkdownImage = Image.extend({
@@ -802,6 +988,7 @@ export function createEditorExtensions(placeholder: string) {
     MarkdownCodeBlock,
     CommentHighlight,
     CriticChangeHighlight,
+    LooseLists,
     MarkdownImage.configure({
       allowBase64: true,
       inline: false,

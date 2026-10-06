@@ -1,3 +1,10 @@
+import {
+  parseReviewModel,
+  type RfmEndmatterStatus,
+  type RfmModelComment,
+  type RfmModelSuggestion,
+  type RfmReviewModel,
+} from "@roughdraft/rfm";
 import { generateHTML, generateJSON, type JSONContent } from "@tiptap/core";
 import {
   Marked,
@@ -10,20 +17,43 @@ import {
 import type TurndownService from "turndown";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
-  createEditorExtensions,
+  type CodeCommentAnchor,
   type CriticChangeAttrs,
   type CriticChangeKind,
+  createEditorExtensions,
 } from "../editor-extensions";
 import {
+  appendYamlEndmatter,
   createMarkedRenderer,
   createTurndownService,
+  type MarkdownOptions,
   normalizeBlockSpacing,
-  appendYamlEndmatter,
   prependYamlFrontmatter,
   protectRichTextRoundTripMarkdown,
-  splitYamlDocumentMetadata,
-  type MarkdownOptions,
+  usesLegacyListSpacing,
+  usesLooseHeadingSpacing,
+  yamlDocumentMetadataFromSplit,
 } from "../markdown";
+
+/** Where a thread shows: on prose, on code lines, as an anchorless card, or in the global section. */
+export type CriticCommentScope = "inline" | "code" | "document" | "standalone";
+
+// What a comment looked like when the file was read. A save compares against
+// it so an unchanged comment is written back with its original bytes.
+interface CriticCommentSource {
+  content: string;
+  /** The inline text exactly as written (before `<br>` decoding), for inline bodies. */
+  rawContent: string | null;
+  /** The text came from the comment's review block entry. */
+  bodyFromEntry: boolean;
+  /** The time the editor showed at load (a generated one when the file had none). */
+  createdAt: string;
+  by: string | null;
+  status: string | null;
+  resolved: string | null;
+  /** Inline attribute or legacy metadata, unknown attributes included, in file order. */
+  attributes: Record<string, string> | null;
+}
 
 export interface CriticComment {
   id: string;
@@ -32,7 +62,25 @@ export interface CriticComment {
   authorType?: "user" | "ai";
   authorId?: string | null;
   parentCommentId?: string | null;
-  scope?: "document";
+  scope?: CriticCommentScope;
+  status?: string | null;
+  /** Resolution summary. */
+  resolved?: string | null;
+  /** A comment whose highlight is gone from the text (shown in the global section). */
+  lostAnchor?: boolean;
+  /** Code comments: highlighted lines inside the block, 1-based and inclusive. */
+  codeLines?: [number, number] | null;
+  /** Code comments: the highlighted lines. */
+  quote?: string | null;
+  /** A root whose text lives in the review block, anchored by `{#id}` refs only. */
+  bodyInEndmatter?: boolean;
+  /**
+   * Markup the editor cannot place (an inline comment split by a blank line,
+   * markup inside a raw HTML block) stays literal text; the comment and its
+   * inline replies are kept out of the rail and written back untouched.
+   */
+  literal?: boolean;
+  source?: CriticCommentSource;
 }
 
 export interface CriticCommentThread {
@@ -42,10 +90,16 @@ export interface CriticCommentThread {
 
 export type { CriticChangeAttrs, CriticChangeKind };
 
+/** The banner text for a file whose review block could not be read. */
+export function describeReviewBlockError(message: string): string {
+  return `The review block at the end of this file could not be read: ${message}`;
+}
+
 interface CriticCommentToken {
   type: "criticCommentAnchor";
   raw: string;
   commentIds: string[];
+  refOnlyIds: string[];
   tokens: Token[];
 }
 
@@ -53,6 +107,7 @@ interface CriticStandaloneCommentToken {
   type: "criticStandaloneComment";
   raw: string;
   commentIds: string[];
+  refOnlyIds: string[];
 }
 
 interface CriticChangeToken {
@@ -60,29 +115,54 @@ interface CriticChangeToken {
   raw: string;
   change: CriticChangeAttrs;
   commentIds: string[];
+  refOnlyIds: string[];
   tokens?: Token[];
   oldTokens?: Token[];
   newTokens?: Token[];
 }
 
+// What the marked extensions read while tokenizing: the rfm model decides
+// which ids exist, which are replies and what every body says; the
+// extensions only find the markers so the editor can render them.
+interface ReviewLoadContext {
+  model: RfmReviewModel;
+  comments: Map<string, CriticComment>;
+  changes: Map<string, CriticChangeAttrs>;
+  /** Root ids the editor shows an anchor for. */
+  placedIds: Set<string>;
+  /** Ids whose markup stays literal text (see `CriticComment.literal`). */
+  literalIds: Set<string>;
+}
+
 const extensions = createEditorExtensions("");
 const criticCommentAnchorPattern = /^\{==([\s\S]+?)==\}/;
-const criticCommentBlockPattern =
-  /^\{>>([\s\S]*?)<<\}(?:(\{@([\s\S]+?)@\})|(\{(?:\s*[A-Za-z][A-Za-z0-9_-]*="(?:\\[\s\S]|[^"\\])*")+\s*\})|(\{#[A-Za-z][A-Za-z0-9_-]*\}))?/;
+const attributeValuePattern = String.raw`"(?:\\[\s\S]|[^"\\])*"`;
+const attributeBlockSource = String.raw`\{(?:\s*[A-Za-z][A-Za-z0-9_-]*=${attributeValuePattern})+\s*\}`;
+const criticCommentBlockPattern = new RegExp(
+  String.raw`^\{>>([\s\S]*?)<<\}(?:(\{@([\s\S]+?)@\})|(${attributeBlockSource})|(\{#[A-Za-z][A-Za-z0-9_-]*\}))?`,
+);
+const bareRefPattern = /^\{#([A-Za-z][A-Za-z0-9_-]*)\}/;
 const criticAdditionPattern = /^\{\+\+([\s\S]+?)\+\+\}/;
 const criticDeletionPattern = /^\{--([\s\S]+?)--\}/;
 const criticSubstitutionPattern = /^\{~~([\s\S]+?)~>([\s\S]+?)~~\}/;
-const attributeMetadataBlockPattern =
-  /^\{(?:\s*[A-Za-z][A-Za-z0-9_-]*="(?:\\[\s\S]|[^"\\])*")+\s*\}/;
-const metadataAttributePattern =
-  /([A-Za-z][A-Za-z0-9_-]*)="((?:\\[\s\S]|[^"\\])*)"/g;
+const attributeMetadataBlockPattern = new RegExp(`^${attributeBlockSource}`);
+const metadataAttributePattern = new RegExp(
+  `([A-Za-z][A-Za-z0-9_-]*)=(${attributeValuePattern})`,
+  "g",
+);
 const metadataReferencePattern = /^\{#([A-Za-z][A-Za-z0-9_-]*)\}$/;
-const unanchoredCommentSentinel = "\u2060";
+const roughdraftIdPattern = /^[cas]\d+$/;
+const fenceRefPattern = /\{#([A-Za-z][A-Za-z0-9_-]*)\}/g;
+const unanchoredCommentSentinel = "⁠";
 
 interface ParsedEndmatter {
   comments: Map<string, Record<string, unknown>>;
   suggestions: Map<string, Record<string, unknown>>;
   data: Record<string, unknown> | null;
+}
+
+function decodeBreaks(text: string): string {
+  return text.replace(/<br\s*\/?>/gi, "\n");
 }
 
 function escapeHtml(value: string): string {
@@ -91,6 +171,26 @@ function escapeHtml(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function authorFields(by: string | null | undefined) {
+  const author = by ?? "user";
+  const isAi = author.toUpperCase() === "AI";
+
+  return {
+    authorType: isAi ? ("ai" as const) : ("user" as const),
+    authorId: isAi ? null : author,
+  };
+}
+
+function authorLabel(comment: Pick<CriticComment, "authorType" | "authorId">) {
+  return comment.authorType === "ai" ? "AI" : comment.authorId || "user";
+}
+
+function sameAuthor(stored: unknown, label: string): boolean {
+  if (typeof stored !== "string") return false;
+  const { authorType, authorId } = authorFields(stored);
+  return authorLabel({ authorType, authorId }) === label;
 }
 
 function parseLegacyMetadata(
@@ -107,13 +207,10 @@ function parseLegacyMetadata(
     fields.set(key, value);
   }
 
-  const author = fields.get("by") ?? "user";
-
   return {
     id: fields.get("id"),
     createdAt: fields.get("at") ?? new Date().toISOString(),
-    authorType: author.toUpperCase() === "AI" ? "ai" : "user",
-    authorId: author.toUpperCase() === "AI" ? null : author,
+    ...authorFields(fields.get("by")),
     parentCommentId: fields.get("re") ?? null,
   };
 }
@@ -126,101 +223,131 @@ function escapeMetadataAttributeValue(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
+function parseAttributeMap(metadataText?: string): Map<string, string> {
+  const fields = new Map<string, string>();
+  if (!metadataText?.startsWith("{") || !metadataText.endsWith("}")) {
+    return fields;
+  }
+
+  for (const match of metadataText
+    .slice(1, -1)
+    .matchAll(metadataAttributePattern)) {
+    fields.set(
+      match[1] ?? "",
+      unescapeMetadataAttributeValue((match[2] ?? '""').slice(1, -1)),
+    );
+  }
+
+  return fields;
+}
+
 function parseAttributeMetadata(
   metadataText?: string,
 ): Partial<Omit<CriticComment, "content">> {
-  if (!metadataText?.startsWith("{") || !metadataText.endsWith("}")) {
-    return {};
-  }
-
-  const fields = new Map<string, string>();
-  const content = metadataText.slice(1, -1);
-
-  for (const match of content.matchAll(metadataAttributePattern)) {
-    fields.set(match[1], unescapeMetadataAttributeValue(match[2]));
-  }
-
-  const author = fields.get("by") ?? "user";
+  const fields = parseAttributeMap(metadataText);
+  if (fields.size === 0) return {};
 
   return {
     id: fields.get("id"),
     createdAt: fields.get("at") ?? new Date().toISOString(),
-    authorType: author.toUpperCase() === "AI" ? "ai" : "user",
-    authorId: author.toUpperCase() === "AI" ? null : author,
+    ...authorFields(fields.get("by")),
     parentCommentId: fields.get("re") ?? null,
   };
 }
 
-function commentPartialFromEndmatterEntry(
-  id: string,
-  entry?: Record<string, unknown>,
-  options?: { includeParent?: boolean },
-): Partial<Omit<CriticComment, "content">> {
-  const author = typeof entry?.by === "string" ? entry.by : "user";
-  const includeParent = options?.includeParent ?? true;
+// --------------------------------------------------------------- the model
+
+// A comment as rfm reads it, in the shape the editor and the rail use.
+function commentFromModel(
+  item: RfmModelComment,
+  markdown: string,
+): CriticComment {
+  // The inline text as written, so `<br>` and other bytes survive a save.
+  let rawContent: string | null = null;
+  if (item.bodySource === "inline" && markdown.startsWith("{>>", item.offset)) {
+    const close = markdown.indexOf("<<}", item.offset + 3);
+    if (close !== -1) rawContent = markdown.slice(item.offset + 3, close);
+  }
+
+  const createdAt = item.at ?? new Date().toISOString();
 
   return {
-    id,
-    createdAt:
-      typeof entry?.at === "string" ? entry.at : new Date().toISOString(),
-    authorType: author.toUpperCase() === "AI" ? "ai" : "user",
-    authorId: author.toUpperCase() === "AI" ? null : author,
-    parentCommentId:
-      includeParent && typeof entry?.re === "string" ? entry.re : null,
+    id: item.id,
+    content: item.body,
+    createdAt,
+    ...authorFields(item.by),
+    parentCommentId: item.parentId,
+    scope: item.scope,
+    status: item.status,
+    resolved: item.resolved,
+    lostAnchor: item.lostAnchor,
+    codeLines: item.lines,
+    quote: item.quote,
+    bodyInEndmatter:
+      item.kind === "comment" &&
+      item.bodySource === "endmatter" &&
+      item.anchors.length > 0,
+    source: {
+      content: item.body,
+      rawContent,
+      bodyFromEntry: item.bodySource === "endmatter",
+      createdAt,
+      by: item.by,
+      status: item.status,
+      resolved: item.resolved,
+      attributes: item.attributes,
+    },
   };
 }
 
-function parseMetadata(
-  legacyMetadataText?: string,
-  attributeMetadataText?: string,
-  referenceMetadataText?: string,
-  endmatter?: ParsedEndmatter,
-  kind: "comment" | "suggestion" = "comment",
-): Partial<Omit<CriticComment, "content">> {
-  const reference = referenceMetadataText?.match(metadataReferencePattern);
-  if (reference) {
-    const id = reference[1] ?? "";
-    const entry =
-      kind === "comment"
-        ? endmatter?.comments.get(id)
-        : endmatter?.suggestions.get(id);
-    return commentPartialFromEndmatterEntry(id, entry, {
-      includeParent: false,
-    });
-  }
-
-  if (attributeMetadataText) {
-    return parseAttributeMetadata(attributeMetadataText);
-  }
-
-  return parseLegacyMetadata(legacyMetadataText);
+function isModelSuggestion(
+  item: RfmModelComment | RfmModelSuggestion | undefined,
+): item is RfmModelSuggestion {
+  return Boolean(item && "suggestionKind" in item);
 }
 
-function serializeMetadata(comment: CriticComment): string {
-  const fields = [
-    ["id", comment.id],
-    ["by", comment.authorType === "ai" ? "AI" : comment.authorId || "user"],
-    ["at", comment.createdAt || new Date().toISOString()],
-  ];
+function createReviewLoadContext(markdown: string): ReviewLoadContext {
+  const model = parseReviewModel(markdown);
+  const comments = new Map<string, CriticComment>();
 
-  if (comment.parentCommentId) {
-    fields.push(["re", comment.parentCommentId]);
+  for (const item of model.comments) {
+    // Comments with no id at all (a bare `{>>text<<}`) get a document-local
+    // id from the tokenizer below, the way the browser always named them.
+    if (item.metadataSource === "none") continue;
+    comments.set(item.id, commentFromModel(item, markdown));
   }
 
-  return `{${fields
-    .map(([key, value]) => `${key}="${escapeMetadataAttributeValue(value)}"`)
-    .join(" ")}}`;
+  return {
+    model,
+    comments,
+    changes: new Map(),
+    placedIds: new Set(),
+    literalIds: new Set(),
+  };
 }
 
-function serializeChangeMetadata(change: CriticChangeAttrs): string {
-  return serializeMetadata({
-    id: change.changeId,
-    content: "",
-    createdAt: change.createdAt,
-    authorType: change.authorType,
-    authorId: change.authorId,
-  });
+// A reply whose parent is a comment or a suggestion of this file. Such a
+// reply never sits on a mark: it is shown and saved from the comment map.
+function isNestedReply(
+  comment: CriticComment | undefined,
+  comments: ReadonlyMap<string, CriticComment>,
+  model?: RfmReviewModel,
+): boolean {
+  const parentId = comment?.parentCommentId;
+  if (!comment || !parentId || parentId === comment.id) return false;
+  return comments.has(parentId) || isModelSuggestion(model?.byId.get(parentId));
 }
+
+function isQualifiedBareRef(id: string, context: ReviewLoadContext): boolean {
+  const entries = context.model.split.entries;
+  return (
+    entries.comments.has(id) ||
+    entries.suggestions.has(id) ||
+    roughdraftIdPattern.test(id)
+  );
+}
+
+// ---------------------------------------------------------- the review block
 
 function parseReviewEndmatter(endmatter?: string | null): ParsedEndmatter {
   if (!endmatter) {
@@ -264,41 +391,34 @@ function parseEndmatterMap(
   );
 }
 
-function addEndmatterFeedback(
-  comments: Map<string, CriticComment>,
-  endmatter: ParsedEndmatter,
-) {
-  for (const [id, entry] of endmatter.comments) {
-    if (typeof entry.body !== "string") {
-      continue;
-    }
-    if (comments.has(id)) {
-      continue;
-    }
-
-    comments.set(
-      id,
-      createCommentWithContext({
-        ...commentPartialFromEndmatterEntry(id, entry),
-        content: entry.body,
-        parentCommentId: typeof entry.re === "string" ? entry.re : null,
-        scope: typeof entry.re === "string" ? undefined : "document",
-      }),
+function areValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return (
+      left.length === right.length &&
+      left.every((value, index) => areValuesEqual(value, right[index]))
     );
   }
-}
-
-function areEndmatterEntriesEqual(
-  left: Record<string, unknown>,
-  right: Record<string, unknown>,
-): boolean {
-  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
-
-  for (const key of keys) {
-    if (left[key] !== right[key]) return false;
+  if (
+    left &&
+    right &&
+    typeof left === "object" &&
+    typeof right === "object" &&
+    !Array.isArray(left) &&
+    !Array.isArray(right)
+  ) {
+    const leftRecord = left as Record<string, unknown>;
+    const rightRecord = right as Record<string, unknown>;
+    const keys = new Set([
+      ...Object.keys(leftRecord),
+      ...Object.keys(rightRecord),
+    ]);
+    for (const key of keys) {
+      if (!areValuesEqual(leftRecord[key], rightRecord[key])) return false;
+    }
+    return true;
   }
-
-  return true;
+  return false;
 }
 
 function areEndmatterMapsEqual(
@@ -309,7 +429,7 @@ function areEndmatterMapsEqual(
 
   for (const [id, leftEntry] of left) {
     const rightEntry = right.get(id);
-    if (!rightEntry || !areEndmatterEntriesEqual(leftEntry, rightEntry)) {
+    if (!rightEntry || !areValuesEqual(leftEntry, rightEntry)) {
       return false;
     }
   }
@@ -317,48 +437,91 @@ function areEndmatterMapsEqual(
   return true;
 }
 
+// `status` and `resolved` written only when they changed in the editor.
+function applyResolution(
+  next: Record<string, unknown>,
+  comment: CriticComment,
+) {
+  const source = comment.source;
+  const status = comment.status ?? null;
+  const resolved = comment.resolved ?? null;
+
+  if (!source || status !== source.status) {
+    if (status) next.status = status;
+    else delete next.status;
+  }
+  if (!source || resolved !== source.resolved) {
+    if (resolved) next.resolved = resolved;
+    else delete next.resolved;
+  }
+}
+
 function endmatterEntryForComment(
   comment: CriticComment,
-  existing: Record<string, unknown> = {},
+  existing: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
-  const by = comment.authorType === "ai" ? "AI" : comment.authorId || "user";
-  const next: Record<string, unknown> = {
-    ...existing,
-    by,
-    at: comment.createdAt,
-  };
+  const source = comment.source;
+  const by = authorLabel(comment);
+  const next: Record<string, unknown> = { ...existing };
+  const unchanged = (value: unknown, sourceValue: unknown) =>
+    existing !== undefined && source !== undefined && value === sourceValue;
 
-  if (comment.scope === "document") {
-    next.body = comment.content;
-    delete next.re;
-  } else if (comment.parentCommentId) {
-    next.body = comment.content;
-    next.re = comment.parentCommentId;
+  if (!sameAuthor(existing?.by, by)) next.by = by;
+  // An entry keeps its `at` (even a missing one) while the time is unchanged.
+  if (!unchanged(comment.createdAt, source?.createdAt)) {
+    next.at = comment.createdAt;
+  }
+
+  const isReply = Boolean(comment.parentCommentId);
+  const keepsBodyInEntry =
+    comment.scope === "document" ||
+    comment.lostAnchor === true ||
+    isReply ||
+    comment.bodyInEndmatter === true ||
+    (typeof existing?.body === "string" && existing.body === comment.content);
+
+  if (keepsBodyInEntry) {
+    // The entry's own text is kept byte for byte (`<br>`, quoting) while the
+    // editor shows the same words.
+    const entryBodyMatches =
+      source?.bodyFromEntry === true ||
+      (typeof existing?.body === "string" &&
+        decodeBreaks(existing.body) === comment.content);
+    if (!(unchanged(comment.content, source?.content) && entryBodyMatches)) {
+      next.body = comment.content;
+    }
   } else {
     delete next.body;
+  }
+
+  if (isReply) {
+    next.re = comment.parentCommentId;
+  } else if (typeof next.re === "string" && next.re !== "") {
     delete next.re;
   }
 
+  applyResolution(next, comment);
   return next;
 }
 
 function endmatterEntryForChange(
   change: CriticChangeAttrs,
-  existing: Record<string, unknown> = {},
+  existing: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
   const by = change.authorType === "ai" ? "AI" : change.authorId || "user";
+  const next: Record<string, unknown> = { ...existing };
 
-  return {
-    ...existing,
-    by,
-    at: change.createdAt,
-  };
+  if (!sameAuthor(existing?.by, by)) next.by = by;
+  if (existing?.at !== change.createdAt) next.at = change.createdAt;
+
+  return next;
 }
 
 function serializeReviewEndmatter(
   existingEndmatter: string | null,
   comments: Map<string, CriticComment>,
   changes: Map<string, CriticChangeAttrs>,
+  preservedEntryIds: readonly string[] = [],
 ): string | null {
   if (!existingEndmatter) return null;
 
@@ -367,10 +530,13 @@ function serializeReviewEndmatter(
   const suggestionEntries = new Map<string, Record<string, unknown>>();
 
   for (const comment of comments.values()) {
-    commentEntries.set(
-      comment.id,
-      endmatterEntryForComment(comment, parsed.comments.get(comment.id)),
-    );
+    const existing = parsed.comments.get(comment.id);
+    if (comment.literal) {
+      // Its markup is still literal text in the body; the entry stays as is.
+      if (existing) commentEntries.set(comment.id, existing);
+      continue;
+    }
+    commentEntries.set(comment.id, endmatterEntryForComment(comment, existing));
   }
 
   for (const change of changes.values()) {
@@ -378,6 +544,17 @@ function serializeReviewEndmatter(
       change.changeId,
       endmatterEntryForChange(change, parsed.suggestions.get(change.changeId)),
     );
+  }
+
+  // Entries the browser never showed (no anchor, no body, no `re`) stay as
+  // they are; nothing in the editor can have deleted them.
+  for (const id of preservedEntryIds) {
+    const comment = parsed.comments.get(id);
+    if (comment && !commentEntries.has(id)) commentEntries.set(id, comment);
+    const suggestion = parsed.suggestions.get(id);
+    if (suggestion && !suggestionEntries.has(id)) {
+      suggestionEntries.set(id, suggestion);
+    }
   }
 
   if (
@@ -403,6 +580,8 @@ function serializeReviewEndmatter(
 
   return `---\n${stringifyYaml(data)}`;
 }
+
+// ------------------------------------------------------------------ ids
 
 export function createNextCommentId(
   existingComments: Iterable<Pick<CriticComment, "id">>,
@@ -447,6 +626,7 @@ function createCommentWithContext(
   const authorType = partial?.authorType ?? "user";
 
   return {
+    ...partial,
     id: partial?.id ?? createNextCommentId(existingComments),
     content: partial?.content ?? "",
     createdAt: partial?.createdAt ?? new Date().toISOString(),
@@ -474,19 +654,18 @@ function createChangeWithContext(
 }
 
 function parseChangeMetadata(
-  metadataText?: string,
-  endmatter?: ParsedEndmatter,
+  metadataText: string | undefined,
+  context: ReviewLoadContext,
 ): Partial<CriticChangeAttrs> {
   const reference = metadataText?.match(metadataReferencePattern);
   if (reference) {
     const id = reference[1] ?? "";
-    const entry = endmatter?.suggestions.get(id);
-    const parsed = commentPartialFromEndmatterEntry(id, entry);
+    const item = context.model.byId.get(id);
+    const suggestion = isModelSuggestion(item) ? item : null;
     return {
-      changeId: parsed.id,
-      createdAt: parsed.createdAt,
-      authorType: parsed.authorType,
-      authorId: parsed.authorId,
+      changeId: id,
+      createdAt: suggestion?.at ?? new Date().toISOString(),
+      ...authorFields(suggestion?.by),
     };
   }
 
@@ -499,6 +678,8 @@ function parseChangeMetadata(
     authorId: parsed.authorId,
   };
 }
+
+// ---------------------------------------------------------------- threads
 
 function buildCommentThreadsFromOrderedComments(
   orderedComments: CriticComment[],
@@ -557,41 +738,6 @@ export function flattenCommentThreads(
   return orderedComments;
 }
 
-function getOrderedAnchorComments(
-  commentIds: string[],
-  comments: ReadonlyMap<string, CriticComment>,
-): CriticComment[] {
-  const visibleComments = commentIds
-    .map((commentId) => comments.get(commentId))
-    .filter((comment): comment is CriticComment => Boolean(comment));
-
-  return flattenCommentThreads(buildCommentThreads(visibleComments));
-}
-
-function serializeCommentBlocks(
-  commentIds: string[],
-  comments: ReadonlyMap<string, CriticComment>,
-  useEndmatter = false,
-): string {
-  const orderedComments = useEndmatter
-    ? commentIds
-        .map((commentId) => comments.get(commentId))
-        .filter(
-          (comment): comment is CriticComment =>
-            comment !== undefined && !comment.parentCommentId,
-        )
-    : getOrderedAnchorComments(commentIds, comments);
-  let result = "";
-
-  for (const comment of orderedComments) {
-    result += `{>>${comment.content}<<}${
-      useEndmatter ? `{#${comment.id}}` : serializeMetadata(comment)
-    }`;
-  }
-
-  return result;
-}
-
 export function getCommentDescendantIds(
   commentId: string,
   comments: ReadonlyMap<string, CriticComment>,
@@ -609,11 +755,13 @@ export function getCommentDescendantIds(
   }
 
   const descendantIds: string[] = [];
+  const visited = new Set<string>([commentId]);
   const stack = [...(childrenByParentId.get(commentId) ?? [])].reverse();
 
   while (stack.length > 0) {
     const nextCommentId = stack.pop();
-    if (!nextCommentId) continue;
+    if (!nextCommentId || visited.has(nextCommentId)) continue;
+    visited.add(nextCommentId);
 
     descendantIds.push(nextCommentId);
 
@@ -629,71 +777,216 @@ export function getCommentDescendantIds(
   return descendantIds;
 }
 
-function tokenizeCriticCommentAnchor(
-  lexer: TokenizerThis["lexer"],
+/** A root and every reply under it, wherever the replies are stored. */
+export function getThreadComments(
+  rootId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): CriticComment[] {
+  const root = comments.get(rootId);
+  if (!root) return [];
+
+  return [
+    root,
+    ...getCommentDescendantIds(rootId, comments)
+      .map((id) => comments.get(id))
+      .filter((comment): comment is CriticComment => Boolean(comment)),
+  ];
+}
+
+/** Resolved threads fold into the "N resolved" row of their section. */
+export function isResolvedComment(comment: CriticComment | undefined) {
+  return comment?.status === "resolved";
+}
+
+// -------------------------------------------------------------- tokenizers
+
+interface CommentTail {
+  raw: string;
+  /** Every comment id the markup named, replies included. */
+  consumedIds: string[];
+  /** Root ids for the mark, in file order. */
+  commentIds: string[];
+  /** Root ids written as a bare `{#id}` ref on this anchor. */
+  refOnlyIds: string[];
+  /** Whether anything at all was consumed. */
+  matched: boolean;
+}
+
+function commentIdFromTrain(
+  commentText: string,
+  legacyMetadataText: string | undefined,
+  attributeMetadataText: string | undefined,
+  referenceMetadataText: string | undefined,
+  context: ReviewLoadContext,
+  scope: CriticCommentScope,
+): string {
+  const reference = referenceMetadataText?.match(metadataReferencePattern);
+  const metadata = reference
+    ? { id: reference[1] }
+    : attributeMetadataText
+      ? parseAttributeMetadata(attributeMetadataText)
+      : legacyMetadataText
+        ? parseLegacyMetadata(legacyMetadataText)
+        : {};
+  const id = metadata.id;
+
+  if (id && context.comments.has(id)) return id;
+
+  // Not in the model: a train with no id (named here, as the browser always
+  // did) or metadata rfm does not accept. Keep it readable either way.
+  const comment = createCommentWithContext(
+    { ...metadata, content: commentText, scope },
+    context.comments.values(),
+  );
+  if (id) {
+    comment.source = {
+      content: commentText,
+      rawContent: commentText,
+      bodyFromEntry: false,
+      createdAt: comment.createdAt,
+      by: authorLabel(comment),
+      status: null,
+      resolved: null,
+      attributes: attributeMetadataText
+        ? Object.fromEntries(parseAttributeMap(attributeMetadataText))
+        : null,
+    };
+  }
+  context.comments.set(comment.id, comment);
+  return comment.id;
+}
+
+// Comment trains and `{#id}` refs after a highlight, a suggestion or on
+// their own, in any order.
+function readCommentTail(
   src: string,
-  existingComments: Iterable<Pick<CriticComment, "id">>,
-  endmatter?: ParsedEndmatter,
-):
-  | {
-      token: CriticCommentToken;
-      comments: CriticComment[];
-    }
-  | undefined {
-  const anchorMatch = src.match(criticCommentAnchorPattern);
+  offset: number,
+  context: ReviewLoadContext,
+  options: { scope: CriticCommentScope },
+): CommentTail {
+  let raw = "";
+  let cursor = offset;
+  const commentIds: string[] = [];
+  const refOnlyIds: string[] = [];
+  const consumedIds: string[] = [];
+  let matched = false;
 
-  if (!anchorMatch) return undefined;
+  const addRoot = (id: string, refOnly: boolean) => {
+    consumedIds.push(id);
+    const comment = context.comments.get(id);
+    if (isNestedReply(comment, context.comments, context.model)) return;
+    if (!commentIds.includes(id)) commentIds.push(id);
+    if (refOnly && !refOnlyIds.includes(id)) refOnlyIds.push(id);
+  };
 
-  const [, anchor] = anchorMatch;
-  let raw = anchorMatch[0];
-  let offset = raw.length;
-  const parsedComments: CriticComment[] = [];
-
-  while (offset < src.length) {
-    const nextMatch = src.slice(offset).match(criticCommentBlockPattern);
-    if (!nextMatch) break;
-
-    const [
-      ,
-      commentText,
-      ,
-      legacyMetadataText,
-      attributeMetadataText,
-      referenceMetadataText,
-    ] = nextMatch;
-    const comment = createCommentWithContext(
-      {
-        ...parseMetadata(
+  while (cursor < src.length) {
+    const rest = src.slice(cursor);
+    const train = rest.match(criticCommentBlockPattern);
+    if (train) {
+      const [
+        whole,
+        commentText = "",
+        ,
+        legacyMetadataText,
+        attributeMetadataText,
+        referenceMetadataText,
+      ] = train;
+      addRoot(
+        commentIdFromTrain(
+          commentText,
           legacyMetadataText,
           attributeMetadataText,
           referenceMetadataText,
-          endmatter,
-          "comment",
+          context,
+          options.scope,
         ),
-        content: commentText,
-      },
-      [...existingComments, ...parsedComments],
-    );
-    parsedComments.push(comment);
-    raw += nextMatch[0];
-    offset += nextMatch[0].length;
+        false,
+      );
+      raw += whole;
+      cursor += whole.length;
+      matched = true;
+      continue;
+    }
+
+    const ref = rest.match(bareRefPattern);
+    if (ref) {
+      // A ref to an id rfm does not read as a comment stays on the mark so
+      // the save writes it back; the rail ignores it.
+      addRoot(ref[1] ?? "", true);
+      raw += ref[0];
+      cursor += ref[0].length;
+      matched = true;
+      continue;
+    }
+
+    break;
   }
 
-  if (parsedComments.length === 0) return undefined;
+  return {
+    raw,
+    consumedIds,
+    commentIds,
+    refOnlyIds,
+    matched: matched && !isLiteralTail(consumedIds, context),
+  };
+}
+
+function isLiteralTail(consumedIds: string[], context: ReviewLoadContext) {
+  return (
+    consumedIds.length > 0 &&
+    consumedIds.every((id) => context.literalIds.has(id))
+  );
+}
+
+function tokenizeCriticCommentAnchor(
+  lexer: TokenizerThis["lexer"],
+  src: string,
+  context: ReviewLoadContext,
+): CriticCommentToken | undefined {
+  const anchorMatch = src.match(criticCommentAnchorPattern);
+  if (!anchorMatch) return undefined;
+
+  const [whole, anchor = ""] = anchorMatch;
+  const tail = readCommentTail(src, whole.length, context, {
+    scope: "inline",
+  });
+  if (!tail.matched) return undefined;
 
   return {
-    token: {
-      type: "criticCommentAnchor",
-      raw,
-      commentIds: parsedComments.map((comment) => comment.id),
-      tokens: lexer.inlineTokens(anchor),
-    },
-    comments: parsedComments,
+    type: "criticCommentAnchor",
+    raw: whole + tail.raw,
+    commentIds: tail.commentIds,
+    refOnlyIds: tail.refOnlyIds,
+    tokens: lexer.inlineTokens(anchor),
+  };
+}
+
+function tokenizeCriticStandaloneComment(
+  src: string,
+  context: ReviewLoadContext,
+): CriticStandaloneCommentToken | undefined {
+  if (src.startsWith("{#")) {
+    const ref = src.match(bareRefPattern);
+    const id = ref?.[1];
+    if (!ref || !id || !isQualifiedBareRef(id, context)) return undefined;
+    if (isModelSuggestion(context.model.byId.get(id))) return undefined;
+  } else if (!src.startsWith("{>>")) {
+    return undefined;
+  }
+
+  const tail = readCommentTail(src, 0, context, { scope: "standalone" });
+  if (!tail.matched) return undefined;
+
+  return {
+    type: "criticStandaloneComment",
+    raw: tail.raw,
+    commentIds: tail.commentIds,
+    refOnlyIds: tail.refOnlyIds,
   };
 }
 
 function getTrailingAttributeMetadata(src: string, offset: number) {
-  const reference = src.slice(offset).match(/^\{#[A-Za-z][A-Za-z0-9_-]*\}/);
+  const reference = src.slice(offset).match(bareRefPattern);
   if (reference) {
     return {
       metadataText: reference[0],
@@ -716,185 +1009,73 @@ function getTrailingAttributeMetadata(src: string, offset: number) {
   };
 }
 
-function tokenizeCriticCommentBlocks(
-  src: string,
-  offset: number,
-  existingComments: Iterable<Pick<CriticComment, "id">>,
-  endmatter?: ParsedEndmatter,
-) {
-  let raw = "";
-  let nextOffset = offset;
-  const parsedComments: CriticComment[] = [];
-
-  while (nextOffset < src.length) {
-    const nextMatch = src.slice(nextOffset).match(criticCommentBlockPattern);
-    if (!nextMatch) break;
-
-    const [
-      ,
-      commentText,
-      ,
-      legacyMetadataText,
-      attributeMetadataText,
-      referenceMetadataText,
-    ] = nextMatch;
-    const comment = createCommentWithContext(
-      {
-        ...parseMetadata(
-          legacyMetadataText,
-          attributeMetadataText,
-          referenceMetadataText,
-          endmatter,
-          "comment",
-        ),
-        content: commentText,
-      },
-      [...existingComments, ...parsedComments],
-    );
-    parsedComments.push(comment);
-    raw += nextMatch[0];
-    nextOffset += nextMatch[0].length;
-  }
-
-  return {
-    raw,
-    comments: parsedComments,
-  };
-}
-
-function tokenizeCriticStandaloneComment(
-  src: string,
-  existingComments: Iterable<Pick<CriticComment, "id">>,
-  endmatter?: ParsedEndmatter,
-):
-  | {
-      token: CriticStandaloneCommentToken;
-      comments: CriticComment[];
-    }
-  | undefined {
-  const result = tokenizeCriticCommentBlocks(
-    src,
-    0,
-    existingComments,
-    endmatter,
-  );
-
-  if (result.comments.length === 0) return undefined;
-
-  return {
-    token: {
-      type: "criticStandaloneComment",
-      raw: result.raw,
-      commentIds: result.comments.map((comment) => comment.id),
-    },
-    comments: result.comments,
-  };
-}
-
 function tokenizeCriticChange(
   lexer: TokenizerThis["lexer"],
   src: string,
-  existingChanges: Iterable<Pick<CriticChangeAttrs, "changeId">>,
-  existingComments: Iterable<Pick<CriticComment, "id">>,
-  endmatter?: ParsedEndmatter,
-):
-  | {
-      token: CriticChangeToken;
-      comments: CriticComment[];
-    }
-  | undefined {
+  context: ReviewLoadContext,
+): CriticChangeToken | undefined {
   const additionMatch = src.match(criticAdditionPattern);
+  const deletionMatch = additionMatch ? null : src.match(criticDeletionPattern);
+  const substitutionMatch =
+    additionMatch || deletionMatch
+      ? null
+      : src.match(criticSubstitutionPattern);
+  const match = additionMatch ?? deletionMatch ?? substitutionMatch;
+  if (!match) return undefined;
 
-  if (additionMatch) {
-    const [, text] = additionMatch;
-    const metadata = getTrailingAttributeMetadata(src, additionMatch[0].length);
-    const trailingComments = tokenizeCriticCommentBlocks(
-      src,
-      additionMatch[0].length + metadata.raw.length,
-      existingComments,
-      endmatter,
-    );
-    const change = createChangeWithContext(
-      "addition",
-      parseChangeMetadata(metadata.metadataText, endmatter),
-      existingChanges,
-    );
+  const kind: CriticChangeKind = additionMatch
+    ? "addition"
+    : deletionMatch
+      ? "deletion"
+      : "substitution-old";
+  const metadata = getTrailingAttributeMetadata(src, match[0].length);
+  const tail = readCommentTail(
+    src,
+    match[0].length + metadata.raw.length,
+    context,
+    { scope: "inline" },
+  );
+  const change = createChangeWithContext(
+    kind,
+    parseChangeMetadata(metadata.metadataText, context),
+    context.changes.values(),
+  );
+  const raw = match[0] + metadata.raw + tail.raw;
 
+  if (kind === "substitution-old") {
     return {
-      token: {
-        type: "criticChange",
-        raw: additionMatch[0] + metadata.raw + trailingComments.raw,
-        change,
-        commentIds: trailingComments.comments.map((comment) => comment.id),
-        tokens: lexer.inlineTokens(text),
-      },
-      comments: trailingComments.comments,
+      type: "criticChange",
+      raw,
+      change,
+      commentIds: tail.commentIds,
+      refOnlyIds: tail.refOnlyIds,
+      oldTokens: lexer.inlineTokens(match[1] ?? ""),
+      newTokens: lexer.inlineTokens(match[2] ?? ""),
     };
   }
 
-  const deletionMatch = src.match(criticDeletionPattern);
+  return {
+    type: "criticChange",
+    raw,
+    change,
+    commentIds: tail.commentIds,
+    refOnlyIds: tail.refOnlyIds,
+    tokens: lexer.inlineTokens(match[1] ?? ""),
+  };
+}
 
-  if (deletionMatch) {
-    const [, text] = deletionMatch;
-    const metadata = getTrailingAttributeMetadata(src, deletionMatch[0].length);
-    const trailingComments = tokenizeCriticCommentBlocks(
-      src,
-      deletionMatch[0].length + metadata.raw.length,
-      existingComments,
-      endmatter,
-    );
-    const change = createChangeWithContext(
-      "deletion",
-      parseChangeMetadata(metadata.metadataText, endmatter),
-      existingChanges,
-    );
-
-    return {
-      token: {
-        type: "criticChange",
-        raw: deletionMatch[0] + metadata.raw + trailingComments.raw,
-        change,
-        commentIds: trailingComments.comments.map((comment) => comment.id),
-        tokens: lexer.inlineTokens(text),
-      },
-      comments: trailingComments.comments,
-    };
-  }
-
-  const substitutionMatch = src.match(criticSubstitutionPattern);
-
-  if (substitutionMatch) {
-    const [, oldText, newText] = substitutionMatch;
-    const metadata = getTrailingAttributeMetadata(
-      src,
-      substitutionMatch[0].length,
-    );
-    const trailingComments = tokenizeCriticCommentBlocks(
-      src,
-      substitutionMatch[0].length + metadata.raw.length,
-      existingComments,
-      endmatter,
-    );
-    const change = createChangeWithContext(
-      "substitution-old",
-      parseChangeMetadata(metadata.metadataText, endmatter),
-      existingChanges,
-    );
-
-    return {
-      token: {
-        type: "criticChange",
-        raw: substitutionMatch[0] + metadata.raw + trailingComments.raw,
-        change,
-        commentIds: trailingComments.comments.map((comment) => comment.id),
-        oldTokens: lexer.inlineTokens(oldText),
-        newTokens: lexer.inlineTokens(newText),
-      },
-      comments: trailingComments.comments,
-    };
-  }
-
-  return undefined;
+function commentIdsAttributes(
+  commentIds: string[],
+  refOnlyIds: string[],
+  context?: ReviewLoadContext,
+) {
+  for (const id of commentIds) context?.placedIds.add(id);
+  const refOnly = refOnlyIds.filter((id) => commentIds.includes(id));
+  return `data-comment-ids="${escapeHtml(JSON.stringify(commentIds))}"${
+    refOnly.length > 0
+      ? ` data-comment-ref-only="${escapeHtml(JSON.stringify(refOnly))}"`
+      : ""
+  }`;
 }
 
 function renderCriticChangeSpan(
@@ -902,6 +1083,8 @@ function renderCriticChangeSpan(
   content: string,
   kind: CriticChangeKind = change.kind,
   commentIds: string[] = [],
+  refOnlyIds: string[] = [],
+  context?: ReviewLoadContext,
 ) {
   const by = change.authorType === "ai" ? "AI" : change.authorId || "user";
   const changeSpan = `<span data-critic-change-kind="${escapeHtml(kind)}" data-critic-change-id="${escapeHtml(
@@ -914,121 +1097,179 @@ function renderCriticChangeSpan(
     return changeSpan;
   }
 
-  return `<span data-comment-ids="${escapeHtml(
-    JSON.stringify(commentIds),
-  )}">${changeSpan}</span>`;
+  return `<span ${commentIdsAttributes(commentIds, refOnlyIds, context)}>${changeSpan}</span>`;
 }
 
-function renderCriticCodeText(
-  text: string,
-  comments: Map<string, CriticComment>,
-  endmatter?: ParsedEndmatter,
-) {
+// Code is literal: nothing inside a fence is review markup. A comment on
+// code is a ref on the opening fence line, with the highlighted lines in the
+// comment's entry.
+function renderCriticCodeBlock(token: Tokens.Code, context: ReviewLoadContext) {
+  const info = (token.lang || "").trim();
+  const language = info.match(/^[^\s{]\S*/)?.[0];
+  const classAttr = language ? ` class="language-${escapeHtml(language)}"` : "";
+  const content = token.escaped ? token.text : escapeHtml(token.text);
+  const anchors: CodeCommentAnchor[] = [];
+
+  for (const match of info.matchAll(fenceRefPattern)) {
+    const id = match[1] ?? "";
+    const comment = context.comments.get(id);
+    if (!comment || isNestedReply(comment, context.comments, context.model)) {
+      continue;
+    }
+    if (anchors.some((anchor) => anchor.id === id)) continue;
+    anchors.push({ id, lines: comment.codeLines ?? null });
+    context.placedIds.add(id);
+  }
+
+  const infoAttr =
+    info && info !== language ? ` data-info="${escapeHtml(info)}"` : "";
+  const anchorsAttr =
+    anchors.length > 0
+      ? ` data-code-anchors="${escapeHtml(JSON.stringify(anchors))}"`
+      : "";
+
+  return `<pre${infoAttr}${anchorsAttr}><code${classAttr}>${content}</code></pre>\n`;
+}
+
+// ------------------------------------------------------------- the writer
+
+interface SerializeContext {
+  comments: Map<string, CriticComment>;
+  useEndmatter: boolean;
+  /** Roots whose replies were already written inline (attribute files). */
+  emittedReplies: Set<string>;
+}
+
+function serializeMetadata(comment: CriticComment): string {
+  const source = comment.source;
+  const fields = new Map<string, string>();
+
+  if (source?.attributes) {
+    for (const [key, value] of Object.entries(source.attributes)) {
+      fields.set(key, value);
+    }
+  }
+
+  const by = authorLabel(comment);
+  fields.set("id", comment.id);
+  if (!sameAuthor(fields.get("by"), by)) fields.set("by", by);
+  if (!(source && fields.has("at") && comment.createdAt === source.createdAt)) {
+    fields.set("at", comment.createdAt || new Date().toISOString());
+  }
+  if (comment.parentCommentId) {
+    fields.set("re", comment.parentCommentId);
+  } else {
+    fields.delete("re");
+  }
+  if (!source || (comment.status ?? null) !== source.status) {
+    if (comment.status) fields.set("status", comment.status);
+    else fields.delete("status");
+  }
+  if (!source || (comment.resolved ?? null) !== source.resolved) {
+    if (comment.resolved) fields.set("resolved", comment.resolved);
+    else fields.delete("resolved");
+  }
+
+  return `{${[...fields]
+    .map(([key, value]) => `${key}="${escapeMetadataAttributeValue(value)}"`)
+    .join(" ")}}`;
+}
+
+function serializeChangeMetadata(change: CriticChangeAttrs): string {
+  return serializeMetadata({
+    id: change.changeId,
+    content: "",
+    createdAt: change.createdAt,
+    authorType: change.authorType,
+    authorId: change.authorId,
+  });
+}
+
+function inlineCommentText(comment: CriticComment): string {
+  const source = comment.source;
+  return source?.rawContent != null && comment.content === source.content
+    ? source.rawContent
+    : comment.content;
+}
+
+function serializeInlineReplies(rootId: string, context: SerializeContext) {
+  if (context.useEndmatter || context.emittedReplies.has(rootId)) return "";
+  context.emittedReplies.add(rootId);
+
+  return getCommentDescendantIds(rootId, context.comments)
+    .map((id) => context.comments.get(id))
+    .filter(
+      (comment): comment is CriticComment =>
+        comment !== undefined && !comment.literal,
+    )
+    .map(
+      (comment) =>
+        `{>>${inlineCommentText(comment)}<<}${serializeMetadata(comment)}`,
+    )
+    .join("");
+}
+
+function serializeCommentBlocks(
+  commentIds: string[],
+  refOnlyIds: string[],
+  context: SerializeContext,
+): string {
   let result = "";
-  let offset = 0;
 
-  while (offset < text.length) {
-    const anchorMatch = text.slice(offset).match(criticCommentAnchorPattern);
-
-    if (!anchorMatch || anchorMatch.index !== 0) {
-      result += escapeHtml(text[offset] ?? "");
-      offset += 1;
+  for (const commentId of commentIds) {
+    const comment = context.comments.get(commentId);
+    if (!comment) {
+      if (refOnlyIds.includes(commentId)) result += `{#${commentId}}`;
       continue;
     }
+    // Marks carry root ids only; a reply that still sits on one is written
+    // with its thread below (or in the review block).
+    if (isNestedReply(comment, context.comments)) continue;
 
-    const [, anchor] = anchorMatch;
-    let nextOffset = offset + anchorMatch[0].length;
-    const parsedComments: CriticComment[] = [];
-
-    while (nextOffset < text.length) {
-      const commentMatch = text
-        .slice(nextOffset)
-        .match(criticCommentBlockPattern);
-      if (!commentMatch) break;
-
-      const [
-        ,
-        commentText,
-        ,
-        legacyMetadataText,
-        attributeMetadataText,
-        referenceMetadataText,
-      ] = commentMatch;
-      const comment = createCommentWithContext(
-        {
-          ...parseMetadata(
-            legacyMetadataText,
-            attributeMetadataText,
-            referenceMetadataText,
-            endmatter,
-            "comment",
-          ),
-          content: commentText,
-        },
-        [...comments.values(), ...parsedComments],
-      );
-      parsedComments.push(comment);
-      nextOffset += commentMatch[0].length;
+    if (
+      refOnlyIds.includes(commentId) ||
+      (context.useEndmatter && comment.bodyInEndmatter)
+    ) {
+      result += `{#${comment.id}}`;
+    } else if (context.useEndmatter) {
+      result += `{>>${inlineCommentText(comment)}<<}{#${comment.id}}`;
+    } else {
+      result += `{>>${inlineCommentText(comment)}<<}${serializeMetadata(comment)}`;
     }
-
-    if (parsedComments.length === 0) {
-      result += escapeHtml(anchorMatch[0]);
-      offset += anchorMatch[0].length;
-      continue;
-    }
-
-    for (const comment of parsedComments) {
-      comments.set(comment.id, comment);
-    }
-
-    result += `<span data-comment-ids="${escapeHtml(
-      JSON.stringify(parsedComments.map((comment) => comment.id)),
-    )}">${escapeHtml(anchor)}</span>`;
-    offset = nextOffset;
+    result += serializeInlineReplies(comment.id, context);
   }
 
   return result;
 }
 
-function renderCriticCodeBlock(
-  token: Tokens.Code,
-  comments: Map<string, CriticComment>,
-  endmatter?: ParsedEndmatter,
-) {
-  const language = (token.lang || "").match(/\S+/)?.[0];
-  const classAttr = language ? ` class="language-${escapeHtml(language)}"` : "";
-  const content = token.escaped
-    ? token.text
-    : renderCriticCodeText(token.text, comments, endmatter);
+function getElementIdList(element: HTMLElement, attribute: string): string[] {
+  const text = element.getAttribute(attribute);
+  if (!text) return [];
 
-  return `<pre><code${classAttr}>${content}</code></pre>\n`;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string")
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 function addCriticCommentRule(
   service: TurndownService,
-  comments: Map<string, CriticComment>,
-  useEndmatter = false,
+  context: SerializeContext,
 ) {
   service.addRule("criticComment", {
     filter: (node) =>
       node.nodeName === "SPAN" &&
       (node as HTMLElement).hasAttribute("data-comment-ids"),
     replacement(content, node) {
-      const commentIdsText = (node as HTMLElement).getAttribute(
-        "data-comment-ids",
-      );
+      const element = node as HTMLElement;
+      const commentIds = getElementIdList(element, "data-comment-ids");
+      const refOnlyIds = getElementIdList(element, "data-comment-ref-only");
 
-      if (!commentIdsText) return content;
-
-      let commentIds: string[] = [];
-
-      try {
-        commentIds = JSON.parse(commentIdsText) as string[];
-      } catch {
-        return content;
-      }
-
-      const criticChangeElement = (node as HTMLElement).querySelector(
+      const criticChangeElement = element.querySelector(
         "span[data-critic-change-kind]",
       );
       if (criticChangeElement instanceof HTMLElement) {
@@ -1036,52 +1277,44 @@ function addCriticCommentRule(
           service,
           criticChangeElement,
           service.turndown(criticChangeElement.innerHTML).trim(),
-          comments,
+          context,
           commentIds,
-          useEndmatter,
+          refOnlyIds,
         );
       }
 
       const commentBlocks = serializeCommentBlocks(
         commentIds,
-        comments,
-        useEndmatter,
+        refOnlyIds,
+        context,
       );
-      if (!commentBlocks) return content;
       if (content === unanchoredCommentSentinel) return commentBlocks;
+      if (!commentBlocks) return content;
 
       return `{==${content}==}${commentBlocks}`;
     },
   });
 }
 
-function addCriticCodeBlockRule(service: TurndownService) {
-  service.addRule("criticCodeBlock", {
-    filter: (node) => {
-      if (node.nodeName !== "PRE") return false;
-      const codeElement = (node as HTMLElement).firstElementChild;
-      return (
-        codeElement?.nodeName === "CODE" &&
-        Boolean(
-          codeElement.querySelector(
-            "span[data-comment-ids], span[data-critic-change-kind]",
-          ),
-        )
-      );
-    },
+// A fence whose info string carries more than a language (fence-line refs,
+// attributes) is written back with that info string untouched.
+function addCodeBlockInfoRule(service: TurndownService) {
+  service.addRule("codeBlockInfo", {
+    filter: (node) =>
+      node.nodeName === "PRE" &&
+      (node as HTMLElement).hasAttribute("data-info") &&
+      (node as HTMLElement).firstElementChild?.nodeName === "CODE",
     replacement(_content, node) {
-      const codeElement = (node as HTMLElement)
-        .firstElementChild as HTMLElement | null;
+      const element = node as HTMLElement;
+      const info = element.getAttribute("data-info") ?? "";
+      const code = element.firstElementChild?.textContent ?? "";
+      const longestRun = Math.max(
+        2,
+        ...[...code.matchAll(/^`{3,}/gm)].map((match) => match[0].length),
+      );
+      const fence = "`".repeat(longestRun + 1);
 
-      if (!codeElement) return "";
-
-      const language =
-        [...codeElement.classList]
-          .find((className) => className.startsWith("language-"))
-          ?.slice("language-".length) ?? "";
-      const content = service.turndown(codeElement.innerHTML).trimEnd();
-
-      return `\n\n\`\`\`${language}\n${content}\n\`\`\`\n\n`;
+      return `\n\n${fence}${info}\n${code.replace(/\n$/, "")}\n${fence}\n\n`;
     },
   });
 }
@@ -1126,52 +1359,57 @@ function isPairedSubstitutionElement(
   );
 }
 
-function getElementCommentIds(element: HTMLElement): string[] {
-  const commentIdsText = element.getAttribute("data-comment-ids");
-  if (!commentIdsText) return [];
-
-  try {
-    const parsed = JSON.parse(commentIdsText) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter((id): id is string => typeof id === "string")
-      : [];
-  } catch {
-    return [];
-  }
-}
-
 function getChangeCommentBlocks(
   element: HTMLElement,
-  comments: Map<string, CriticComment>,
+  change: CriticChangeAttrs,
+  context: SerializeContext,
   extraCommentIds: string[] = [],
-  useEndmatter = false,
+  extraRefOnlyIds: string[] = [],
 ) {
-  return serializeCommentBlocks(
-    [...new Set([...getElementCommentIds(element), ...extraCommentIds])],
-    comments,
-    useEndmatter,
+  const blocks = serializeCommentBlocks(
+    [
+      ...new Set([
+        ...getElementIdList(element, "data-comment-ids"),
+        ...extraCommentIds,
+      ]),
+    ],
+    [...getElementIdList(element, "data-comment-ref-only"), ...extraRefOnlyIds],
+    context,
   );
+
+  // Replies to the suggestion itself (attribute files keep them inline).
+  return blocks + serializeInlineReplies(change.changeId, context);
 }
 
 function serializeCriticChangeElement(
   service: TurndownService,
   element: HTMLElement,
   content: string,
-  comments: Map<string, CriticComment>,
+  context: SerializeContext,
   extraCommentIds: string[] = [],
-  useEndmatter = false,
+  extraRefOnlyIds: string[] = [],
 ) {
   const change = getElementChangeAttrs(element);
 
   if (!change) return content;
 
+  const isSecondHalf =
+    change.kind === "substitution-new" &&
+    isPairedSubstitutionElement(
+      element.previousElementSibling,
+      "substitution-old",
+      change.changeId,
+    );
+  if (isSecondHalf) return "";
+
   const commentBlocks = getChangeCommentBlocks(
     element,
-    comments,
+    change,
+    context,
     extraCommentIds,
-    useEndmatter,
+    extraRefOnlyIds,
   );
-  const metadata = useEndmatter
+  const metadata = context.useEndmatter
     ? `{#${change.changeId}}`
     : serializeChangeMetadata(change);
 
@@ -1184,20 +1422,14 @@ function serializeCriticChangeElement(
   }
 
   if (change.kind === "substitution-new") {
-    return isPairedSubstitutionElement(
-      element.previousElementSibling,
-      "substitution-old",
-      change.changeId,
-    )
-      ? ""
-      : `{++${content}++}${
-          useEndmatter
-            ? `{#${change.changeId}}`
-            : serializeChangeMetadata({
-                ...change,
-                kind: "addition",
-              })
-        }${commentBlocks}`;
+    return `{++${content}++}${
+      context.useEndmatter
+        ? `{#${change.changeId}}`
+        : serializeChangeMetadata({
+            ...change,
+            kind: "addition",
+          })
+    }${commentBlocks}`;
   }
 
   const nextElement = element.nextElementSibling;
@@ -1215,7 +1447,7 @@ function serializeCriticChangeElement(
   }
 
   return `{--${content}--}${
-    useEndmatter
+    context.useEndmatter
       ? `{#${change.changeId}}`
       : serializeChangeMetadata({
           ...change,
@@ -1226,35 +1458,31 @@ function serializeCriticChangeElement(
 
 function addCriticChangeRule(
   service: TurndownService,
-  comments: Map<string, CriticComment>,
-  useEndmatter = false,
+  context: SerializeContext,
 ) {
   service.addRule("criticChange", {
     filter: (node) =>
       node.nodeName === "SPAN" &&
       (node as HTMLElement).hasAttribute("data-critic-change-kind"),
     replacement(content, node) {
-      const element = node as HTMLElement;
       return serializeCriticChangeElement(
         service,
-        element,
+        node as HTMLElement,
         content,
-        comments,
-        [],
-        useEndmatter,
+        context,
       );
     },
   });
 }
 
+// ------------------------------------------------------------- the reader
+
 function createCriticMarked(
+  context: ReviewLoadContext,
   markdownOptions?: MarkdownOptions,
-  endmatter?: ParsedEndmatter,
 ) {
-  const comments = new Map<string, CriticComment>();
-  const changes = new Map<string, CriticChangeAttrs>();
   const renderer = createMarkedRenderer(markdownOptions);
-  renderer.code = (token) => renderCriticCodeBlock(token, comments, endmatter);
+  renderer.code = (token) => renderCriticCodeBlock(token, context);
   const parser = new Marked({
     gfm: true,
     async: false,
@@ -1270,24 +1498,19 @@ function createCriticMarked(
           return src.indexOf("{==");
         },
         tokenizer(this: TokenizerThis, src: string) {
-          const result = tokenizeCriticCommentAnchor(
-            this.lexer,
-            src,
-            comments.values(),
-            endmatter,
-          );
-          if (!result) return undefined;
-
-          for (const comment of result.comments) {
-            comments.set(comment.id, comment);
-          }
-          return result.token;
+          return tokenizeCriticCommentAnchor(this.lexer, src, context);
         },
         renderer(this: RendererThis, token: Tokens.Generic) {
           const criticToken = token as CriticCommentToken;
-          return `<span data-comment-ids="${escapeHtml(
-            JSON.stringify(criticToken.commentIds),
-          )}">${this.parser.parseInline(criticToken.tokens)}</span>`;
+          const inner = this.parser.parseInline(criticToken.tokens);
+          // A highlight that only carried replies keeps no mark: the
+          // replies are in the comment map.
+          if (criticToken.commentIds.length === 0) return inner;
+          return `<span ${commentIdsAttributes(
+            criticToken.commentIds,
+            criticToken.refOnlyIds,
+            context,
+          )}>${inner}</span>`;
         },
         childTokens: ["tokens"],
       } satisfies TokenizerAndRendererExtension,
@@ -1295,26 +1518,23 @@ function createCriticMarked(
         name: "criticStandaloneComment",
         level: "inline",
         start(src: string) {
-          return src.indexOf("{>>");
+          const starts = ["{>>", "{#"]
+            .map((marker) => src.indexOf(marker))
+            .filter((index) => index >= 0);
+
+          return starts.length > 0 ? Math.min(...starts) : undefined;
         },
         tokenizer(src: string) {
-          const result = tokenizeCriticStandaloneComment(
-            src,
-            comments.values(),
-            endmatter,
-          );
-          if (!result) return undefined;
-
-          for (const comment of result.comments) {
-            comments.set(comment.id, comment);
-          }
-          return result.token;
+          return tokenizeCriticStandaloneComment(src, context);
         },
         renderer(token: Tokens.Generic) {
           const criticToken = token as CriticStandaloneCommentToken;
-          return `<span data-comment-ids="${escapeHtml(
-            JSON.stringify(criticToken.commentIds),
-          )}" data-comment-anchorless="true">${unanchoredCommentSentinel}</span>`;
+          if (criticToken.commentIds.length === 0) return "";
+          return `<span ${commentIdsAttributes(
+            criticToken.commentIds,
+            criticToken.refOnlyIds,
+            context,
+          )} data-comment-anchorless="true">${unanchoredCommentSentinel}</span>`;
         },
       } satisfies TokenizerAndRendererExtension,
       {
@@ -1328,20 +1548,11 @@ function createCriticMarked(
           return starts.length > 0 ? Math.min(...starts) : undefined;
         },
         tokenizer(this: TokenizerThis, src: string) {
-          const result = tokenizeCriticChange(
-            this.lexer,
-            src,
-            changes.values(),
-            comments.values(),
-            endmatter,
-          );
-          if (!result) return undefined;
+          const token = tokenizeCriticChange(this.lexer, src, context);
+          if (!token) return undefined;
 
-          for (const comment of result.comments) {
-            comments.set(comment.id, comment);
-          }
-          changes.set(result.token.change.changeId, result.token.change);
-          return result.token;
+          context.changes.set(token.change.changeId, token.change);
+          return token;
         },
         renderer(this: RendererThis, token: Tokens.Generic) {
           const criticToken = token as CriticChangeToken;
@@ -1367,9 +1578,11 @@ function createCriticMarked(
               return substitutionHtml;
             }
 
-            return `<span data-comment-ids="${escapeHtml(
-              JSON.stringify(criticToken.commentIds),
-            )}">${substitutionHtml}</span>`;
+            return `<span ${commentIdsAttributes(
+              criticToken.commentIds,
+              criticToken.refOnlyIds,
+              context,
+            )}>${substitutionHtml}</span>`;
           }
 
           return renderCriticChangeSpan(
@@ -1377,6 +1590,8 @@ function createCriticMarked(
             this.parser.parseInline(criticToken.tokens ?? []),
             criticToken.change.kind,
             criticToken.commentIds,
+            criticToken.refOnlyIds,
+            context,
           );
         },
         childTokens: ["tokens", "oldTokens", "newTokens"],
@@ -1384,22 +1599,130 @@ function createCriticMarked(
     ],
   });
 
-  return { parser, comments, changes };
+  return parser;
 }
 
+interface CriticMarkdownLoad {
+  html: string;
+  placedIds: Set<string>;
+  comments: Map<string, CriticComment>;
+  changes: Map<string, CriticChangeAttrs>;
+  frontmatter: string | null;
+  endmatter: string | null;
+  reviewStatus: RfmEndmatterStatus;
+  /** Set when the review block could not be read: the banner text. */
+  reviewError: string | null;
+  /** Review block entries the editor does not show; a save keeps them. */
+  preservedEntryIds: string[];
+  /** The file keeps a blank line around its headings; a save does too. */
+  looseHeadings: boolean;
+  /** The file's lists were written by an earlier build; a save keeps that shape. */
+  legacyListSpacing: boolean;
+}
+
+// Inline roots rfm reads but the editor could not place, with every reply
+// under them. Their markup is kept as literal text on a second pass.
+function findUnplacedThreads(context: ReviewLoadContext): Set<string> {
+  const unplaced = new Set<string>();
+
+  for (const item of context.model.comments) {
+    if (item.kind !== "comment" || item.anchors.length === 0) continue;
+    if (context.placedIds.has(item.id)) continue;
+    if (!context.comments.has(item.id)) continue;
+    unplaced.add(item.id);
+    for (const id of getCommentDescendantIds(item.id, context.comments)) {
+      unplaced.add(id);
+    }
+  }
+
+  return unplaced;
+}
+
+function parseBody(
+  markdown: string,
+  body: string,
+  options: MarkdownOptions | undefined,
+  literalIds: Set<string>,
+) {
+  const context = createReviewLoadContext(markdown);
+  for (const id of literalIds) context.literalIds.add(id);
+  const parser = createCriticMarked(context, options);
+  const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
+  return { context, html };
+}
+
+function loadCriticMarkdown(
+  markdown: string,
+  options?: MarkdownOptions,
+): CriticMarkdownLoad {
+  const split = yamlDocumentMetadataFromSplit(parseReviewModel(markdown).split);
+  const { frontmatter, body, endmatter, status, yamlError } = split;
+  let { context, html } = parseBody(markdown, body, options, new Set());
+  const unplaced = findUnplacedThreads(context);
+  if (unplaced.size > 0) {
+    ({ context, html } = parseBody(markdown, body, options, unplaced));
+    for (const id of unplaced) {
+      const comment = context.comments.get(id);
+      if (comment) comment.literal = true;
+    }
+  }
+
+  return {
+    html,
+    placedIds: context.placedIds,
+    comments: context.comments,
+    changes: context.changes,
+    frontmatter,
+    endmatter,
+    reviewStatus: status,
+    reviewError:
+      status === "invalid" && yamlError
+        ? describeReviewBlockError(yamlError.message)
+        : null,
+    preservedEntryIds: context.model.orphans.map((orphan) => orphan.id),
+    looseHeadings: usesLooseHeadingSpacing(body),
+    legacyListSpacing: usesLegacyListSpacing(body),
+  };
+}
+
+/**
+ * A thread shown in the global section: a document-level comment, a comment
+ * whose anchor is gone, or a reply whose parent is missing (rfm gives all
+ * three the document scope; replies to a suggestion keep the inline one).
+ */
+export function isGlobalThreadRoot(
+  comment: CriticComment,
+  comments: ReadonlyMap<string, CriticComment>,
+): boolean {
+  if (isNestedReply(comment, comments)) return false;
+  return comment.scope === "document" || comment.lostAnchor === true;
+}
+
+// Whether the document has anything for the rail to show: a suggestion, a
+// thread on an anchor the editor renders, or a global thread. Review markup
+// the editor keeps literal (inside raw HTML blocks) does not count.
 export function criticMarkdownHasReviewRail(
   markdown: string,
   options?: MarkdownOptions,
 ): boolean {
-  const { body, endmatter } = splitYamlDocumentMetadata(markdown);
-  const parsedEndmatter = parseReviewEndmatter(endmatter);
-  const { parser, comments, changes } = createCriticMarked(
+  const { comments, changes, placedIds } = loadCriticMarkdown(
+    markdown,
     options,
-    parsedEndmatter,
   );
-  parser.parse(protectRichTextRoundTripMarkdown(body));
-  addEndmatterFeedback(comments, parsedEndmatter);
-  return comments.size > 0 || changes.size > 0;
+  if (changes.size > 0 || placedIds.size > 0) return true;
+
+  for (const comment of comments.values()) {
+    if (isGlobalThreadRoot(comment, comments)) return true;
+  }
+  return false;
+}
+
+/** The banner text when the file's review block cannot be read, else null. */
+export function getReviewBlockError(markdown: string): string | null {
+  const split = parseReviewModel(markdown).split;
+  return split.status === "invalid" && split.yamlError
+    ? describeReviewBlockError(split.yamlError.message)
+    : null;
 }
 
 export function criticMarkdownToRenderedHtml(
@@ -1412,14 +1735,8 @@ export function criticMarkdownToRenderedHtml(
   frontmatter: string | null;
   endmatter: string | null;
 } {
-  const { frontmatter, body, endmatter } = splitYamlDocumentMetadata(markdown);
-  const parsedEndmatter = parseReviewEndmatter(endmatter);
-  const { parser, comments, changes } = createCriticMarked(
-    options,
-    parsedEndmatter,
-  );
-  const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
-  addEndmatterFeedback(comments, parsedEndmatter);
+  const { html, comments, changes, frontmatter, endmatter } =
+    loadCriticMarkdown(markdown, options);
 
   return { html, comments, changes, frontmatter, endmatter };
 }
@@ -1432,24 +1749,51 @@ export function criticMarkdownToEditorState(
   comments: Map<string, CriticComment>;
   frontmatter: string | null;
   endmatter: string | null;
+  reviewStatus: RfmEndmatterStatus;
+  reviewError: string | null;
+  preservedEntryIds: string[];
+  looseHeadings: boolean;
+  legacyListSpacing: boolean;
 } {
-  const { frontmatter, body, endmatter } = splitYamlDocumentMetadata(markdown);
-  const parsedEndmatter = parseReviewEndmatter(endmatter);
-  const { parser, comments } = createCriticMarked(options, parsedEndmatter);
-  const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
-  const doc = generateJSON(html, extensions) as JSONContent & {
-    yamlFrontmatter?: string;
-    yamlEndmatter?: string;
-  };
-  addEndmatterFeedback(comments, parsedEndmatter);
-  if (frontmatter) {
-    doc.yamlFrontmatter = frontmatter;
+  const load = loadCriticMarkdown(markdown, options);
+  const doc = generateJSON(load.html, extensions) as JSONContent &
+    CriticDocumentMetadata;
+  if (load.frontmatter) {
+    doc.yamlFrontmatter = load.frontmatter;
   }
-  if (endmatter) {
-    doc.yamlEndmatter = endmatter;
+  if (load.endmatter) {
+    doc.yamlEndmatter = load.endmatter;
+  }
+  if (load.preservedEntryIds.length > 0) {
+    doc.yamlEndmatterPreservedIds = load.preservedEntryIds;
+  }
+  if (load.looseHeadings) {
+    doc.looseHeadings = true;
+  }
+  if (load.legacyListSpacing) {
+    doc.legacyListSpacing = true;
   }
 
-  return { doc, comments, frontmatter, endmatter };
+  return {
+    doc,
+    comments: load.comments,
+    frontmatter: load.frontmatter,
+    endmatter: load.endmatter,
+    reviewStatus: load.reviewStatus,
+    reviewError: load.reviewError,
+    preservedEntryIds: load.preservedEntryIds,
+    looseHeadings: load.looseHeadings,
+    legacyListSpacing: load.legacyListSpacing,
+  };
+}
+
+// What a load keeps beside the editor document for the next save.
+interface CriticDocumentMetadata {
+  yamlFrontmatter?: string;
+  yamlEndmatter?: string;
+  yamlEndmatterPreservedIds?: string[];
+  looseHeadings?: boolean;
+  legacyListSpacing?: boolean;
 }
 
 function collectCriticChangesFromDoc(
@@ -1489,31 +1833,45 @@ function collectCriticChangesFromDoc(
 export function editorStateToCriticMarkdown(
   doc: JSONContent,
   comments: Map<string, CriticComment>,
-  options?: { frontmatter?: string | null; endmatter?: string | null },
+  options?: {
+    frontmatter?: string | null;
+    endmatter?: string | null;
+    preservedEntryIds?: readonly string[];
+    looseHeadings?: boolean;
+    legacyListSpacing?: boolean;
+  },
 ): string {
   const html = generateHTML(doc, extensions);
-  const service = createTurndownService();
-  const frontmatter =
-    options?.frontmatter ??
-    (doc as JSONContent & { yamlFrontmatter?: string }).yamlFrontmatter ??
-    null;
-  const sourceEndmatter =
-    options?.endmatter ??
-    (doc as JSONContent & { yamlEndmatter?: string }).yamlEndmatter ??
-    null;
+  const metadata = doc as JSONContent & CriticDocumentMetadata;
+  const service = createTurndownService({
+    legacyListSpacing:
+      options?.legacyListSpacing ?? metadata.legacyListSpacing ?? false,
+  });
+  const frontmatter = options?.frontmatter ?? metadata.yamlFrontmatter ?? null;
+  const sourceEndmatter = options?.endmatter ?? metadata.yamlEndmatter ?? null;
+  const preservedEntryIds =
+    options?.preservedEntryIds ?? metadata.yamlEndmatterPreservedIds ?? [];
   const changes = collectCriticChangesFromDoc(doc);
-  const useEndmatter = Boolean(sourceEndmatter);
-  addCriticCommentRule(service, comments, useEndmatter);
-  addCriticChangeRule(service, comments, useEndmatter);
-  addCriticCodeBlockRule(service);
+  const context: SerializeContext = {
+    comments,
+    useEndmatter: Boolean(sourceEndmatter),
+    emittedReplies: new Set(),
+  };
+  addCriticCommentRule(service, context);
+  addCriticChangeRule(service, context);
+  addCodeBlockInfoRule(service);
+  const body = service.turndown(html).trimEnd();
   const endmatter = serializeReviewEndmatter(
     sourceEndmatter,
     comments,
     changes,
+    preservedEntryIds,
   );
   return appendYamlEndmatter(
     prependYamlFrontmatter(
-      normalizeBlockSpacing(`${service.turndown(html).trimEnd()}\n`),
+      normalizeBlockSpacing(`${body}\n`, {
+        looseHeadings: options?.looseHeadings ?? metadata.looseHeadings,
+      }),
       frontmatter,
     ),
     endmatter,

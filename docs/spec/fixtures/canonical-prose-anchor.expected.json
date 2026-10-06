@@ -1,0 +1,41 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": [],
+  "summary": {
+    "comments": 3,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 2,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Split these checks by owner.",
+      "status": null,
+      "anchors": ["the caption and the link placement"]
+    },
+    {
+      "id": "a1",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Done: split into creator and ops checks.",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "a1",
+      "text": "Thanks, that reads better.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

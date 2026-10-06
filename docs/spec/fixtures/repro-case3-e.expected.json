@@ -1,0 +1,32 @@
+{
+  "status": "absent",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "The handoff between these two sentences is abrupt.",
+      "status": null,
+      "anchors": ["a closing clause that runs on."]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reconciled both sections with the timeline doc and moved the date to June.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

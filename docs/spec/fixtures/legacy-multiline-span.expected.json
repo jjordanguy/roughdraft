@@ -1,0 +1,32 @@
+{
+  "status": "absent",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Split this sentence.",
+      "status": "resolved",
+      "anchors": ["runs on\ninto the second line"]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Done.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

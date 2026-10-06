@@ -1,0 +1,23 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 1,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 0,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Needs a source.",
+      "status": null,
+      "anchors": ["this sentence"]
+    }
+  ]
+}

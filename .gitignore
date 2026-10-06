@@ -17,3 +17,4 @@ sandbox
 /roughdraft.json
 .compound-engineering/*.local.yaml
 .context/
+packages/rfm/test/corpus/

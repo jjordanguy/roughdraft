@@ -1,0 +1,50 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body", "warning mixed-metadata"],
+  "summary": {
+    "comments": 4,
+    "roots": 2,
+    "documentComments": 0,
+    "replies": 2,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Inline attr root",
+      "status": null,
+      "anchors": ["one"]
+    },
+    {
+      "id": "c2",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Compact root",
+      "status": null,
+      "anchors": ["two"]
+    },
+    {
+      "id": "c3",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c2",
+      "text": "Reply to compact root",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "c4",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reply to inline root",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

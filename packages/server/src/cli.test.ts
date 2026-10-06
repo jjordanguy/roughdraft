@@ -1593,9 +1593,22 @@ describe("cli", () => {
   it("validates a conforming markdown file from doctor path", async () => {
     const test = createTestDependencies();
     const documentPath = path.join(projectDir, "draft.md");
+    // Batch 3a: an inline comment body is the legacy form and now carries a
+    // `legacy-inline-body` warning, so a conforming file uses the current
+    // format (anchor in the text, comment text in the review block).
     fs.writeFileSync(
       documentPath,
-      'Please revisit {==this sentence==}{>>Needs a source.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n',
+      [
+        "Please revisit {==this sentence==}{#c1}.",
+        "",
+        "---",
+        "comments:",
+        "  c1:",
+        '    body: "Needs a source."',
+        "    by: user",
+        '    at: "2026-04-28T12:00:00.000Z"',
+        "",
+      ].join("\n"),
     );
 
     const exitCode = await runCli(["doctor", documentPath], test.deps);

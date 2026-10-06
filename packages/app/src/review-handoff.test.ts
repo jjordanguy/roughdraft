@@ -231,9 +231,13 @@ describe("getReviewHandoffView", () => {
         }),
       }),
       expected: {
-        kind: "saved-for-agent",
+        kind: "sent",
+        buttonLabel: "Sent",
+        icon: "check",
+        title: "Sent to Plan review chat",
+        body: "Your agent will start a round on your comments; the AI editing badge shows when it does.",
         wakeLine: "Sent to Plan review chat",
-        showCopyMessage: true,
+        showCopyMessage: false,
       },
     },
     {
@@ -249,7 +253,8 @@ describe("getReviewHandoffView", () => {
         handoff: null,
       }),
       expected: {
-        kind: "saved-for-agent",
+        kind: "sent",
+        title: "Sent to your agent's session",
         wakeLine: "Sent to your agent's session",
       },
     },

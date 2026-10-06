@@ -223,6 +223,21 @@ export function getReviewHandoffView(
     }
 
     if (input.result.pending) {
+      const wake = handoff?.wake ?? input.result.wake ?? null;
+      // The wake route delivered the Done into the agent's session: it is
+      // on its way, so this reads like a live delivery, not a wait.
+      if (wake?.state === "sent") {
+        const target = input.sessionLabel ?? "your agent's session";
+        return {
+          ...base,
+          kind: "sent",
+          buttonLabel: "Sent",
+          icon: "check",
+          title: `Sent to ${target}`,
+          body: "Your agent will start a round on your comments; the AI editing badge shows when it does.",
+          wakeLine: describeWake(wake, input.sessionLabel),
+        };
+      }
       return {
         ...base,
         kind: "saved-for-agent",
@@ -230,10 +245,7 @@ export function getReviewHandoffView(
         icon: "check",
         title: "Saved for your agent",
         body: "Your agent is not listening right now. Tell it you're done, or copy this message.",
-        wakeLine: describeWake(
-          handoff?.wake ?? input.result.wake ?? null,
-          input.sessionLabel,
-        ),
+        wakeLine: describeWake(wake, input.sessionLabel),
         showCopyMessage: true,
       };
     }

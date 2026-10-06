@@ -1063,7 +1063,15 @@ export function DocumentWorkspace({
                       {reviewHandoffView.title}
                     </div>
                     <div className="mt-1">
-                      <p className="text-sm leading-[1.32rem] text-stone-500 dark:text-slate-400">
+                      {reviewHandoffView.body ? (
+                        <p className="text-sm leading-[1.32rem] text-stone-500 dark:text-slate-400">
+                          {reviewHandoffView.body}
+                        </p>
+                      ) : null}
+                      <p
+                        className="text-sm leading-[1.32rem] text-stone-500 dark:text-slate-400"
+                        hidden={reviewHandoffView.body !== null}
+                      >
                         Your agent is now working in the background on this, in
                         all likelihood. If our signal didn't make it, just{" "}
                         <button

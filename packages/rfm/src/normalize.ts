@@ -1,3 +1,4 @@
+import type { BuildReviewDocOptions } from "./document.js";
 import {
   buildReviewDoc,
   FORMATTING_CHANGES,
@@ -33,8 +34,9 @@ export interface RfmNormalizationResult {
  */
 export function normalizeRoughdraftMetadata(
   markdown: string,
+  options: BuildReviewDocOptions = {},
 ): RfmNormalizationResult {
-  const built = buildReviewDoc(markdown);
+  const built = buildReviewDoc(markdown, options);
   const byLine = <T extends { line?: number }>(list: T[]) =>
     list
       .map((item, index) => ({ item, index }))

@@ -973,15 +973,22 @@ describe("review commands", () => {
     });
 
     it("refuses a file that needs a person, exit 1, nothing written", async () => {
-      fs.copyFileSync(
-        path.join(fixturesDir, "probe-R07-anchor-inside-fence.md"),
+      fs.writeFileSync(
         doc,
+        [
+          "# Two bodies",
+          "",
+          'First {==one==}{>>Body one<<}{id="c1" by="user" at="2026-10-03T12:00:00.000Z"}',
+          "",
+          'Second {==two==}{>>Body two<<}{id="c1" by="user" at="2026-10-03T12:00:00.000Z"}',
+          "",
+        ].join("\n"),
       );
       const before = fs.readFileSync(doc);
       const result = await run(["doctor", "--fix", doc, "--json"]);
       expect(result.exitCode).toBe(1);
       expect(result.json.error.code).toBe("NORMALIZE_REFUSED");
-      expect(result.json.refused[0]).toMatchObject({ code: "markup-in-code" });
+      expect(result.json.refused.length).toBeGreaterThan(0);
       expect(fs.readFileSync(doc).equals(before)).toBe(true);
     });
 
@@ -999,11 +1006,25 @@ describe("review commands", () => {
       const names = [
         "legacy-at-block.md",
         "canonical-document-comments.md",
-        "probe-R07-anchor-inside-fence.md",
+        "two-bodies.md",
       ];
       const copies = names.map((name) => {
         const copy = path.join(projectDir, name);
-        fs.copyFileSync(path.join(fixturesDir, name), copy);
+        if (name === "two-bodies.md") {
+          fs.writeFileSync(
+            copy,
+            [
+              "# Two bodies",
+              "",
+              'First {==one==}{>>Body one<<}{id="c1" by="user" at="2026-10-03T12:00:00.000Z"}',
+              "",
+              'Second {==two==}{>>Body two<<}{id="c1" by="user" at="2026-10-03T12:00:00.000Z"}',
+              "",
+            ].join("\n"),
+          );
+        } else {
+          fs.copyFileSync(path.join(fixturesDir, name), copy);
+        }
         return copy;
       });
       const before = copies.map((copy) => fs.readFileSync(copy));
@@ -1036,7 +1057,7 @@ describe("review commands", () => {
       expect(report).toContain(
         "1 would convert, 1 already in the current format, 1 refused until a person fixes them",
       );
-      expect(report).toContain("`markup-in-code`");
+      expect(report).toContain("`duplicate-id`");
       // The report itself is safe to open in Roughdraft: no review items.
       const check = validateRoughdraftMarkdown(report);
       expect(check.summary.comments + check.summary.suggestions).toBe(0);

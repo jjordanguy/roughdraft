@@ -499,7 +499,20 @@ const CODE_MARKUP = /(?:<<\}|\+\+\}|--\}|~~\})(?:\{[^}\n]*\bid="|\{@)/;
  * block cannot be read at all; when `refused` is non-empty the document is
  * still built for readers (the clean text), but it must not be written.
  */
-export function buildReviewDoc(markdown: string): BuildResult {
+export interface BuildReviewDocOptions {
+  /**
+   * Convert review markup found inside fenced code (what the 0.1.10 browser
+   * wrote for a comment on code) into fence-line anchors. Off by default:
+   * markup inside code is literal, and a documentation file full of examples
+   * must never turn into comments.
+   */
+  codeComments?: boolean;
+}
+
+export function buildReviewDoc(
+  markdown: string,
+  options: BuildReviewDocOptions = {},
+): BuildResult {
   const changes: RfmNormalizationChange[] = [];
   const refused: RfmNormalizationRefusal[] = [];
   let source = markdown;
@@ -623,6 +636,7 @@ export function buildReviewDoc(markdown: string): BuildResult {
     split.entries.comments.size > 0 ||
     split.entries.suggestions.size > 0;
   for (const fence of model.fences) {
+    if (!options.codeComments) break;
     const code = source.slice(fence.codeStart, fence.codeEnd);
     const liveRefIds = [...code.matchAll(/\{#([A-Za-z][A-Za-z0-9_-]*)\}/g)]
       .map((match) => match[1] ?? "")

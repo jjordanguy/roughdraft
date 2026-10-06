@@ -12,8 +12,11 @@ import { fixture, NO_PROBLEMS, readersAccept } from "./review-helpers";
 
 const fixtures = loadFixtures();
 
-function normalized(markdown: string) {
-  const result = normalizeRoughdraftMetadata(markdown);
+function normalized(
+  markdown: string,
+  options: { codeComments?: boolean } = {},
+) {
+  const result = normalizeRoughdraftMetadata(markdown, options);
   expect(result.refused).toEqual([]);
   return result;
 }
@@ -193,7 +196,7 @@ describe("normalizeRoughdraftMetadata: legacy forms", () => {
       "```",
       "",
     ].join("\n");
-    const result = normalized(markdown);
+    const result = normalized(markdown, { codeComments: true });
     expect(result.markdown).toContain(
       "```ts {#c2}\nimport { start } from './server';\nconst port = 3000;\nstart({ port });\n```",
     );
@@ -255,12 +258,6 @@ describe("normalizeRoughdraftMetadata: refusals (nothing written, the line named
       "probe-R06-body-not-string",
       "endmatter-body-not-string",
       8,
-    ],
-    [
-      "markup inside code in a file with no other review data",
-      "probe-R07-anchor-inside-fence",
-      "markup-in-code",
-      2,
     ],
     ["re that is not an id", "probe-R10-re-odd-types", "re-not-string", 5],
     [

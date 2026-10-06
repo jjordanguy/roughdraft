@@ -156,6 +156,45 @@ The sections below describe these forms in detail.
 
 `summary.comments` counts roots plus document-level comments plus replies. The summary also reports `roots`, `documentComments`, `replies`, `suggestions` and `endmatter` (the block status).
 
+### Normalization
+
+`normalizeRoughdraftMetadata` (exposed as `roughdraft doctor --fix`) rewrites a file's review data in the canonical shape and changes nothing else. It is the only path from a legacy file to the canonical shape: editors never convert a file on save, and agent writers refuse a legacy file until it is converted. It runs on the whole file and either rewrites it or writes nothing.
+
+What it changes, each reported as a change with the input line it concerns:
+
+| Change | What happens |
+| --- | --- |
+| `legacy-inline-body` | Comment text written inline moves to the comment's entry; the prose keeps the highlight and a ref. A standalone train becomes a bare ref. |
+| `attribute-metadata`, `legacy-metadata` | Inline attribute blocks and `{@...@}` blocks become entries; unknown attributes are kept as entry keys. |
+| `status-attribute` | `status` and `resolved` attributes move into the entry. |
+| `inline-reply` | An inline reply becomes an entry with `re`, once per id. |
+| `replicas-to-continuations` | A comment written in full on several blocks becomes one comment: the highlight on every block stays, each with the ref, and the text is stored once. |
+| `multi-line-highlight` | A highlight that spans lines becomes one highlight per line under the same id. Line breaks inside comment text are stored as `<br>`. |
+| `multi-line-suggestion`, `replicated-suggestion` | A suggestion over several lines or blocks becomes one marker per line, each with its own id; every later part's entry carries `continues: <first id>`. |
+| `merged-blocks` | Two or more review blocks at the end of the file merge into one. |
+| `code-anchor` | A comment an older browser wrote inside a code block moves to a ref on the fence line, with `lines` and `quote`, when the file has review data outside code. |
+| `document-scope` | A legacy document-level comment gains `scope: document`, so it keeps its meaning once the file is in the canonical shape. |
+| `blank-line-before-block`, `yaml-rewritten` | The blank line before the block and the YAML itself are written by the canonical writer. These two, and `document-scope`, are formatting only: an agent writer rewrites them on any canonical file. |
+
+It refuses, writes nothing, and names the line, when deciding would mean guessing: a review block that does not parse or repeats a key, two blocks that disagree on an entry, two different texts under one id, a ref with no metadata, a reply with no body, a body YAML does not read as text or cuts short at ` #`, a `re` that is not an id, a time that is not an ISO 8601 date-time, a multi-line substitution whose sides have different line counts, and review markup inside code in a file with no other review data (an example or a comment cannot be told apart). Any other error the doctor reports is a refusal too.
+
+Normalization is idempotent: a canonical file comes back byte for byte. It keeps every comment, reply and suggestion with its author, time, text and status; a replicated suggestion gains one entry per extra part.
+
+### Review rounds
+
+An agent answers a review in a round, so it never writes review markup itself. The reference implementation is `buildReviewRound` and `applyReviewResponse` in `packages/rfm`; the CLI wraps them as `roughdraft round` and `roughdraft apply`.
+
+The round lists one entry per thread. A comment over several blocks is one thread whose anchor has one segment per block. Each thread carries its id, kind (`comment`, `code`, `document` or `suggestion`), author, time, text, status, every reply in time order, and an anchor with the highlighted text of each segment, its line in the clean text, the section heading, and up to two blocks of context on each side. Document-level comments come first. A thread needs an answer when it is open and its latest entry is not by an agent. The round also carries the clean text: the body with every review marker removed, where a pending suggestion shows the current text (a deletion keeps its text, an addition shows nothing, a substitution shows the old text).
+
+The agent edits the clean text and answers each thread with a reply, a resolution, a decision on a suggestion (only when asked), or a skip with a reason. Applying the answer:
+
+- matches each change to the clean text by content in the current file (exact first, then ignoring whitespace), so saves made in the browser during the round are kept;
+- keeps every highlight on its text; an edit inside a highlight keeps it on the new words, an edit around it keeps it on its words when they survive once and otherwise covers the new text (one highlight per line), and a comment whose text is deleted stays as a standalone comment at that spot; a comment on code follows its lines;
+- refuses an edit that touches a pending suggestion, and refuses the whole answer when a thread changed since the round or a waiting thread has no answer;
+- writes replies as `aN` entries with `re`, a round note as an `aN` entry with `scope: document`, and settles a decided suggestion by removing its markers and entries (its replies only with an explicit `dropReplies`);
+- puts back any of the reviewer's comments, replies, highlights or suggestions changed outside Roughdraft since the round;
+- reads its own result back with this specification's reader, a frozen copy of the 0.1.10 reader and the render-hazard lint before anything is written. Either everything is written or nothing is.
+
 ## Canonical Markers
 
 Roughdraft uses these CriticMarkup-compatible markers:

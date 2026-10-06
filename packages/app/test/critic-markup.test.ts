@@ -226,7 +226,7 @@ describe("CriticMarkup comments", () => {
     expect(output).toContain("suggestions:");
     expect(output).toContain("s1:");
     expect(output).toContain("s2:");
-    expect(output).toContain("at: 2026-05-24T11:00:00.000Z");
+    expect(output).toContain('at: "2026-05-24T11:00:00.000Z"');
   });
 
   it("removes deleted comments and replies from YAML endmatter", () => {
@@ -390,7 +390,7 @@ describe("CriticMarkup comments", () => {
     expect(createNextCommentId(comments.values())).toBe("c4");
   });
 
-  it("repairs stale YAML reply metadata when an inline root comment id was reused", () => {
+  it("keeps a reply whose id was reused inline as it is on save (older format, D11)", () => {
     const input = [
       "Add {++one concrete customer example++}{#s1}.",
       "",
@@ -414,21 +414,16 @@ describe("CriticMarkup comments", () => {
     const output = editorStateToCriticMarkdown(doc, comments);
 
     // rfm reads `c3` as a reply to `s1` (its entry has `re: s1`) whose text is
-    // the inline one; the browser follows the model, so the reply moves to
-    // the review block with that text.
+    // the inline one; the browser follows the model. The file has two bodies
+    // for c3, which normalization refuses to settle, so the browser writes it
+    // back exactly as it was instead of picking one.
     expect(comments.get("c3")).toMatchObject({
       id: "c3",
       content:
         "Consider whether this belongs in the executive summary instead.",
       parentCommentId: "s1",
     });
-    expect(output).toContain("This paragraph has an unanchored note.\n");
-    expect(output).not.toContain("{>>Consider");
-    expect(output).toContain(
-      "body: Consider whether this belongs in the executive summary instead.",
-    );
-    expect(output).toContain("re: s1");
-    expect(output).not.toContain("body: reply to suggestion");
+    expect(output).toBe(input);
     expect(createNextCommentId(comments.values())).toBe("c4");
   });
 
@@ -520,7 +515,17 @@ describe("CriticMarkup comments", () => {
           ]),
         ),
       ).toBe(
-        'Each dev wrapper keeps {==its own server state under `~/.roughdraft/dev/<wrapper-name>` by default==}{>>test<<}{id="c1" by="user" at="2026-04-25T21:54:47.475Z"}, so opening works.\n',
+        [
+          "Each dev wrapper keeps {==its own server state under `~/.roughdraft/dev/<wrapper-name>` by default==}{#c1}, so opening works.",
+          "",
+          "---",
+          "comments:",
+          "  c1:",
+          '    body: "test"',
+          "    by: user",
+          '    at: "2026-04-25T21:54:47.475Z"',
+          "",
+        ].join("\n"),
       );
     } finally {
       editor.destroy();
@@ -672,7 +677,7 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
     expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
-  it("migrates legacy metadata to attribute metadata on save", () => {
+  it("keeps legacy metadata as it is on save (older format, D11)", () => {
     const input =
       "Please revisit {==this sentence==}{>>Needs a source<<}{@id:c1;by:user;at:2024-01-15T10:30:00.000Z@}.\n";
 
@@ -684,9 +689,7 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
       authorType: "user",
       authorId: "user",
     });
-    expect(editorStateToCriticMarkdown(doc, comments)).toBe(
-      'Please revisit {==this sentence==}{>>Needs a source<<}{id="c1" by="user" at="2024-01-15T10:30:00.000Z"}.\n',
-    );
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
   it("round-trips escaped attribute metadata values", () => {
@@ -828,7 +831,7 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
     expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
-  it("keeps a reply to a suggestion off the marks and writes it after the suggestion", () => {
+  it("keeps a reply to a suggestion off the marks and its markup as it was (D11)", () => {
     const input =
       '{==New wording==}{>>Why this wording?<<}{id="c1" by="user" at="2024-01-15T10:31:00.000Z" re="s1"} follows {++new text++}{id="s1" by="AI" at="2024-01-15T10:30:00.000Z"}.\n';
 
@@ -838,9 +841,7 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
       parentCommentId: "s1",
     });
     expect(JSON.stringify(doc)).not.toContain('"c1"');
-    expect(editorStateToCriticMarkdown(doc, comments)).toBe(
-      'New wording follows {++new text++}{id="s1" by="AI" at="2024-01-15T10:30:00.000Z"}{>>Why this wording?<<}{id="c1" by="user" at="2024-01-15T10:31:00.000Z" re="s1"}.\n',
-    );
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
   it("round-trips a comment attached directly to a suggestion", () => {

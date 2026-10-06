@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
 import { ArrowUpRight } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import { Button } from "./components/ui/button";
 import type { UpdateStatus } from "./update-status";
 

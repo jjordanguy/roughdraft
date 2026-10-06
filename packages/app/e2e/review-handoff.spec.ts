@@ -65,7 +65,8 @@ test.describe("review handoff", () => {
     await expect
       .poll(() => readProjectFile(projectDir, relativePath))
       .toMatch(
-        /---\ncomments:\n {2}c1:\n {4}body: Please prioritize the CLI contract\.\n {4}by: user\n {4}at: [^\n]+\n?$/,
+        // The server writes it with rfm's canonical writer (batch 3b).
+        /---\ncomments:\n {2}c1:\n {4}body: "Please prioritize the CLI contract\."\n {4}by: user\n {4}at: "[^"\n]+"\n {4}scope: document\n$/,
       );
 
     const watchResponse = await pendingWatch;
@@ -315,7 +316,7 @@ test.describe("review handoff", () => {
     );
     await expect
       .poll(() => readProjectFile(projectDir, relativePath))
-      .toContain(`body: ${overallComment}`);
+      .toContain(`body: "${overallComment}"`);
     // Wait until the tab has loaded the server's write, so the edit below
     // does not race it into a "changed on disk" conflict.
     await expect(codeEditor(page)).toContainText(overallComment);
@@ -338,6 +339,6 @@ test.describe("review handoff", () => {
     );
 
     const finalContent = readProjectFile(projectDir, relativePath);
-    expect(finalContent.split(`body: ${overallComment}`)).toHaveLength(2);
+    expect(finalContent.split(`body: "${overallComment}"`)).toHaveLength(2);
   });
 });

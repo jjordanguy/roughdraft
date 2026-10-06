@@ -121,9 +121,9 @@ function SelectItemText({
 
 export {
   Select,
-  SelectTrigger,
-  SelectValue,
   SelectContent,
   SelectItem,
   SelectItemText,
+  SelectTrigger,
+  SelectValue,
 };

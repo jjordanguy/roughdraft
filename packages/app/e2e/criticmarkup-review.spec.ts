@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import {
   createMarkdownProject,
   logE2eEvent,
@@ -88,7 +88,9 @@ test.describe("CriticMarkup review flows", () => {
     await expect
       .poll(() => readProjectFile(projectDir, "new-comment.md"))
       .toMatch(
-        /\{==target text==\}\{>>Clarify this phrase\.<<\}\{id="c1" by="user" at="[^"]+"\}/,
+        // A file with no review items yet gets the canonical shape: the
+        // anchor in the prose, the text in the review block.
+        /\{==target text==\}\{#c1\} to review\.\n\n---\ncomments:\n {2}c1:\n {4}body: "Clarify this phrase\."\n {4}by: user\n {4}at: "[^"]+"\n$/,
       );
 
     logE2eEvent("criticmarkup.root-comment-saved", {

@@ -122,8 +122,8 @@ export {
   DialogDescription,
   DialogFooter,
   DialogHeader,
-  DialogPortal,
   DialogOverlay,
+  DialogPortal,
   DialogTitle,
   DialogTrigger,
 };

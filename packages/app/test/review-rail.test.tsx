@@ -439,7 +439,7 @@ describe("review rail from the comment map", () => {
 
     const saved = onSave.mock.calls.at(-1)?.[1] as string;
     expect(saved).toMatch(
-      / {2}c3:\n {4}by: user\n {4}at: [^\n]+\n {4}body: Thanks for the summary\.\n {4}re: a2\n/,
+      / {2}c3:\n {4}body: "Thanks for the summary\."\n {4}by: user\n {4}at: "[^"\n]+"\n {4}re: a2\n/,
     );
     expect(saved.split("\n---\n")[0]).not.toContain("Thanks for the summary.");
   });

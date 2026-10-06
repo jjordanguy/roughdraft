@@ -17,6 +17,14 @@ The fork is installed from a packed build, never from the npm registry. [docs/fo
 
 A Roughdraft link is the address of the Roughdraft running where the file lives plus the file's path, for example `http://localhost:7373/?path=/Users/me/notes/plan.md`. Opening a link for a file that already has a window brings that window forward. On a VPS the link is its Tailscale address with the VPS path; see [Running Roughdraft on a VPS](#running-roughdraft-on-a-vps).
 
+## Keeping your tab and the file in sync
+
+Each window holds one WebSocket to the local server, so any number of windows works. The server's first message on every connect or reconnect is the current file version, with a heartbeat after that, and the tab re-checks the file when it becomes visible, regains focus or comes back online. Saves go one at a time, retry on failure, and are decided on the file's content, never on its timestamp. Every write goes to a temporary file first and is renamed into place, so a reader never sees a half-written file (`ROUGHDRAFT_WRITE_MODE=inplace` turns the rename off; `scripts/check-drive-rename.mjs` checks a cloud-synced folder first).
+
+When the file changes on disk while you have unsaved text, the tab merges the two. Edits in different places both land, with a quiet "Updated from disk" notice. When you and the agent changed the same words, your version is kept as a suggested change against the agent's text, so nothing is lost and autosave keeps going; only an overlap inside a comment or a suggestion asks you to choose, for that one spot. What you type is kept in the browser's local storage until it reaches disk, and restored on the next load if a tab closed mid-edit. A louder notice appears when an outside write removed text you saved in the last few minutes, with one click to restore it.
+
+While an agent has a round open on the document (from `roughdraft round` until `apply`, or for the second a quick command takes), the tab shows an **AI editing...** badge with the elapsed time; after 30 minutes without a write it reads **AI round stalled** and can be dismissed. The document stays editable throughout.
+
 ## For agents
 
 [docs/fork/agent-procedure.md](docs/fork/agent-procedure.md) is the procedure an agent follows (the paragraph for `~/.claude/CLAUDE.md`, why each step is there, and the optional guard hook). The Claude Code skill in [packages/skill/SKILL.md](packages/skill/SKILL.md) carries the same procedure. In short:

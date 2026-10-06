@@ -422,7 +422,11 @@ export class DocumentWatcher {
   write(
     filePath: string,
     content: string,
-    options: { expectedHash: string | null; tabId?: string | null },
+    options: {
+      expectedHash: string | null;
+      tabId?: string | null;
+      create?: boolean;
+    },
   ): Promise<WriteResult> {
     return this.mutate(filePath, () => content, {
       ...options,
@@ -446,6 +450,8 @@ export class DocumentWatcher {
       expectedHash?: string | null;
       tabId?: string | null;
       recheck?: boolean;
+      /** Write a file that does not exist yet (a tab recreating it from a draft). */
+      create?: boolean;
     } = {},
   ): Promise<WriteResult> {
     const entry = this.entryFor(filePath);
@@ -453,11 +459,16 @@ export class DocumentWatcher {
       for (let attempt = 1; ; attempt += 1) {
         const snapshot = await readSnapshot(entry.filePath);
         const current = this.apply(entry, snapshot);
-        if (!snapshot.exists) return { status: "missing", read: current };
-        if (!snapshot.bytes) return { status: "unavailable", read: current };
+        const creating = !snapshot.exists && options.create === true;
+        if (!snapshot.exists && !creating) {
+          return { status: "missing", read: current };
+        }
+        if (!creating && !snapshot.bytes) {
+          return { status: "unavailable", read: current };
+        }
 
         const bytes = Buffer.from(transform(current.content ?? ""), "utf8");
-        if (bytes.equals(snapshot.bytes)) {
+        if (snapshot.bytes && bytes.equals(snapshot.bytes)) {
           return { status: "unchanged", read: current };
         }
         const expectedHash = options.expectedHash ?? null;
@@ -469,7 +480,8 @@ export class DocumentWatcher {
         this.rememberOwnWrite(entry, hash, options.tabId ?? null);
         const written = await writeFileAtomic(entry.filePath, bytes, {
           mode: this.writeMode,
-          expectedHash: options.recheck === false ? null : snapshot.contentHash,
+          expectedHash:
+            options.recheck === false || creating ? null : snapshot.contentHash,
           beforeCommit: this.beforeWriteCommit,
         });
         if (written.status === "written") {

@@ -12,7 +12,14 @@ import {
   RefreshCcw,
   Upload,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { DocumentEditorViewMode } from "./app-navigation";
 import { Button } from "./components/ui/button";
 import {
@@ -37,10 +44,15 @@ import {
   criticMarkdownHasReviewRail,
   criticMarkdownToRenderedHtml,
 } from "./critic-markup";
+import {
+  type DocumentSync,
+  type DocumentSyncView,
+  HandoffError,
+  type Snapshot,
+} from "./document-sync";
 import { cn } from "./lib/utils";
 import {
   type DocumentInteractionMode,
-  type DocumentSaveController,
   type DocumentSaveState,
   PageCard,
 } from "./PageCard";
@@ -49,10 +61,10 @@ import {
   createClientId,
   type DiskChangeState,
   getReviewHandoffView,
+  type ReviewHandoffErrorKind,
   type ReviewHandoffPhase,
 } from "./review-handoff";
 import type {
-  CompleteReviewOptions,
   CompleteReviewResult,
   HandoffRecord,
   Page,
@@ -126,7 +138,7 @@ const documentInteractionModeOptions = [
 }[];
 
 const conflictNoticeCopy: Record<
-  Exclude<DiskChangeState, "clean">,
+  "changed" | "conflict" | "paused",
   {
     title: string;
     body: string;
@@ -231,6 +243,69 @@ async function writeRichTextToClipboard(markdown: string) {
   await writePlainTextToClipboard(plainText);
 }
 
+// One place that turns the controller's state into the two values the
+// status icon, the banner and the Done button read.
+export function getSyncStatus(view: DocumentSyncView): {
+  saveState: DocumentSaveState;
+  diskState: DiskChangeState;
+} {
+  const unsavedOrSaved = view.dirty ? "unsaved" : "saved";
+  switch (view.state.kind) {
+    case "synced":
+      return { saveState: view.dirty ? "saving" : "saved", diskState: "clean" };
+    case "pending":
+    case "saving":
+      return { saveState: "saving", diskState: "clean" };
+    case "offline":
+      return { saveState: "offline", diskState: "clean" };
+    case "unavailable":
+      return { saveState: unsavedOrSaved, diskState: "unavailable" };
+    case "changed":
+    case "conflict":
+      return {
+        saveState: unsavedOrSaved,
+        diskState: view.paused ? "paused" : view.state.kind,
+      };
+  }
+}
+
+function formatDiskVersion(snapshot: Snapshot): string {
+  const shortHash = snapshot.contentHash.replace(/^local:\d+:/, "").slice(0, 7);
+  const mtime = Number(snapshot.version.split(":")[0]);
+  if (Number.isFinite(mtime) && mtime > 0) {
+    const time = new Date(mtime).toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    return `Disk version from ${time} (${shortHash})`;
+  }
+  return `Disk version ${shortHash}`;
+}
+
+function useNow(active: boolean) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const interval = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(interval);
+  }, [active]);
+  return now;
+}
+
+const noopSubscribe = () => () => {};
+
+function useDocumentSyncView(sync: DocumentSync | null) {
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      sync ? sync.subscribe(listener) : noopSubscribe(),
+    [sync],
+  );
+  const getSnapshot = useCallback(() => sync?.getView() ?? null, [sync]);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
 function getSaveStatusViewModel(
   saveState: DocumentSaveState,
   diskChangeState: DiskChangeState,
@@ -258,6 +333,24 @@ function getSaveStatusViewModel(
       label: "Autosave paused",
       ariaLabel: "Autosave paused",
       tone: "warning" as const,
+      Icon: AlertTriangle,
+    };
+  }
+
+  if (diskChangeState === "unavailable") {
+    return {
+      label: "File unavailable",
+      ariaLabel: "File unavailable",
+      tone: "warning" as const,
+      Icon: AlertTriangle,
+    };
+  }
+
+  if (saveState === "offline") {
+    return {
+      label: "Save failed, retrying",
+      ariaLabel: "Save failed, retrying",
+      tone: "danger" as const,
       Icon: AlertTriangle,
     };
   }
@@ -296,6 +389,9 @@ function getSaveStatusViewModel(
     Icon: Check,
   };
 }
+
+// PageCard needs an onSave; with a sync controller it is never called.
+const noopSave = async () => {};
 
 export function DocumentSaveStatusIndicator({
   saveState,
@@ -344,59 +440,57 @@ export function shouldLatchDocumentChangedSinceOpen({
 }
 
 interface DocumentWorkspaceProps {
-  documentPage: Page | null;
+  // The open document's sync controller; null before a document loads.
+  sync: DocumentSync | null;
   activeDocumentPath: string | null;
   documentCopyPath: string | null;
   documentFilenameLabel: string;
   documentEditorViewMode: DocumentEditorViewMode;
   onDocumentEditorViewModeChange: (mode: DocumentEditorViewMode) => void;
-  onSaveDocument: (id: string, content: string) => Promise<void>;
-  onDocumentSaveStateChange: (state: DocumentSaveState) => void;
-  onDocumentDirtyStateChange: (isDirty: boolean) => void;
-  onDocumentLocalContentChange: (markdown: string) => void;
-  documentDiskChangeState: DiskChangeState;
-  documentForceResetKey: string | null;
-  onReloadDocumentFromDisk: () => void | Promise<void>;
-  onKeepEditingWithoutAutosave: () => void;
-  onOverwriteDocumentOnDisk: () => void | Promise<void>;
-  onCompleteReview: (
-    options?: CompleteReviewOptions,
-  ) => Promise<CompleteReviewResult>;
   backend: StorageBackend | null;
 }
 
 export function DocumentWorkspace({
-  documentPage,
+  sync,
   activeDocumentPath,
   documentCopyPath,
   documentFilenameLabel,
   documentEditorViewMode,
   onDocumentEditorViewModeChange,
-  onSaveDocument,
-  onDocumentSaveStateChange,
-  onDocumentDirtyStateChange,
-  onDocumentLocalContentChange,
-  documentDiskChangeState,
-  documentForceResetKey,
-  onReloadDocumentFromDisk,
-  onKeepEditingWithoutAutosave,
-  onOverwriteDocumentOnDisk,
-  onCompleteReview,
   backend,
 }: DocumentWorkspaceProps) {
+  const syncView = useDocumentSyncView(sync);
+  const syncBase = syncView?.base ?? null;
+  // The saved page. The live draft is `sync.draft`; reading it here would
+  // re-render the workspace on every keystroke.
+  const documentPage = useMemo<Page | null>(
+    () =>
+      sync && syncBase
+        ? {
+            id: sync.pageId,
+            title: sync.title,
+            content: syncBase.content,
+            version: syncBase.version,
+          }
+        : null,
+    [sync, syncBase],
+  );
+  const { saveState, diskState: documentDiskChangeState } = syncView
+    ? getSyncStatus(syncView)
+    : { saveState: "saved" as const, diskState: "clean" as const };
+  const reviewWatcherCount = syncView?.watchers ?? 0;
+  const reviewSessionLabel = syncView?.session?.label ?? null;
+  const channelHandoff = syncView?.handoff ?? null;
   const [documentInteractionMode, setDocumentInteractionMode] =
     useState<DocumentInteractionMode>("suggesting");
-  const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
+  const [reviewHandoffErrorKind, setReviewHandoffErrorKind] =
+    useState<ReviewHandoffErrorKind | null>(null);
   const [reviewHandoffPhase, setReviewHandoffPhase] =
     useState<ReviewHandoffPhase>("idle");
   const [reviewHandoffResult, setReviewHandoffResult] =
     useState<CompleteReviewResult | null>(null);
   const [reviewHandoffRecord, setReviewHandoffRecord] =
     useState<HandoffRecord | null>(null);
-  const [reviewSessionLabel, setReviewSessionLabel] = useState<string | null>(
-    null,
-  );
-  const [reviewWatcherCount, setReviewWatcherCount] = useState(0);
   const [copiedHandoffMessage, setCopiedHandoffMessage] = useState(false);
   const [reviewHandoffPopoverOpen, setReviewHandoffPopoverOpen] =
     useState(false);
@@ -424,16 +518,7 @@ export function DocumentWorkspace({
   const documentVersionRef = useRef<string | undefined>(documentPage?.version);
   documentVersionRef.current = documentPage?.version;
   const copiedFileActionTimeoutRef = useRef<number | null>(null);
-  const saveControllerRef = useRef<DocumentSaveController | null>(null);
   const documentChangeTrackingReadyRef = useRef(false);
-
-  const handleSaveStateChange = useCallback(
-    (state: DocumentSaveState) => {
-      setSaveState(state);
-      onDocumentSaveStateChange(state);
-    },
-    [onDocumentSaveStateChange],
-  );
 
   const [documentHasComments, setDocumentHasComments] = useState(
     () =>
@@ -468,41 +553,17 @@ export function DocumentWorkspace({
     return () => window.clearTimeout(readyTimer);
   }, [activeDocumentPath, documentPage?.id]);
 
+  // The tab channel pushes the latest handoff record (hello and handoff
+  // messages). Only this tab's Done moves its button to "Picked up".
   useEffect(() => {
-    if (!backend?.getReviewWatchStatus || !activeDocumentPath) {
-      setReviewWatcherCount(0);
-      return;
+    if (
+      channelHandoff &&
+      channelHandoff.handoffId === completedHandoffIdRef.current
+    ) {
+      completedHandoffVersionsRef.current.add(channelHandoff.version);
+      setReviewHandoffRecord(channelHandoff);
     }
-
-    let cancelled = false;
-    const refreshWatchStatus = async () => {
-      try {
-        const status = await backend.getReviewWatchStatus?.(activeDocumentPath);
-        if (cancelled) return;
-        setReviewWatcherCount(status?.watcherCount ?? 0);
-        setReviewSessionLabel(status?.session?.label ?? null);
-        const polledHandoff = status?.handoff;
-        if (
-          polledHandoff &&
-          polledHandoff.handoffId === completedHandoffIdRef.current
-        ) {
-          completedHandoffVersionsRef.current.add(polledHandoff.version);
-          setReviewHandoffRecord(polledHandoff);
-        }
-      } catch {
-        if (!cancelled) {
-          setReviewWatcherCount(0);
-        }
-      }
-    };
-
-    void refreshWatchStatus();
-    const interval = window.setInterval(refreshWatchStatus, 1500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [activeDocumentPath, backend]);
+  }, [channelHandoff]);
 
   const reviewHandoffSettledKind =
     reviewHandoffPhase !== "completed" || !reviewHandoffResult
@@ -578,18 +639,22 @@ export function DocumentWorkspace({
 
       if (documentDiskChangeState !== "clean") return;
 
-      void saveControllerRef.current?.flushSave();
+      void sync?.flush();
     };
 
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => {
       window.removeEventListener("keydown", handleKeyDown, { capture: true });
     };
-  }, [documentDiskChangeState, documentPage]);
+  }, [documentDiskChangeState, documentPage, sync]);
 
   const handleCompleteReview = useCallback(
     async (overallCommentText?: string) => {
-      if (!activeDocumentPath || reviewHandoffPhaseRef.current === "sending") {
+      if (
+        !sync ||
+        !activeDocumentPath ||
+        reviewHandoffPhaseRef.current === "sending"
+      ) {
         return;
       }
 
@@ -597,22 +662,18 @@ export function DocumentWorkspace({
       pendingHandoffIdRef.current = handoffId;
       reviewHandoffPhaseRef.current = "sending";
       setReviewHandoffPhase("sending");
+      setReviewHandoffErrorKind(null);
       try {
-        // The button stays enabled while autosave is still pending, so make
-        // sure any debounced edits are persisted before handing off.
-        const flushResult = await saveControllerRef.current?.flushSave();
-        if (flushResult && flushResult.status === "error") {
-          throw flushResult.error;
-        }
-
-        const result = await onCompleteReview({
+        // The controller flushes pending edits first and sends the version
+        // the flush left as expectedVersion; it never saves a second time.
+        const result = await sync.completeReview({
           ...(overallCommentText ? { overallComment: overallCommentText } : {}),
           handoffId,
         });
         pendingHandoffIdRef.current = null;
         completedHandoffIdRef.current = result.handoff?.handoffId ?? handoffId;
         completedHandoffVersionsRef.current = new Set(
-          [documentVersionRef.current, result.handoff?.version].filter(
+          [sync.getView().base.version, result.handoff?.version].filter(
             (version): version is string => !!version,
           ),
         );
@@ -623,32 +684,31 @@ export function DocumentWorkspace({
         setReviewHandoffPopoverOpen(true);
       } catch (error) {
         console.error("Failed to complete review:", error);
+        setReviewHandoffErrorKind(
+          error instanceof HandoffError ? error.kind : "failed",
+        );
         setReviewHandoffPhase("error");
         setReviewHandoffPopoverOpen(true);
       }
     },
-    [activeDocumentPath, onCompleteReview],
+    [activeDocumentPath, sync],
   );
 
-  const handleDocumentDirtyStateChange = useCallback(
-    (isDirty: boolean) => {
-      if (
-        shouldLatchDocumentChangedSinceOpen({
-          isDirty,
-          documentChangeTrackingReady: documentChangeTrackingReadyRef.current,
-        })
-      ) {
-        setDocumentChangedSinceOpen(true);
-        // An edit after Done starts a new round. A failed Done keeps its
-        // handoff id, so the next attempt still cannot write twice.
-        setReviewHandoffPhase((phase) =>
-          phase === "completed" || phase === "error" ? "idle" : phase,
-        );
-      }
-      onDocumentDirtyStateChange(isDirty);
-    },
-    [onDocumentDirtyStateChange],
-  );
+  const handleDocumentDirtyStateChange = useCallback((isDirty: boolean) => {
+    if (
+      shouldLatchDocumentChangedSinceOpen({
+        isDirty,
+        documentChangeTrackingReady: documentChangeTrackingReadyRef.current,
+      })
+    ) {
+      setDocumentChangedSinceOpen(true);
+      // An edit after Done starts a new round. A failed Done keeps its
+      // handoff id, so the next attempt still cannot write twice.
+      setReviewHandoffPhase((phase) =>
+        phase === "completed" || phase === "error" ? "idle" : phase,
+      );
+    }
+  }, []);
 
   const handleCopyHandoffMessage = useCallback(async (message: string) => {
     try {
@@ -670,12 +730,12 @@ export function DocumentWorkspace({
       > = {
         path: documentCopyPath ?? activeDocumentPath ?? documentFilenameLabel,
         filename: documentFilenameLabel,
-        markdown: documentPage.content,
+        markdown: sync?.draft ?? documentPage.content,
       };
 
       try {
         if (action === "rich-text") {
-          await writeRichTextToClipboard(documentPage.content);
+          await writeRichTextToClipboard(sync?.draft ?? documentPage.content);
         } else {
           await writePlainTextToClipboard(copyTextByAction[action]);
         }
@@ -692,7 +752,13 @@ export function DocumentWorkspace({
         console.error("Failed to copy document data:", error);
       }
     },
-    [activeDocumentPath, documentCopyPath, documentFilenameLabel, documentPage],
+    [
+      activeDocumentPath,
+      documentCopyPath,
+      documentFilenameLabel,
+      documentPage,
+      sync,
+    ],
   );
 
   const editorViewModeToggleLabel =
@@ -715,15 +781,51 @@ export function DocumentWorkspace({
   const ActiveDocumentInteractionModeIcon =
     activeDocumentInteractionMode?.Icon ?? PencilLine;
   const conflictNotice =
-    documentDiskChangeState === "clean"
-      ? null
-      : conflictNoticeCopy[documentDiskChangeState];
+    documentDiskChangeState === "changed" ||
+    documentDiskChangeState === "conflict" ||
+    documentDiskChangeState === "paused"
+      ? conflictNoticeCopy[documentDiskChangeState]
+      : null;
+  const conflictTheirs =
+    syncView?.state.kind === "changed" || syncView?.state.kind === "conflict"
+      ? syncView.state.theirs
+      : null;
+  const offlineRetryAt =
+    syncView?.state.kind === "offline" ? syncView.state.retryAt : null;
+  const now = useNow(offlineRetryAt !== null);
+  const syncNotice =
+    syncView?.state.kind === "unavailable"
+      ? {
+          state: "unavailable" as const,
+          title:
+            syncView.state.reason === "missing"
+              ? "File not found on disk"
+              : "File unavailable",
+          body:
+            syncView.state.reason === "missing"
+              ? `Roughdraft cannot find ${documentCopyPath ?? documentFilenameLabel}. Your edits stay in this tab and save when the file is back.`
+              : `Roughdraft cannot read this file (${syncView.state.reason}). Your edits stay in this tab and save when it can read it again.`,
+          retry: false,
+        }
+      : offlineRetryAt !== null
+        ? {
+            state: "offline" as const,
+            title: "Roughdraft is not answering",
+            body: `Your edits stay in this tab and save when it is back. Trying again in ${Math.max(
+              0,
+              Math.ceil((offlineRetryAt - now) / 1000),
+            )} s.`,
+            retry: true,
+          }
+        : null;
+  const hasNotice = !!conflictNotice || !!syncNotice;
   const reviewHandoffView = getReviewHandoffView({
     enabled: !!activeDocumentPath && backend?.info.kind === "local-files",
     watcherCount: reviewWatcherCount,
     diskState: documentDiskChangeState,
     saveState,
     phase: reviewHandoffPhase,
+    errorKind: reviewHandoffErrorKind,
     result: reviewHandoffResult,
     handoff: reviewHandoffRecord,
     sessionLabel: reviewSessionLabel,
@@ -751,7 +853,7 @@ export function DocumentWorkspace({
     <div
       className={cn(
         "min-h-0 flex-1 overflow-y-auto px-8 pb-8 sm:px-12",
-        conflictNotice ? "pt-40 sm:pt-28" : "pt-10",
+        hasNotice ? "pt-40 sm:pt-28" : "pt-10",
       )}
     >
       {documentPage ? (
@@ -768,7 +870,7 @@ export function DocumentWorkspace({
       <div
         className={cn(
           "fixed right-3 z-[60] flex max-w-[min(16rem,calc(100vw-1rem))] flex-col items-end gap-1.5",
-          conflictNotice ? "top-[19rem] sm:top-[7rem]" : "top-3",
+          hasNotice ? "top-[19rem] sm:top-[7rem]" : "top-3",
         )}
         data-testid="document-status-stack"
         data-document-status-stack="true"
@@ -1072,7 +1174,24 @@ export function DocumentWorkspace({
               </div>
               <div className="mt-0.5 text-xs leading-5 text-amber-900 dark:text-amber-200">
                 {conflictNotice.body}
+                {documentDiskChangeState === "paused" &&
+                syncView &&
+                syncView.theirsUpdates > 0 ? (
+                  <span data-testid="file-conflict-later-change">
+                    {" "}
+                    The file changed on disk again while autosave was paused.
+                  </span>
+                ) : null}
               </div>
+              {conflictTheirs ? (
+                <div
+                  data-testid="file-conflict-disk-version"
+                  className="mt-0.5 text-[0.68rem] leading-4 text-amber-800/80 dark:text-amber-300/80"
+                >
+                  {formatDiskVersion(conflictTheirs)}. Overwrite replaces this
+                  version.
+                </div>
+              ) : null}
             </div>
           </div>
           <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:justify-end">
@@ -1082,7 +1201,7 @@ export function DocumentWorkspace({
               variant="ghost"
               size="sm"
               className="h-8 rounded-[7px] bg-white/55 dark:bg-white/10 px-2 text-xs text-amber-950 dark:text-amber-100 hover:bg-white dark:hover:bg-white/20"
-              onClick={() => void onReloadDocumentFromDisk()}
+              onClick={() => void sync?.reloadFromDisk()}
             >
               <RefreshCcw className="size-3.5" />
               Reload from disk
@@ -1094,7 +1213,7 @@ export function DocumentWorkspace({
                 variant="ghost"
                 size="sm"
                 className="h-8 rounded-[7px] bg-white/55 dark:bg-white/10 px-2 text-xs text-amber-950 dark:text-amber-100 hover:bg-white dark:hover:bg-white/20"
-                onClick={onKeepEditingWithoutAutosave}
+                onClick={() => sync?.keepEditing()}
               >
                 <PencilLine className="size-3.5" />
                 Keep editing with autosave paused
@@ -1106,12 +1225,51 @@ export function DocumentWorkspace({
               variant="ghost"
               size="sm"
               className="h-8 rounded-[7px] bg-amber-900 dark:bg-amber-600 px-2 text-xs text-white hover:bg-amber-800 dark:hover:bg-amber-500"
-              onClick={() => void onOverwriteDocumentOnDisk()}
+              onClick={() => void sync?.overwrite()}
             >
               <Upload className="size-3.5" />
               Overwrite disk file
             </Button>
           </div>
+        </div>
+      ) : null}
+      {!conflictNotice && syncNotice ? (
+        <div
+          data-testid="sync-status-notice"
+          data-sync-state={syncNotice.state}
+          role="status"
+          aria-label={syncNotice.title}
+          className="fixed top-3 left-1/2 z-50 flex w-[min(calc(100vw-1rem),52rem)] -translate-x-1/2 flex-col gap-3 rounded-[8px] border border-stone-300 bg-stone-50 px-3 py-3 text-stone-900 shadow-[0_14px_40px_rgba(41,37,36,0.14)] sm:flex-row sm:items-center sm:justify-between sm:px-4 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:shadow-[0_14px_40px_rgba(0,0,0,0.4)]"
+        >
+          <div className="flex min-w-0 items-start gap-2.5">
+            <AlertTriangle
+              className="mt-0.5 size-4 shrink-0 text-stone-500 dark:text-slate-400"
+              aria-hidden="true"
+            />
+            <div className="min-w-0">
+              <div className="text-sm font-semibold leading-5">
+                {syncNotice.title}
+              </div>
+              <div className="mt-0.5 text-xs leading-5 text-stone-600 dark:text-slate-300">
+                {syncNotice.body}
+              </div>
+            </div>
+          </div>
+          {syncNotice.retry ? (
+            <div className="flex shrink-0 items-center gap-1.5 sm:justify-end">
+              <Button
+                type="button"
+                data-testid="sync-status-retry"
+                variant="ghost"
+                size="sm"
+                className="h-8 rounded-[7px] bg-white/70 px-2 text-xs hover:bg-white dark:bg-white/10 dark:hover:bg-white/20"
+                onClick={() => sync?.retrySave()}
+              >
+                <RefreshCcw className="size-3.5" />
+                Retry now
+              </Button>
+            </div>
+          ) : null}
         </div>
       ) : null}
       <div className="mx-auto min-h-full max-w-[1080px]">
@@ -1272,19 +1430,13 @@ export function DocumentWorkspace({
               page={documentPage}
               activeDocumentPath={activeDocumentPath}
               selected
-              onSave={onSaveDocument}
-              onSaveStateChange={handleSaveStateChange}
+              onSave={noopSave}
               editorViewMode={documentEditorViewMode}
               interactionMode={documentInteractionMode}
               backend={backend}
               onCommentRailPresenceChange={setDocumentHasComments}
               onDirtyStateChange={handleDocumentDirtyStateChange}
-              onLocalContentChange={onDocumentLocalContentChange}
-              onSaveControllerChange={(controller) => {
-                saveControllerRef.current = controller;
-              }}
-              saveBlocked={documentDiskChangeState !== "clean"}
-              forceResetKey={documentForceResetKey}
+              sync={sync}
             />
           ) : null
         ) : (

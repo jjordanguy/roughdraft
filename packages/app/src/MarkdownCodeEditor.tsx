@@ -3,7 +3,7 @@ import { markdown } from "@codemirror/lang-markdown";
 import { yamlFrontmatter } from "@codemirror/lang-yaml";
 import { EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { useEffect, useRef } from "react";
+import { type RefObject, useEffect, useRef } from "react";
 import { cn } from "./lib/utils";
 
 interface MarkdownCodeEditorProps {
@@ -13,6 +13,43 @@ interface MarkdownCodeEditorProps {
   readOnly?: boolean;
   className?: string;
   testId?: string;
+  // Receives a function that replaces the document with new text in place
+  // (only the changed range), keeping the selection and focus.
+  externalApplyRef?: RefObject<((value: string) => boolean) | null>;
+}
+
+// The smallest single replacement that turns `current` into `next`, so a
+// cursor outside the changed range stays where it was.
+export function minimalChange(current: string, next: string) {
+  const limit = Math.min(current.length, next.length);
+  let from = 0;
+  while (from < limit && current.charCodeAt(from) === next.charCodeAt(from)) {
+    from += 1;
+  }
+  let suffix = 0;
+  while (
+    suffix < limit - from &&
+    current.charCodeAt(current.length - 1 - suffix) ===
+      next.charCodeAt(next.length - 1 - suffix)
+  ) {
+    suffix += 1;
+  }
+  return {
+    from,
+    to: current.length - suffix,
+    insert: next.slice(from, next.length - suffix),
+  };
+}
+
+function replaceInPlace(
+  view: EditorView,
+  value: string,
+  lastValueRef: { current: string },
+) {
+  const currentValue = view.state.doc.toString();
+  lastValueRef.current = value;
+  if (currentValue === value) return;
+  view.dispatch({ changes: minimalChange(currentValue, value) });
 }
 
 export function createMarkdownCodeEditorExtensions(
@@ -91,6 +128,7 @@ export function MarkdownCodeEditor({
   readOnly = false,
   className,
   testId,
+  externalApplyRef,
 }: MarkdownCodeEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const editorViewRef = useRef<EditorView | null>(null);
@@ -134,22 +172,22 @@ export function MarkdownCodeEditor({
   useEffect(() => {
     const view = editorViewRef.current;
     if (!view) return;
-
-    const currentValue = view.state.doc.toString();
-    if (currentValue === value) {
-      lastValueRef.current = value;
-      return;
-    }
-
-    lastValueRef.current = value;
-    view.dispatch({
-      changes: {
-        from: 0,
-        to: currentValue.length,
-        insert: value,
-      },
-    });
+    replaceInPlace(view, value, lastValueRef);
   }, [value]);
+
+  useEffect(() => {
+    if (!externalApplyRef) return;
+    const apply = (nextValue: string) => {
+      const view = editorViewRef.current;
+      if (!view) return false;
+      replaceInPlace(view, nextValue, lastValueRef);
+      return true;
+    };
+    externalApplyRef.current = apply;
+    return () => {
+      if (externalApplyRef.current === apply) externalApplyRef.current = null;
+    };
+  }, [externalApplyRef]);
 
   return (
     <div

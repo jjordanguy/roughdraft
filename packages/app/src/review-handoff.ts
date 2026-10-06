@@ -5,7 +5,17 @@ import type {
   HandoffWake,
 } from "./storage";
 
-export type DiskChangeState = "clean" | "changed" | "conflict" | "paused";
+export type DiskChangeState =
+  | "clean"
+  | "changed"
+  | "conflict"
+  | "paused"
+  // The file is missing or unreadable; edits wait in the tab.
+  | "unavailable";
+
+// Why the last Done failed: the file moved on disk, the server never
+// answered, or it answered with an error.
+export type ReviewHandoffErrorKind = "file-changed" | "no-answer" | "failed";
 
 // idle: nothing sent since the last edit; sending: request in flight;
 // completed: the server answered 2xx; error: the request failed.
@@ -31,6 +41,7 @@ export interface ReviewHandoffViewInput {
   diskState: DiskChangeState;
   saveState: DocumentSaveState;
   phase: ReviewHandoffPhase;
+  errorKind?: ReviewHandoffErrorKind | null;
   // The last 2xx answer to Done.
   result: CompleteReviewResult | null;
   // The newest copy of that Done's handoff record, refreshed by the status
@@ -87,6 +98,9 @@ function getReviewHandoffBlockedReason({
   if (diskState === "paused") {
     return "Autosave is paused. Reload or overwrite the file before you finish.";
   }
+  if (diskState === "unavailable") {
+    return "The file is not available on disk. Roughdraft can finish when it is back.";
+  }
   // Transient save states ("saving"/"unsaved") intentionally do not block.
   // Blocking on them dims the control on every keystroke while autosave
   // debounces; Done flushes the pending save instead.
@@ -109,6 +123,16 @@ function describeWake(
   // The server answers Done before the wake route runs, so a route id with
   // state "none" means the wake is still in flight.
   return wake.routeId ? `Waking ${target}` : "No wake route registered";
+}
+
+function handoffErrorBody(kind: ReviewHandoffErrorKind | null): string {
+  if (kind === "file-changed") {
+    return "The file changed on disk before Roughdraft could record your Done. Reload or overwrite it, then retry.";
+  }
+  if (kind === "no-answer") {
+    return "The Roughdraft server did not answer, so your Done was not recorded. Retry when it is back.";
+  }
+  return "Roughdraft could not record your Done. Your saved edits are on disk.";
 }
 
 export function getReviewHandoffView(
@@ -163,7 +187,7 @@ export function getReviewHandoffView(
       buttonLabel: "Not sent",
       icon: "alert",
       title: "Done not recorded",
-      body: "Roughdraft could not record your Done. Your saved edits are on disk.",
+      body: handoffErrorBody(input.errorKind ?? null),
       showCopyMessage: true,
       showRetry: true,
       retryDisabled: blockedReason !== null,

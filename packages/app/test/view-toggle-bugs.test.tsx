@@ -6,74 +6,201 @@ import {
   type DocumentEditorViewMode,
   getDocumentEditorViewModeFromLocation,
 } from "../src/app-navigation";
+import { localContentHash } from "../src/content-hash";
 import {
   DocumentSaveStatusIndicator,
   DocumentWorkspace,
   shouldLatchDocumentChangedSinceOpen,
 } from "../src/DocumentWorkspace";
+import { DocumentSync } from "../src/document-sync";
 import type { DocumentSaveState } from "../src/PageCard";
-import type {
-  BackendInfo,
-  CompleteReviewOptions,
-  CompleteReviewResult,
-  HandoffRecord,
-  Page,
-  ReviewWatchStatus,
-  StorageBackend,
+import {
+  type BackendInfo,
+  type CompleteReviewOptions,
+  type CompleteReviewResult,
+  type HandoffRecord,
+  MarkdownFileConflictError,
+  type Page,
+  type SessionRecord,
+  type StorageBackend,
+  type TabChannelHandlers,
+  type TabServerMessage,
 } from "../src/storage";
 
-function createBackend({
-  watcherCount,
-  kind = "local-storage",
-  status = {},
-}: {
-  watcherCount?: number;
-  kind?: BackendInfo["kind"];
-  status?: Partial<ReviewWatchStatus>;
-} = {}): StorageBackend {
-  const backend: StorageBackend = {
-    info: {
-      kind,
-      label: "Test backend",
-      detail: "In-memory",
-    },
-    canManageProjects: false,
-    async getMarkdownFile(relativePath) {
-      return { id: relativePath, title: relativePath, content: "" };
-    },
-    async saveMarkdownFile() {
-      return undefined;
-    },
-    async saveAsset(file) {
-      return {
-        markdownPath: file.name,
-        previewUrl: `file://${file.name}`,
-        mimeType: file.type || "application/octet-stream",
-      };
-    },
-    resolveFileUrl(path) {
-      return `file://${path}`;
-    },
-    async openProject() {},
-  };
+// A fake Roughdraft server for one document: a disk, a tab channel the
+// test speaks for, and a Done endpoint the test controls.
+class TestServer {
+  content: string;
+  version = 1;
+  kind: BackendInfo["kind"];
+  saves: string[] = [];
+  conflictOnSave = false;
+  channels: TabChannelHandlers[] = [];
+  completeReview: (
+    options?: CompleteReviewOptions,
+  ) => Promise<CompleteReviewResult>;
 
-  if (watcherCount !== undefined) {
-    backend.getReviewWatchStatus = async () => ({
-      watching: watcherCount > 0,
-      watcherCount,
-      ...status,
+  constructor({
+    content = "Hello world",
+    kind = "local-storage",
+    completeReview = async () => ({ delivered: false }),
+  }: {
+    content?: string;
+    kind?: BackendInfo["kind"];
+    completeReview?: (
+      options?: CompleteReviewOptions,
+    ) => Promise<CompleteReviewResult>;
+  } = {}) {
+    this.content = content;
+    this.kind = kind;
+    this.completeReview = completeReview;
+  }
+
+  page(): Page {
+    return {
+      id: "test-doc",
+      title: "Test Doc",
+      content: this.content,
+      version: `v${this.version}`,
+    };
+  }
+
+  // An outside writer (the agent).
+  write(content: string) {
+    this.content = content;
+    this.version += 1;
+  }
+
+  backend(): StorageBackend {
+    return {
+      info: {
+        kind: this.kind,
+        label: "Test backend",
+        detail: "In-memory",
+      },
+      canManageProjects: false,
+      getMarkdownFile: async () => this.page(),
+      saveMarkdownFile: async (_path, content) => {
+        if (this.conflictOnSave) {
+          throw new MarkdownFileConflictError({
+            ...this.page(),
+            content: "Changed elsewhere",
+            version: "v99",
+          });
+        }
+        this.saves.push(content);
+        this.write(content);
+        return this.page();
+      },
+      getMarkdownFileState: async () => ({
+        exists: true,
+        available: true,
+        version: `v${this.version}`,
+        contentHash: localContentHash(this.content),
+        seq: this.version,
+      }),
+      openTabChannel: (_path, _tabId, handlers) => {
+        this.channels.push(handlers);
+        return { send() {}, close() {} };
+      },
+      completeReview: (_path, options) => this.completeReview(options),
+      async saveAsset(file) {
+        return {
+          markdownPath: file.name,
+          previewUrl: `file://${file.name}`,
+          mimeType: file.type || "application/octet-stream",
+        };
+      },
+      resolveFileUrl(path) {
+        return `file://${path}`;
+      },
+      async openProject() {},
+    };
+  }
+
+  // What the batch 2 server sends on connect.
+  async hello({
+    watchers = 0,
+    session = null,
+    handoff = null,
+  }: {
+    watchers?: number;
+    session?: SessionRecord | null;
+    handoff?: HandoffRecord | null;
+  } = {}) {
+    const channel = this.channels.at(-1);
+    if (!channel) throw new Error("the tab never opened its channel");
+    await act(async () => {
+      channel.onOpen();
+      channel.onMessage({
+        type: "hello",
+        instanceId: "instance-1",
+        document: {
+          exists: true,
+          available: true,
+          version: `v${this.version}`,
+          contentHash: localContentHash(this.content),
+          seq: this.version,
+        },
+        tabs: 1,
+        watchers,
+        session,
+        handoff,
+        latestSequence: null,
+      });
+      await Promise.resolve();
     });
   }
 
-  return backend;
+  async send(message: TabServerMessage) {
+    const channel = this.channels.at(-1);
+    if (!channel) throw new Error("the tab never opened its channel");
+    await act(async () => {
+      channel.onMessage(message);
+      for (let index = 0; index < 5; index += 1) await Promise.resolve();
+    });
+  }
 }
 
-function createPage(content = "Hello world"): Page {
-  return {
-    id: "test-doc",
-    title: "Test Doc",
-    content,
-  };
+const openSyncs: DocumentSync[] = [];
+
+function createSync(server: TestServer) {
+  const sync = new DocumentSync({
+    backend: server.backend(),
+    path: "test.md",
+    tabId: "tab-test",
+    initialPage: server.page(),
+    environment: { isVisible: () => true, listen: () => () => {} },
+  });
+  sync.start();
+  openSyncs.push(sync);
+  return sync;
+}
+
+afterEach(() => {
+  for (const sync of openSyncs.splice(0)) sync.dispose();
+});
+
+// Puts the tab in the state the old `documentDiskChangeState` prop forced:
+// a save that answered 409, optionally followed by "keep editing".
+async function driveDiskState(
+  server: TestServer,
+  sync: DocumentSync,
+  state: "clean" | "changed" | "conflict" | "paused",
+) {
+  if (state === "clean") return;
+  await act(async () => {
+    if (state === "changed") {
+      sync.edit(`${server.content} (local)`);
+      server.write("Changed elsewhere");
+      await sync.resync();
+      return;
+    }
+    server.conflictOnSave = true;
+    sync.edit(`${server.content} (local)`);
+    await sync.flush();
+    if (state === "paused") sync.keepEditing();
+  });
 }
 
 function setupDomMocks() {
@@ -280,7 +407,12 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     documentDiskChangeState = "clean",
   }: {
     saveState?: DocumentSaveState;
-    documentDiskChangeState?: "clean" | "changed" | "conflict" | "paused";
+    documentDiskChangeState?:
+      | "clean"
+      | "changed"
+      | "conflict"
+      | "paused"
+      | "unavailable";
   } = {}) {
     await act(async () => {
       root.render(
@@ -297,45 +429,38 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     documentDiskChangeState = "clean",
     documentContent = "Hello world",
     documentCopyPath = "test.md",
-    watcherCount = 0,
     backendKind = "local-storage",
-    onSaveDocument = async () => {},
   }: {
     documentDiskChangeState?: "clean" | "changed" | "conflict" | "paused";
     documentContent?: string;
     documentCopyPath?: string | null;
-    watcherCount?: number;
     backendKind?: BackendInfo["kind"];
-    onSaveDocument?: (id: string, content: string) => Promise<void>;
   } = {}) {
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
     ).IS_REACT_ACT_ENVIRONMENT = true;
+    const server = new TestServer({
+      content: documentContent,
+      kind: backendKind,
+    });
+    const sync = createSync(server);
 
     await act(async () => {
       root.render(
         <DocumentWorkspace
-          documentPage={createPage(documentContent)}
+          sync={sync}
           activeDocumentPath="test.md"
           documentCopyPath={documentCopyPath}
           documentFilenameLabel="test.md"
           documentEditorViewMode="rich-text"
           onDocumentEditorViewModeChange={() => {}}
-          onSaveDocument={onSaveDocument}
-          onDocumentSaveStateChange={() => {}}
-          onDocumentDirtyStateChange={() => {}}
-          onDocumentLocalContentChange={() => {}}
-          documentDiskChangeState={documentDiskChangeState}
-          documentForceResetKey={null}
-          onReloadDocumentFromDisk={() => {}}
-          onKeepEditingWithoutAutosave={() => {}}
-          onOverwriteDocumentOnDisk={() => {}}
-          onCompleteReview={async () => ({ delivered: false })}
-          backend={createBackend({ watcherCount, kind: backendKind })}
+          backend={server.backend()}
         />,
       );
       await Promise.resolve();
     });
+    await driveDiskState(server, sync, documentDiskChangeState);
+    return { server, sync };
   }
 
   async function openFileMenu() {
@@ -348,6 +473,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     ["saving", "Saving", "animate-spin"],
     ["unsaved", "Unsaved changes", "animate-spin"],
     ["error", "Save failed", ""],
+    ["offline", "Save failed, retrying", ""],
   ] satisfies Array<
     [DocumentSaveState, string, string]
   >)("shows icon-only %s save status", async (saveState, label, iconClass) => {
@@ -366,6 +492,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     ["changed", "File changed on disk"],
     ["conflict", "Save conflict"],
     ["paused", "Autosave paused"],
+    ["unavailable", "File unavailable"],
   ] as const)("shows disk-blocked %s save status", async (state, label) => {
     await renderSaveStatus({ documentDiskChangeState: state });
 
@@ -376,7 +503,8 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
   });
 
   it("renders save status in the fixed corner when handoff exists", async () => {
-    await renderWorkspace({ watcherCount: 1, backendKind: "local-files" });
+    const { server } = await renderWorkspace({ backendKind: "local-files" });
+    await server.hello({ watchers: 1 });
 
     const stack = queryByTestId(container, "document-status-stack");
     const header = getByTestId(container, "document-page-header");
@@ -434,6 +562,21 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     await click(getByTestId(document.body, `document-file-menu-${action}`));
 
     expect(writeText).toHaveBeenCalledWith(text);
+  });
+
+  it("copies the unsaved draft, not only the saved file, as markdown", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const { sync } = await renderWorkspace({ documentContent: "# Heading" });
+    sync.edit("# Heading\n\nTyped a moment ago");
+    await openFileMenu();
+    await click(getByTestId(document.body, "document-file-menu-markdown"));
+
+    expect(writeText).toHaveBeenCalledWith("# Heading\n\nTyped a moment ago");
   });
 
   it("keeps the file menu open and shows temporary copied feedback", async () => {
@@ -574,9 +717,9 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
   it.each([
     ["Meta+S", { key: "s", metaKey: true }],
     ["Control+S", { key: "s", ctrlKey: true }],
-  ])("prevents browser save on %s", async (_label, init) => {
-    const onSaveDocument = vi.fn().mockResolvedValue(undefined);
-    await renderWorkspace({ onSaveDocument });
+  ])("prevents browser save on %s and saves the draft", async (_label, init) => {
+    const { server, sync } = await renderWorkspace();
+    sync.edit("Hello world, saved by shortcut");
 
     const event = new KeyboardEvent("keydown", {
       ...init,
@@ -591,13 +734,12 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     });
 
     expect(preventDefault).toHaveBeenCalled();
+    expect(server.saves).toEqual(["Hello world, saved by shortcut"]);
   });
 
   it("prevents browser save even when disk conflict blocks persistence", async () => {
-    const onSaveDocument = vi.fn().mockResolvedValue(undefined);
-    await renderWorkspace({
+    const { server } = await renderWorkspace({
       documentDiskChangeState: "conflict",
-      onSaveDocument,
     });
 
     const event = new KeyboardEvent("keydown", {
@@ -614,7 +756,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     });
 
     expect(preventDefault).toHaveBeenCalled();
-    expect(onSaveDocument).not.toHaveBeenCalled();
+    expect(server.saves).toEqual([]);
     expect(container.textContent).toContain("Save conflict");
   });
 
@@ -626,6 +768,30 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     expect(
       getByTestId(container, "document-save-status").getAttribute("aria-label"),
     ).toBe("Save conflict");
+  });
+
+  it("names the disk version that Overwrite will replace", async () => {
+    await renderWorkspace({ documentDiskChangeState: "conflict" });
+
+    expect(
+      getByTestId(container, "file-conflict-disk-version").textContent,
+    ).toContain("Overwrite replaces this version");
+  });
+
+  it("shows a change that lands while autosave is paused", async () => {
+    const { server, sync } = await renderWorkspace({
+      documentDiskChangeState: "paused",
+    });
+    expect(queryByTestId(container, "file-conflict-later-change")).toBeNull();
+
+    server.write("Changed again by the agent");
+    await act(async () => {
+      await sync.resync();
+    });
+
+    expect(
+      getByTestId(container, "file-conflict-later-change").textContent,
+    ).toContain("The file changed on disk again");
   });
 
   it("ignores initial editor dirty signals before user input is possible", () => {
@@ -671,27 +837,20 @@ describe("interaction mode preserved across view toggle (issue 3 fix)", () => {
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
     ).IS_REACT_ACT_ENVIRONMENT = true;
+    const server = new TestServer();
+    const sync = createSync(server);
 
     const renderWorkspace = async (viewMode: DocumentEditorViewMode) => {
       await act(async () => {
         root.render(
           <DocumentWorkspace
-            documentPage={createPage()}
+            sync={sync}
             activeDocumentPath="test.md"
+            documentCopyPath="test.md"
             documentFilenameLabel="test.md"
             documentEditorViewMode={viewMode}
             onDocumentEditorViewModeChange={() => {}}
-            onSaveDocument={async () => {}}
-            onDocumentSaveStateChange={() => {}}
-            onDocumentDirtyStateChange={() => {}}
-            onDocumentLocalContentChange={() => {}}
-            documentDiskChangeState="clean"
-            documentForceResetKey={null}
-            onReloadDocumentFromDisk={() => {}}
-            onKeepEditingWithoutAutosave={() => {}}
-            onOverwriteDocumentOnDisk={() => {}}
-            onCompleteReview={async () => ({ delivered: false })}
-            backend={createBackend()}
+            backend={server.backend()}
           />,
         );
       });
@@ -732,58 +891,54 @@ describe("review handoff watcher affordance", () => {
     });
     container.remove();
     document.body.replaceChildren();
+    vi.useRealTimers();
     vi.restoreAllMocks();
     window.history.replaceState(null, "", "/");
   });
 
   async function renderWorkspace({
-    getWatcherCount,
-    getStatus = () => ({}),
+    watchers,
+    session = null,
     onCompleteReview = async () => ({ delivered: false, pending: true }),
     backendKind = "local-files",
-    documentPage = createPage(),
+    content = "Hello world",
   }: {
-    getWatcherCount: () => number;
-    getStatus?: () => Partial<ReviewWatchStatus>;
+    // Undefined: the server never says hello (an older server).
+    watchers?: number;
+    session?: SessionRecord | null;
     onCompleteReview?: (
       options?: CompleteReviewOptions,
     ) => Promise<CompleteReviewResult>;
     backendKind?: BackendInfo["kind"];
-    documentPage?: Page;
-  }) {
+    content?: string;
+  } = {}) {
+    const server = new TestServer({
+      content,
+      kind: backendKind,
+      completeReview: onCompleteReview,
+    });
+    const sync = createSync(server);
     await act(async () => {
       root.render(
         <DocumentWorkspace
-          documentPage={documentPage}
+          sync={sync}
           activeDocumentPath="test.md"
+          documentCopyPath="test.md"
           documentFilenameLabel="test.md"
           documentEditorViewMode="rich-text"
           onDocumentEditorViewModeChange={() => {}}
-          onSaveDocument={async () => {}}
-          onDocumentSaveStateChange={() => {}}
-          onDocumentDirtyStateChange={() => {}}
-          onDocumentLocalContentChange={() => {}}
-          documentDiskChangeState="clean"
-          documentForceResetKey={null}
-          onReloadDocumentFromDisk={() => {}}
-          onKeepEditingWithoutAutosave={() => {}}
-          onOverwriteDocumentOnDisk={() => {}}
-          onCompleteReview={onCompleteReview}
-          backend={createBackend({
-            watcherCount: getWatcherCount(),
-            kind: backendKind,
-            status: getStatus(),
-          })}
+          backend={server.backend()}
         />,
       );
       await Promise.resolve();
     });
+    if (watchers !== undefined) await server.hello({ watchers, session });
+    return { server, sync };
   }
 
   async function settle() {
     await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
+      for (let index = 0; index < 5; index += 1) await Promise.resolve();
     });
   }
 
@@ -814,13 +969,37 @@ describe("review handoff watcher affordance", () => {
     );
   }
 
+  function splitButton() {
+    return getByTestId(container, "review-handoff-split-button");
+  }
+
   it("does not show the Done button outside a local files document", async () => {
-    await renderWorkspace({
-      getWatcherCount: () => 1,
-      backendKind: "local-storage",
-    });
+    await renderWorkspace({ watchers: 1, backendKind: "local-storage" });
 
     expect(queryByTestId(container, "review-handoff-button")).toBeNull();
+  });
+
+  it("takes the watcher count from the tab channel, with no status poll", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    const { server } = await renderWorkspace();
+
+    expect(splitButton().getAttribute("data-watcher-state")).toBe("none");
+
+    await server.hello({ watchers: 1 });
+    expect(splitButton().getAttribute("data-watcher-state")).toBe("listening");
+
+    await server.send({ type: "watchers", count: 0 });
+    expect(splitButton().getAttribute("data-watcher-state")).toBe("none");
+
+    await server.send({ type: "watchers", count: 2 });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(splitButton().getAttribute("data-watcher-state")).toBe("listening");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 
   it("shows the Done button with no watcher and says no agent is listening", async () => {
@@ -828,7 +1007,7 @@ describe("review handoff watcher affordance", () => {
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: false, pending: true });
 
-    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    await renderWorkspace({ watchers: 0, onCompleteReview });
 
     const doneButton = getByTestId<HTMLButtonElement>(
       container,
@@ -836,11 +1015,7 @@ describe("review handoff watcher affordance", () => {
     );
     expect(doneButton.textContent).toContain("Approve");
     expect(doneButton.disabled).toBe(false);
-    expect(
-      getByTestId(container, "review-handoff-split-button").getAttribute(
-        "data-watcher-state",
-      ),
-    ).toBe("none");
+    expect(splitButton().getAttribute("data-watcher-state")).toBe("none");
 
     await openOverallCommentPopover();
 
@@ -854,25 +1029,19 @@ describe("review handoff watcher affordance", () => {
 
   it("says the agent is waiting and names its session when one is registered", async () => {
     await renderWorkspace({
-      getWatcherCount: () => 1,
-      getStatus: () => ({
-        session: {
-          harness: "claude-code",
-          label: "Plan review chat",
-          link: null,
-          sessionId: null,
-          routeId: null,
-          registeredAt: "2026-10-05T15:00:00.000Z",
-        },
-      }),
+      watchers: 1,
+      session: {
+        harness: "claude-code",
+        label: "Plan review chat",
+        link: null,
+        sessionId: null,
+        routeId: null,
+        registeredAt: "2026-10-05T15:00:00.000Z",
+      },
     });
     await settle();
 
-    expect(
-      getByTestId(container, "review-handoff-split-button").getAttribute(
-        "data-watcher-state",
-      ),
-    ).toBe("listening");
+    expect(splitButton().getAttribute("data-watcher-state")).toBe("listening");
 
     await openOverallCommentPopover();
 
@@ -884,18 +1053,43 @@ describe("review handoff watcher affordance", () => {
     ).toBe("Opened by Plan review chat");
   });
 
-  it("sends Done with a client handoff id", async () => {
+  it("sends Done with a client handoff id and the version it is based on", async () => {
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+    await renderWorkspace({ watchers: 1, onCompleteReview });
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
     expect(onCompleteReview).toHaveBeenCalledWith({
       handoffId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      expectedVersion: "v1",
+      expectedContentHash: localContentHash("Hello world"),
     });
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Sent");
+  });
+
+  it("hands off right after typing with one save and no second PUT", async () => {
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockResolvedValue({ delivered: true });
+    const { server, sync } = await renderWorkspace({
+      watchers: 1,
+      onCompleteReview,
+    });
+
+    sync.edit("Hello world. Quick note.");
+    await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+
+    expect(server.saves).toEqual(["Hello world. Quick note."]);
+    expect(onCompleteReview).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedVersion: "v2" }),
+    );
     expect(
       getByTestId(container, "review-handoff-button").textContent,
     ).toContain("Sent");
@@ -912,7 +1106,7 @@ describe("review handoff watcher affordance", () => {
           }),
       );
 
-    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    await renderWorkspace({ watchers: 0, onCompleteReview });
     const textarea = await openOverallCommentPopover();
     await change(textarea, "Tighten the intro.");
     await click(getByTestId(document.body, "review-handoff-submit-comment"));
@@ -928,6 +1122,7 @@ describe("review handoff watcher affordance", () => {
     expect(queryByTestId(status, "review-handoff-robots-toy")).toBeNull();
     expect(status.textContent).not.toContain("Your agent is now working");
 
+    await settle();
     await act(async () => {
       resolveReview({ delivered: false, pending: true });
       await Promise.resolve();
@@ -949,8 +1144,9 @@ describe("review handoff watcher affordance", () => {
         wake: handoffRecord().wake,
       });
 
-    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    await renderWorkspace({ watchers: 0, onCompleteReview });
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
 
     expect(
       getByTestId(container, "review-handoff-button").textContent,
@@ -968,9 +1164,8 @@ describe("review handoff watcher affordance", () => {
     );
   });
 
-  it("moves to Picked up when the status poll reports the handoff acknowledged", async () => {
+  it("moves to Picked up when the tab channel reports the handoff acknowledged", async () => {
     let handoffId = "";
-    let polledHandoff: HandoffRecord | null = null;
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockImplementation(async (options) => {
@@ -984,24 +1179,18 @@ describe("review handoff watcher affordance", () => {
         };
       });
 
-    await renderWorkspace({
-      getWatcherCount: () => 0,
-      getStatus: () => ({ handoff: polledHandoff }),
-      onCompleteReview,
-    });
+    const { server } = await renderWorkspace({ watchers: 0, onCompleteReview });
     await click(getByTestId(container, "review-handoff-button"));
-
-    polledHandoff = handoffRecord({
-      handoffId,
-      state: "acknowledged",
-      ackedAt: "2026-10-05T15:45:00.000Z",
-    });
-    await renderWorkspace({
-      getWatcherCount: () => 0,
-      getStatus: () => ({ handoff: polledHandoff }),
-      onCompleteReview,
-    });
     await settle();
+
+    await server.send({
+      type: "handoff",
+      handoff: handoffRecord({
+        handoffId,
+        state: "acknowledged",
+        ackedAt: "2026-10-05T15:45:00.000Z",
+      }),
+    });
 
     expect(
       getByTestId(container, "review-handoff-button").textContent,
@@ -1012,15 +1201,8 @@ describe("review handoff watcher affordance", () => {
   });
 
   it("ignores an acknowledged handoff that belongs to another Done", async () => {
-    await renderWorkspace({
-      getWatcherCount: () => 0,
-      getStatus: () => ({
-        handoff: handoffRecord({
-          handoffId: "someone-else",
-          state: "acknowledged",
-          ackedAt: "2026-10-05T15:45:00.000Z",
-        }),
-      }),
+    const { server } = await renderWorkspace({
+      watchers: 0,
       onCompleteReview: async (options) => ({
         delivered: false,
         pending: true,
@@ -1029,6 +1211,14 @@ describe("review handoff watcher affordance", () => {
     });
     await click(getByTestId(container, "review-handoff-button"));
     await settle();
+    await server.send({
+      type: "handoff",
+      handoff: handoffRecord({
+        handoffId: "someone-else",
+        state: "acknowledged",
+        ackedAt: "2026-10-05T15:45:00.000Z",
+      }),
+    });
 
     expect(
       getByTestId(container, "review-handoff-button").textContent,
@@ -1052,10 +1242,11 @@ describe("review handoff watcher affordance", () => {
         return { delivered: false, pending: true };
       });
 
-    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    await renderWorkspace({ watchers: 0, onCompleteReview });
     const textarea = await openOverallCommentPopover();
     await change(textarea, "Tighten the intro.");
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
 
     expect(
       getByTestId(container, "review-handoff-button").textContent,
@@ -1069,6 +1260,7 @@ describe("review handoff watcher affordance", () => {
     ).not.toBeNull();
 
     await click(getByTestId(errorStatus, "review-handoff-retry"));
+    await settle();
 
     expect(onCompleteReview).toHaveBeenCalledTimes(2);
     const [first, second] = onCompleteReview.mock.calls.map(
@@ -1082,19 +1274,67 @@ describe("review handoff watcher affordance", () => {
     ).toContain("Done, waiting");
   });
 
+  it("says the file changed when the Done answers 409, and blocks Retry until it is resolved", async () => {
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockRejectedValue(
+        new MarkdownFileConflictError({
+          id: "test-doc",
+          title: "Test Doc",
+          content: "The agent wrote this first",
+          version: "v7",
+        }),
+      );
+
+    await renderWorkspace({ watchers: 1, onCompleteReview });
+    await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+
+    const status = getByTestId(document.body, "review-handoff-status");
+    expect(status.textContent).toContain(
+      "The file changed on disk before Roughdraft could record your Done.",
+    );
+    expect(
+      getByTestId<HTMLButtonElement>(status, "review-handoff-retry").disabled,
+    ).toBe(true);
+    expect(
+      getByTestId(container, "document-save-status").getAttribute("aria-label"),
+    ).toBe("Save conflict");
+    expect(getByTestId(container, "file-conflict-notice")).not.toBeNull();
+  });
+
+  it("says the server did not answer when the Done never got a reply", async () => {
+    const { ServerUnreachableError } = await import("../src/storage");
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockRejectedValue(new ServerUnreachableError("POST /api/review-events"));
+
+    await renderWorkspace({ watchers: 1, onCompleteReview });
+    await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+
+    const status = getByTestId(document.body, "review-handoff-status");
+    expect(status.textContent).toContain(
+      "The Roughdraft server did not answer, so your Done was not recorded.",
+    );
+    expect(
+      getByTestId<HTMLButtonElement>(status, "review-handoff-retry").disabled,
+    ).toBe(false);
+  });
+
   it("clears the overall comment on a 2xx even when nobody received the Done", async () => {
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: false, pending: true });
-    let watcherCount = 0;
 
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
+    const { server } = await renderWorkspace({
+      watchers: 0,
       onCompleteReview,
     });
     const textarea = await openOverallCommentPopover();
     await change(textarea, "Tighten the intro.");
     await click(getByTestId(document.body, "review-handoff-submit-comment"));
+    await settle();
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
     expect(onCompleteReview.mock.calls[0]?.[0]).toMatchObject({
@@ -1103,12 +1343,17 @@ describe("review handoff watcher affordance", () => {
 
     // A new document version from disk (the agent replied) returns the button
     // to ready. The field must be empty so a second Done cannot repeat it.
-    watcherCount = 1;
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-      documentPage: { ...createPage("Hello again"), version: "v9" },
+    server.write("Hello again");
+    await server.send({
+      type: "change",
+      seq: server.version,
+      exists: true,
+      available: true,
+      version: `v${server.version}`,
+      contentHash: localContentHash(server.content),
+      origin: "outside",
     });
+    await server.send({ type: "watchers", count: 1 });
     await settle();
 
     expect(
@@ -1118,6 +1363,7 @@ describe("review handoff watcher affordance", () => {
     expect(reopened.value).toBe("");
 
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
 
     expect(onCompleteReview).toHaveBeenCalledTimes(2);
     const [first, second] = onCompleteReview.mock.calls.map(
@@ -1128,29 +1374,8 @@ describe("review handoff watcher affordance", () => {
   });
 
   it("disables Done with a reason while the file is in conflict", async () => {
-    await act(async () => {
-      root.render(
-        <DocumentWorkspace
-          documentPage={createPage()}
-          activeDocumentPath="test.md"
-          documentFilenameLabel="test.md"
-          documentEditorViewMode="rich-text"
-          onDocumentEditorViewModeChange={() => {}}
-          onSaveDocument={async () => {}}
-          onDocumentSaveStateChange={() => {}}
-          onDocumentDirtyStateChange={() => {}}
-          onDocumentLocalContentChange={() => {}}
-          documentDiskChangeState="conflict"
-          documentForceResetKey={null}
-          onReloadDocumentFromDisk={() => {}}
-          onKeepEditingWithoutAutosave={() => {}}
-          onOverwriteDocumentOnDisk={() => {}}
-          onCompleteReview={async () => ({ delivered: false })}
-          backend={createBackend({ watcherCount: 1, kind: "local-files" })}
-        />,
-      );
-      await Promise.resolve();
-    });
+    const { server, sync } = await renderWorkspace({ watchers: 1 });
+    await driveDiskState(server, sync, "conflict");
 
     const button = getByTestId<HTMLButtonElement>(
       container,
@@ -1167,12 +1392,8 @@ describe("review handoff watcher affordance", () => {
       .fn<() => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+    await renderWorkspace({ watchers: 1, onCompleteReview });
 
-    const splitButton = getByTestId<HTMLDivElement>(
-      container,
-      "review-handoff-split-button",
-    );
     const doneReviewingButton = getByTestId<HTMLButtonElement>(
       container,
       "review-handoff-button",
@@ -1183,8 +1404,9 @@ describe("review handoff watcher affordance", () => {
     );
 
     await click(doneReviewingButton);
+    await settle();
 
-    expect(splitButton.className).toContain("opacity-50");
+    expect(splitButton().className).toContain("opacity-50");
     expect(doneReviewingButton.className).toContain("disabled:opacity-100");
     expect(commentTrigger.className).toContain("disabled:opacity-100");
   });
@@ -1194,8 +1416,9 @@ describe("review handoff watcher affordance", () => {
       .fn<() => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: false });
 
-    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+    await renderWorkspace({ watchers: 1, onCompleteReview });
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("Not sent");
@@ -1209,18 +1432,21 @@ describe("review handoff watcher affordance", () => {
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+    await renderWorkspace({ watchers: 1, onCompleteReview });
 
     const textarea = await openOverallCommentPopover();
     expect(textarea.getAttribute("placeholder")).toBe("Overall comment");
 
     await change(textarea, "  Please prioritize the CLI contract.  ");
     await click(getByTestId(document.body, "review-handoff-submit-comment"));
+    await settle();
 
-    expect(onCompleteReview).toHaveBeenCalledWith({
-      overallComment: "Please prioritize the CLI contract.",
-      handoffId: expect.any(String),
-    });
+    expect(onCompleteReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        overallComment: "Please prioritize the CLI contract.",
+        handoffId: expect.any(String),
+      }),
+    );
     expect(document.body.textContent).not.toContain(
       "Please prioritize the CLI contract.",
     );
@@ -1231,37 +1457,31 @@ describe("review handoff watcher affordance", () => {
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+    await renderWorkspace({ watchers: 1, onCompleteReview });
 
     const textarea = await openOverallCommentPopover();
     await change(textarea, "  Please prioritize the CLI contract.  ");
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
 
-    expect(onCompleteReview).toHaveBeenCalledWith({
-      overallComment: "Please prioritize the CLI contract.",
-      handoffId: expect.any(String),
-    });
+    expect(onCompleteReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        overallComment: "Please prioritize the CLI contract.",
+        handoffId: expect.any(String),
+      }),
+    );
   });
 
   it("keeps visible sent feedback after the watcher receives the event", async () => {
-    let watcherCount = 1;
     const onCompleteReview = vi
       .fn<() => Promise<CompleteReviewResult>>()
-      .mockImplementation(async () => {
-        watcherCount = 0;
-        return { delivered: true };
-      });
+      .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-    });
+    const { server } = await renderWorkspace({ watchers: 1, onCompleteReview });
 
     await click(getByTestId(container, "review-handoff-button"));
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-    });
+    await settle();
+    await server.send({ type: "watchers", count: 0 });
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("Sent");
@@ -1270,33 +1490,20 @@ describe("review handoff watcher affordance", () => {
   });
 
   it("lets a new watcher start another handoff after sent feedback", async () => {
-    let watcherCount = 1;
     const onCompleteReview = vi
       .fn<() => Promise<CompleteReviewResult>>()
-      .mockImplementation(async () => {
-        watcherCount = 0;
-        return { delivered: true };
-      });
+      .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-    });
+    const { server } = await renderWorkspace({ watchers: 1, onCompleteReview });
 
     await click(getByTestId(container, "review-handoff-button"));
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-    });
+    await settle();
+    await server.send({ type: "watchers", count: 0 });
 
     expect(container.textContent).toContain("Sent");
     expect(container.textContent).not.toContain("Approve");
 
-    watcherCount = 1;
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-    });
+    await server.send({ type: "watchers", count: 1 });
     await settle();
 
     expect(container.textContent).toContain("Approve");
@@ -1311,20 +1518,15 @@ describe("review handoff watcher affordance", () => {
       value: { writeText },
     });
     const closeWindow = vi.spyOn(window, "close").mockImplementation(() => {});
-    let watcherCount = 1;
     const onCompleteReview = vi
       .fn<() => Promise<CompleteReviewResult>>()
-      .mockImplementation(async () => {
-        watcherCount = 0;
-        return { delivered: true };
-      });
+      .mockResolvedValue({ delivered: true });
 
-    await renderWorkspace({
-      getWatcherCount: () => watcherCount,
-      onCompleteReview,
-    });
+    const { server } = await renderWorkspace({ watchers: 1, onCompleteReview });
 
     await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+    await server.send({ type: "watchers", count: 0 });
 
     expect(onCompleteReview).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("Sent");

@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import {
   apiBaseUrl,
   appendInCodeEditor,
+  blockTabChannel,
   codeEditor,
   createMarkdownProject,
   logE2eEvent,
@@ -150,7 +151,7 @@ test.describe("review handoff", () => {
   test("a save conflict disables Done and the tooltip names the reason", async ({
     page,
   }) => {
-    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+    await blockTabChannel(page);
     const filePath = writeProjectFile(
       projectDir,
       "blocked.md",
@@ -176,9 +177,10 @@ test.describe("review handoff", () => {
   });
 
   // The tests below need the batch 1 server (handoff log, includePending,
-  // ack route, idempotent handoffId). Run them once it lands:
-  //   pnpm test:e2e --grep @batch1-server
-  test("Done with no watcher shows Saved for your agent with Copy @batch1-server", async ({
+  // ack route, idempotent handoffId). Since batch 2 the tab learns about
+  // watchers, handoff records and disk changes only over the tab channel, so
+  // the ones that wait for those carry @batch2-server instead.
+  test("Done with no watcher shows Saved for your agent with Copy @batch2-server", async ({
     page,
     request,
   }) => {
@@ -232,7 +234,7 @@ test.describe("review handoff", () => {
     );
   });
 
-  test("a watch aborted by the test leaves the button in the no-agent ready state within 3 s and Done records pending instead of Sent @batch1-server", async ({
+  test("a watch aborted by the test leaves the button in the no-agent ready state within 3 s and Done records pending instead of Sent @batch2-server", async ({
     page,
   }) => {
     const filePath = writeProjectFile(
@@ -290,7 +292,7 @@ test.describe("review handoff", () => {
     );
   });
 
-  test("Done with an overall comment and no watcher, then a second Done, leaves one comment in the file @batch1-server", async ({
+  test("Done with an overall comment and no watcher, then a second Done, leaves one comment in the file @batch2-server", async ({
     page,
   }) => {
     const filePath = writeProjectFile(

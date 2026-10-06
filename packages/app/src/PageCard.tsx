@@ -3,9 +3,18 @@ import type { Mark as ProseMirrorMark } from "@tiptap/pm/model";
 import { TextSelection } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { CommentEditorList } from "./CommentEditorList";
+import type { DocumentSync } from "./document-sync";
 import {
   type CriticChangeAttrs,
   type CriticComment,
@@ -36,7 +45,17 @@ import type { Page, StorageBackend } from "./storage";
 import { useCommentAnchorLayout } from "./useCommentAnchorLayout";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
 
-export type DocumentSaveState = "saved" | "unsaved" | "saving" | "error";
+// "offline": the save failed and the sync controller is retrying it.
+export type DocumentSaveState =
+  | "saved"
+  | "unsaved"
+  | "saving"
+  | "error"
+  | "offline";
+
+// Set by an editor surface: applies new markdown without remounting so the
+// selection and focus stay. Returns false when the editor is not ready.
+export type ExternalContentApplier = (markdown: string) => boolean;
 
 export type ManualSaveResult =
   | { status: "saved" }
@@ -68,6 +87,9 @@ interface PageCardProps {
   onSaveControllerChange?: (controller: DocumentSaveController | null) => void;
   saveBlocked?: boolean;
   forceResetKey?: string | null;
+  // When set, the controller owns saving, the draft and disk updates; `page`
+  // only gives the id and the content at mount.
+  sync?: DocumentSync | null;
 }
 
 interface PageCardEditorSurfaceProps {
@@ -88,6 +110,13 @@ interface PageCardEditorSurfaceProps {
   onSaveControllerChange?: (controller: DocumentSaveController | null) => void;
   saveBlocked?: boolean;
   forceResetKey?: string | null;
+  sync?: DocumentSync | null;
+}
+
+interface RestoreSelectionRequest {
+  key: string;
+  from: number;
+  to: number;
 }
 
 interface RichTextEditorSurfaceProps {
@@ -102,6 +131,8 @@ interface RichTextEditorSurfaceProps {
   backend: StorageBackend;
   onEditorReady?: (editor: Editor | null) => void;
   onCommentRailPresenceChange?: (hasCommentRailSpace: boolean) => void;
+  externalApplyRef?: RefObject<ExternalContentApplier | null>;
+  restoreSelection?: RestoreSelectionRequest | null;
 }
 
 interface CodeEditorSurfaceProps {
@@ -110,6 +141,7 @@ interface CodeEditorSurfaceProps {
   interactionMode: DocumentInteractionMode;
   layout: "default" | "embedded-demo";
   onMarkdownChange: (markdown: string) => void;
+  externalApplyRef?: RefObject<ExternalContentApplier | null>;
 }
 
 export interface DraftSuggestionState {
@@ -601,6 +633,8 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   backend,
   onEditorReady,
   onCommentRailPresenceChange,
+  externalApplyRef,
+  restoreSelection = null,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
   const criticChangeFrameRef = useRef<number | null>(null);
@@ -1307,6 +1341,84 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       editor.chain().focus("end").run();
     });
   }, [editor, focusRequestKey, selected]);
+
+  // After a forced remount, put the caret back where it was and keep focus,
+  // so the next keystrokes land in the document instead of the page body.
+  const restoredSelectionKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!editor || !restoreSelection) return;
+    if (restoredSelectionKeyRef.current === restoreSelection.key) return;
+    restoredSelectionKeyRef.current = restoreSelection.key;
+    const size = editor.state.doc.content.size;
+    const clamp = (position: number) => Math.max(1, Math.min(position, size));
+    editor
+      .chain()
+      .focus()
+      .setTextSelection({
+        from: clamp(restoreSelection.from),
+        to: clamp(restoreSelection.to),
+      })
+      .run();
+  }, [editor, restoreSelection]);
+
+  // New markdown from disk, applied as one transaction that replaces only
+  // the range that differs, so the selection maps through and focus stays.
+  // (Batch 5 replaces this with full transaction mapping and merging.)
+  const applyExternalMarkdown = useCallback(
+    (nextMarkdown: string): boolean => {
+      const currentEditor = editorRef.current;
+      if (!currentEditor || currentEditor.isDestroyed) return false;
+
+      const parsed = criticMarkdownToEditorState(nextMarkdown, {
+        resolveFileUrl,
+        resolveLinkUrl,
+      });
+      let nextDoc: ReturnType<typeof currentEditor.schema.nodeFromJSON>;
+      try {
+        nextDoc = currentEditor.schema.nodeFromJSON(parsed.doc);
+      } catch (error) {
+        console.error("Could not apply the file from disk in place:", error);
+        return false;
+      }
+
+      frontmatterRef.current = parsed.frontmatter;
+      endmatterRef.current = parsed.endmatter;
+      commentsRef.current = parsed.comments;
+      setComments(parsed.comments);
+
+      const { state, view } = currentEditor;
+      const start = state.doc.content.findDiffStart(nextDoc.content);
+      if (start !== null && start !== undefined) {
+        const end = state.doc.content.findDiffEnd(nextDoc.content);
+        let endA = end?.a ?? state.doc.content.size;
+        let endB = end?.b ?? nextDoc.content.size;
+        const overlap = start - Math.min(endA, endB);
+        if (overlap > 0) {
+          endA += overlap;
+          endB += overlap;
+        }
+        const transaction = state.tr
+          .replace(start, endA, nextDoc.slice(start, endB))
+          .setMeta("addToHistory", false);
+        suppressNextMarkdownUpdateRef.current = true;
+        view.dispatch(transaction);
+        suppressNextMarkdownUpdateRef.current = false;
+      }
+      refreshCriticChanges();
+      return true;
+    },
+    [refreshCriticChanges, resolveFileUrl, resolveLinkUrl],
+  );
+
+  useEffect(() => {
+    if (!externalApplyRef) return;
+    externalApplyRef.current = applyExternalMarkdown;
+    return () => {
+      if (externalApplyRef.current === applyExternalMarkdown) {
+        externalApplyRef.current = null;
+      }
+    };
+  }, [applyExternalMarkdown, externalApplyRef]);
 
   useEffect(() => {
     if (selectedCommentId && !comments.has(selectedCommentId)) {
@@ -2035,6 +2147,7 @@ const CodeEditorSurface = memo(function CodeEditorSurface({
   interactionMode,
   layout,
   onMarkdownChange,
+  externalApplyRef,
 }: CodeEditorSurfaceProps) {
   const documentShellClass = cn(
     "document-page-shell",
@@ -2081,6 +2194,7 @@ const CodeEditorSurface = memo(function CodeEditorSurface({
                 onChange={onMarkdownChange}
                 readOnly={interactionMode === "viewing"}
                 autoFocus
+                externalApplyRef={externalApplyRef}
               />
             </div>
           </div>
@@ -2115,20 +2229,32 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   onSaveControllerChange,
   saveBlocked = false,
   forceResetKey = null,
+  sync = null,
 }: PageCardEditorSurfaceProps) {
+  const initialContent = sync ? sync.draft : page.content;
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightSaveRef = useRef<Promise<ManualSaveResult> | null>(null);
-  const pendingMarkdownRef = useRef(page.content);
+  const pendingMarkdownRef = useRef(initialContent);
   const recentMarkdownRef = useRef<Set<string>>(new Set());
   const previousEditorViewModeRef = useRef<EditorViewMode>(editorViewMode);
-  const lastAcceptedMarkdownRef = useRef(page.content);
+  const lastAcceptedMarkdownRef = useRef(initialContent);
   const localDirtyRef = useRef(false);
   const forceResetKeyRef = useRef(forceResetKey);
-  const [markdown, setMarkdown] = useState(page.content);
-  const [richTextSourceMarkdown, setRichTextSourceMarkdown] = useState(
-    page.content,
-  );
+  const [markdown, setMarkdown] = useState(initialContent);
+  const [richTextSourceMarkdown, setRichTextSourceMarkdown] =
+    useState(initialContent);
   const [richTextSourceVersion, setRichTextSourceVersion] = useState(0);
+  // Sync mode: the controller epoch of the content the editor shows, so an
+  // edit typed before new content lands is replayed on that content.
+  const appliedEpochRef = useRef(sync?.epoch ?? 0);
+  const pendingRemountEpochRef = useRef<number | null>(null);
+  const richTextApplyRef = useRef<ExternalContentApplier | null>(null);
+  const codeApplyRef = useRef<ExternalContentApplier | null>(null);
+  const editorViewModeRef = useRef(editorViewMode);
+  editorViewModeRef.current = editorViewMode;
+  const editorReadyRef = useRef<Editor | null>(null);
+  const [restoreSelection, setRestoreSelection] =
+    useState<RestoreSelectionRequest | null>(null);
 
   const reportDirtyState = useCallback(
     (isDirty: boolean) => {
@@ -2228,6 +2354,19 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   );
 
   const flushSave = useCallback(async (): Promise<ManualSaveResult> => {
+    if (sync) {
+      const result = await sync.flush();
+      if (result.status === "saved") return { status: "saved" };
+      if (result.status === "blocked") return { status: "blocked" };
+      return {
+        status: "error",
+        error:
+          result.status === "error"
+            ? result.error
+            : new Error("The file changed on disk."),
+      };
+    }
+
     if (saveTimer.current) {
       clearTimeout(saveTimer.current);
       saveTimer.current = null;
@@ -2252,7 +2391,7 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     }
 
     return await performSave(pendingMarkdownRef.current);
-  }, [onSaveStateChange, performSave]);
+  }, [onSaveStateChange, performSave, sync]);
 
   useEffect(() => {
     onSaveControllerChange?.({ flushSave });
@@ -2264,13 +2403,76 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       pendingMarkdownRef.current = nextMarkdown;
       setMarkdown(nextMarkdown);
       onLocalContentChange?.(nextMarkdown);
+      if (sync) {
+        sync.edit(nextMarkdown, appliedEpochRef.current);
+        reportDirtyState(sync.getView().dirty);
+        return;
+      }
       reportDirtyState(nextMarkdown !== lastAcceptedMarkdownRef.current);
       scheduleSave(nextMarkdown);
     },
-    [onLocalContentChange, reportDirtyState, scheduleSave],
+    [onLocalContentChange, reportDirtyState, scheduleSave, sync],
   );
 
+  const handleEditorReady = useCallback(
+    (nextEditor: Editor | null) => {
+      editorReadyRef.current = nextEditor;
+      onEditorReady?.(nextEditor);
+    },
+    [onEditorReady],
+  );
+
+  // Sync mode: content from disk (fast-forward, reload, replayed keystrokes)
+  // goes straight into the live editor. Only when the editor cannot take it
+  // in place does the rich-text surface remount, and then it gets the caret
+  // and focus back.
   useEffect(() => {
+    if (!sync) return;
+    const stopContent = sync.onContentUpdate((update) => {
+      pendingMarkdownRef.current = update.content;
+      lastAcceptedMarkdownRef.current = update.content;
+      const inCode = editorViewModeRef.current === "code";
+      const apply = inCode ? codeApplyRef.current : richTextApplyRef.current;
+      const applied = apply?.(update.content) ?? false;
+      setMarkdown(update.content);
+      onLocalContentChange?.(update.content);
+      if (applied || inCode) {
+        appliedEpochRef.current = update.epoch;
+      } else {
+        const currentEditor = editorReadyRef.current;
+        const hadFocus = !!currentEditor?.isFocused;
+        const selection = currentEditor?.state.selection;
+        pendingRemountEpochRef.current = update.epoch;
+        setRichTextSourceMarkdown(update.content);
+        setRichTextSourceVersion((current) => current + 1);
+        if (hadFocus && selection) {
+          setRestoreSelection({
+            key: `epoch:${update.epoch}`,
+            from: selection.from,
+            to: selection.to,
+          });
+        }
+      }
+      reportDirtyState(sync.getView().dirty);
+    });
+    const stopView = sync.subscribe(() => {
+      reportDirtyState(sync.getView().dirty);
+    });
+    return () => {
+      stopContent();
+      stopView();
+    };
+  }, [onLocalContentChange, reportDirtyState, sync]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: runs after the remount that richTextSourceVersion triggers commits
+  useEffect(() => {
+    if (pendingRemountEpochRef.current === null) return;
+    appliedEpochRef.current = pendingRemountEpochRef.current;
+    pendingRemountEpochRef.current = null;
+  }, [richTextSourceVersion]);
+
+  useEffect(() => {
+    if (sync) return;
     const forceResetChanged = forceResetKeyRef.current !== forceResetKey;
     forceResetKeyRef.current = forceResetKey;
 
@@ -2300,7 +2502,14 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     }
 
     acceptMarkdown(page.content);
-  }, [acceptMarkdown, forceResetKey, markdown, page.content, reportDirtyState]);
+  }, [
+    acceptMarkdown,
+    forceResetKey,
+    markdown,
+    page.content,
+    reportDirtyState,
+    sync,
+  ]);
 
   useEffect(() => {
     if (!saveBlocked || !saveTimer.current) return;
@@ -2351,11 +2560,13 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
         interactionMode={interactionMode}
         layout={layout}
         onMarkdownChange={handleMarkdownChange}
+        externalApplyRef={codeApplyRef}
       />
     );
   }
 
   const effectiveRichTextSourceMarkdown =
+    !sync &&
     !localDirtyRef.current &&
     !recentMarkdownRef.current.has(page.content) &&
     markdown !== page.content
@@ -2375,7 +2586,9 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       interactionMode={interactionMode}
       onCommentRailPresenceChange={onCommentRailPresenceChange}
       backend={backend}
-      onEditorReady={onEditorReady}
+      onEditorReady={handleEditorReady}
+      externalApplyRef={richTextApplyRef}
+      restoreSelection={restoreSelection}
     />
   );
 });
@@ -2398,6 +2611,7 @@ export function PageCard({
   onSaveControllerChange,
   saveBlocked,
   forceResetKey,
+  sync,
 }: PageCardProps) {
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
 
@@ -2425,6 +2639,7 @@ export function PageCard({
         onSaveControllerChange={onSaveControllerChange}
         saveBlocked={saveBlocked}
         forceResetKey={forceResetKey}
+        sync={sync}
       />
     </div>
   );

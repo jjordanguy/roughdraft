@@ -121,3 +121,16 @@ export function logE2eEvent(event: string, data: Record<string, unknown> = {}) {
 export function apiBaseUrl() {
   return `http://127.0.0.1:${Number(process.env.API_PORT ?? 4317)}`;
 }
+
+// Keeps the tab channel down so the tab learns about disk changes only from
+// its own saves (the stale-write tests need the 409 path).
+export async function blockTabChannel(page: Page) {
+  await page.routeWebSocket(/\/api\/tab\?/, (socket) => {
+    socket.close();
+  });
+}
+
+// Fires the window focus event, one of the tab's resync triggers.
+export async function fireWindowFocus(page: Page) {
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+}

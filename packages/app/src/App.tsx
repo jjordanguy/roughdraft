@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowLeft,
   Braces,
   Check,
@@ -9,6 +10,7 @@ import {
   FileText,
   MessageSquare,
   PencilLine,
+  RefreshCcw,
   Terminal,
 } from "lucide-react";
 import {
@@ -43,7 +45,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./components/ui/dialog";
-import { DocumentWorkspace } from "./DocumentWorkspace";
+import { DocumentWorkspace, getSyncStatus } from "./DocumentWorkspace";
+import { DocumentSync } from "./document-sync";
 import { detectBackend } from "./detect-backend";
 import {
   getCommentAnchorMeasurements,
@@ -62,20 +65,15 @@ import {
 } from "./open-requests";
 import { PreviewBackend } from "./preview-backend";
 import { RoughdraftFormatDemo } from "./RoughdraftFormatDemo";
+import type { DiskChangeState } from "./review-handoff";
 import {
-  type CompleteReviewOptions,
-  MarkdownFileConflictError,
+  MarkdownFileNotFoundError,
   type Page,
   type StorageBackend,
+  UnsupportedRouteError,
 } from "./storage";
 import { UpdateNotice } from "./UpdateNotice";
 import { fetchUpdateStatus, type UpdateStatus } from "./update-status";
-
-export type DocumentDiskChangeState =
-  | "clean"
-  | "changed"
-  | "conflict"
-  | "paused";
 
 export function shouldWarnBeforeUnload({
   activeDocumentPath,
@@ -86,15 +84,13 @@ export function shouldWarnBeforeUnload({
   activeDocumentPath: string | null;
   isDirty: boolean;
   saveState: DocumentSaveState;
-  diskChangeState: DocumentDiskChangeState;
+  diskChangeState: DiskChangeState;
 }) {
   return (
     !!activeDocumentPath &&
     (isDirty ||
-      saveState === "saving" ||
-      saveState === "unsaved" ||
-      saveState === "error" ||
-      diskChangeState !== "clean")
+      saveState !== "saved" ||
+      (diskChangeState !== "clean" && diskChangeState !== "unavailable"))
   );
 }
 
@@ -1409,75 +1405,182 @@ function createPreviewPage(): Page {
 
 export function PreviewPage() {
   const [backend] = useState(() => new PreviewBackend(createPreviewPage()));
-  const [previewPage, setPreviewPage] = useState<Page>(() =>
-    backend.getCurrentPage(),
-  );
-  const [previewForceResetKey, setPreviewForceResetKey] = useState<
-    string | null
-  >(null);
+  const [sync, setSync] = useState<DocumentSync | null>(null);
   const [editorViewMode, setEditorViewMode] = useState<DocumentEditorViewMode>(
     () => getDocumentEditorViewModeFromLocation("rich-text"),
   );
-  const [, setSaveState] = useState<DocumentSaveState>("saved");
 
   useEffect(() => () => backend.dispose(), [backend]);
+
+  // The preview runs through the same sync controller as a real file, with
+  // an in-memory backend and no tab channel.
+  useEffect(() => {
+    const controller = new DocumentSync({
+      backend,
+      path: PREVIEW_DOCUMENT_PATH,
+      tabId: "preview",
+      initialPage: backend.getCurrentPage(),
+    });
+    controller.start();
+    setSync(controller);
+    return () => controller.dispose();
+  }, [backend]);
 
   useEffect(() => {
     document.title = "Roughdraft Preview";
   }, []);
 
-  const handleSaveDocument = useCallback(
-    async (_id: string, content: string) => {
-      const savedPage = await backend.saveMarkdownFile(
-        PREVIEW_DOCUMENT_PATH,
-        content,
-      );
-      setPreviewPage(savedPage);
-    },
-    [backend],
-  );
-
-  const handleResetPreview = useCallback(async () => {
-    const freshBackendPage = createPreviewPage();
-    const savedPage = await backend.saveMarkdownFile(
-      PREVIEW_DOCUMENT_PATH,
-      freshBackendPage.content,
-    );
-    setPreviewPage(savedPage);
-    setPreviewForceResetKey(`preview-reset:${Date.now()}`);
-  }, [backend]);
-
-  const handleCompletePreviewReview = useCallback(
-    async (options?: CompleteReviewOptions) => {
-      return backend.completeReview
-        ? backend.completeReview(PREVIEW_DOCUMENT_PATH, options)
-        : { delivered: false };
-    },
-    [backend],
-  );
-
   return (
     <main className="relative flex h-screen min-w-0 flex-col overflow-hidden bg-[#FCFCFC] dark:bg-background text-slate-950 dark:text-slate-50">
       <DocumentWorkspace
-        documentPage={previewPage}
+        sync={sync}
         activeDocumentPath={PREVIEW_DOCUMENT_PATH}
         documentCopyPath={PREVIEW_DOCUMENT_PATH}
         documentFilenameLabel={PREVIEW_DOCUMENT_PATH}
         documentEditorViewMode={editorViewMode}
         onDocumentEditorViewModeChange={setEditorViewMode}
-        onSaveDocument={handleSaveDocument}
-        onDocumentSaveStateChange={setSaveState}
-        onDocumentDirtyStateChange={() => {}}
-        onDocumentLocalContentChange={() => {}}
-        documentDiskChangeState="clean"
-        documentForceResetKey={previewForceResetKey}
-        onReloadDocumentFromDisk={handleResetPreview}
-        onKeepEditingWithoutAutosave={() => {}}
-        onOverwriteDocumentOnDisk={() => {}}
-        onCompleteReview={handleCompletePreviewReview}
         backend={backend}
       />
     </main>
+  );
+}
+
+// Start-up retries on its own after 1, 2 and 5 s, then waits for Retry.
+export const STARTUP_RETRY_DELAYS_MS = [1_000, 2_000, 5_000];
+// A missing file is checked again every 5 s until it appears.
+export const MISSING_FILE_POLL_MS = 5_000;
+
+type StartupState =
+  | { kind: "loading" }
+  | { kind: "homepage"; message: ReactNode | null }
+  | {
+      kind: "error";
+      message: string;
+      retryAt: number | null;
+      retrying: boolean;
+    }
+  | { kind: "missing" }
+  | { kind: "ready" };
+
+async function fileExists(backend: StorageBackend, relativePath: string) {
+  try {
+    return (await backend.getMarkdownFileState(relativePath)).exists;
+  } catch (error) {
+    if (!(error instanceof UnsupportedRouteError)) throw error;
+  }
+  // A server without the state route: ask for the page itself.
+  try {
+    await backend.getMarkdownFile(relativePath);
+    return true;
+  } catch (error) {
+    if (error instanceof MarkdownFileNotFoundError) return false;
+    throw error;
+  }
+}
+
+function describeStartupError(error: unknown) {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
+
+function StartupScreen({ children }: { children: ReactNode }) {
+  return (
+    <main className="flex h-screen min-w-0 items-center justify-center bg-[#FCFCFC] px-4 text-slate-950 dark:bg-background dark:text-slate-50">
+      <div className="w-full max-w-md rounded-[10px] border border-stone-200 bg-white p-5 shadow-[0_18px_44px_rgba(57,47,38,0.08)] dark:border-slate-800 dark:bg-card">
+        {children}
+      </div>
+    </main>
+  );
+}
+
+function StartupErrorScreen({
+  name,
+  message,
+  retryAt,
+  retrying,
+  onRetry,
+}: {
+  name: string;
+  message: string;
+  retryAt: number | null;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (retryAt === null) return;
+    const interval = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(interval);
+  }, [retryAt]);
+  const seconds =
+    retryAt === null ? null : Math.max(0, Math.ceil((retryAt - now) / 1000));
+
+  return (
+    <StartupScreen>
+      <div data-testid="startup-error" className="space-y-3">
+        <div className="flex items-start gap-2.5">
+          <AlertTriangle
+            className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400"
+            aria-hidden="true"
+          />
+          <p
+            data-testid="startup-error-message"
+            className="min-w-0 text-sm leading-6 break-words"
+          >
+            Could not load {name}: {message}
+          </p>
+        </div>
+        <p
+          data-testid="startup-error-retry-status"
+          className="text-xs leading-5 text-stone-500 dark:text-slate-400"
+        >
+          {retrying
+            ? "Trying again..."
+            : seconds !== null
+              ? `Trying again in ${seconds} s.`
+              : "Roughdraft stopped retrying on its own."}
+        </p>
+        <Button
+          type="button"
+          data-testid="startup-error-retry"
+          size="lg"
+          className="w-full rounded-[7px] text-sm font-semibold"
+          disabled={retrying}
+          onClick={onRetry}
+        >
+          <RefreshCcw className="size-4" />
+          Retry
+        </Button>
+      </div>
+    </StartupScreen>
+  );
+}
+
+function StartupFileMissingScreen({ path }: { path: string }) {
+  return (
+    <StartupScreen>
+      <div data-testid="startup-file-missing" className="space-y-2">
+        <div className="flex items-start gap-2.5">
+          <FileText
+            className="mt-0.5 size-4 shrink-0 text-stone-500 dark:text-slate-400"
+            aria-hidden="true"
+          />
+          <p className="min-w-0 text-sm leading-6 break-words">
+            File not found at{" "}
+            <span
+              data-testid="startup-file-missing-path"
+              className="font-mono text-[0.8rem]"
+            >
+              {path}
+            </span>
+          </p>
+        </div>
+        <p className="text-xs leading-5 text-stone-500 dark:text-slate-400">
+          Roughdraft checks every few seconds and opens the file when it
+          appears.
+        </p>
+      </div>
+    </StartupScreen>
   );
 }
 
@@ -1488,52 +1591,16 @@ export function App() {
     window.location.pathname === ROUGHDRAFT_FLAVORED_MARKDOWN_PATH;
   const isPreviewRoute = window.location.pathname === PREVIEW_PATH;
   const [backend, setBackend] = useState<StorageBackend | null>(null);
-  const [documentPage, setDocumentPage] = useState<Page | null>(null);
-  const [activeDocumentPath, setActiveDocumentPath] = useState<string | null>(
-    initialRequestedPathState.documentPath,
-  );
-  const [documentSaveState, setDocumentSaveState] =
-    useState<DocumentSaveState>("saved");
-  const [documentDiskChangeState, setDocumentDiskChangeState] =
-    useState<DocumentDiskChangeState>("clean");
-  const [documentForceResetKey, setDocumentForceResetKey] = useState<
-    string | null
-  >(null);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [sync, setSync] = useState<DocumentSync | null>(null);
+  const [startup, setStartup] = useState<StartupState>({ kind: "loading" });
+  const [startAttempt, setStartAttempt] = useState(0);
+  const autoRetriesRef = useRef(0);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [documentEditorViewMode, setDocumentEditorViewMode] = useState(() =>
     getDocumentEditorViewModeFromLocation("rich-text"),
   );
-  const backendRef = useRef<StorageBackend | null>(null);
-  const documentPageRef = useRef<Page | null>(null);
-  const activeDocumentPathRef = useRef<string | null>(activeDocumentPath);
-  const documentDirtyRef = useRef(false);
-  const documentSaveStateRef = useRef<DocumentSaveState>("saved");
-  const documentDraftContentRef = useRef<string | null>(null);
-
-  backendRef.current = backend;
-  documentPageRef.current = documentPage;
-  activeDocumentPathRef.current = activeDocumentPath;
-  documentSaveStateRef.current = documentSaveState;
-
-  const applyDocumentPage = useCallback((nextDocument: Page) => {
-    documentPageRef.current = nextDocument;
-    setDocumentPage(nextDocument);
-    documentDraftContentRef.current = nextDocument.content;
-  }, []);
-
-  const loadDocument = useCallback(
-    async (nextBackend: StorageBackend, relativePath: string) => {
-      const nextDocument = await nextBackend.getMarkdownFile(relativePath);
-      applyDocumentPage(nextDocument);
-      setActiveDocumentPath(relativePath);
-      documentDirtyRef.current = false;
-      setDocumentDiskChangeState("clean");
-      return nextDocument;
-    },
-    [applyDocumentPage],
-  );
+  const activeDocumentPath = sync?.path ?? null;
+  const { documentPath, projectPath, rawPath } = requestedPathState;
 
   useEffect(() => {
     let cancelled = false;
@@ -1552,11 +1619,13 @@ export function App() {
     };
   }, []);
 
+  // Legacy open-requests stream. A batch 2 server delivers open requests
+  // on the tab channel instead, so the stream closes at the first hello and
+  // stops counting against the browser's six-connection limit.
   useEffect(() => {
+    if (sync?.getView().channelSupported) return;
     const tabId = getOrCreateTabId(readSessionStorage());
-    const source = new EventSource(
-      buildOpenRequestsUrl(requestedPathState.rawPath, tabId),
-    );
+    const source = new EventSource(buildOpenRequestsUrl(rawPath, tabId));
     const handleOpenRequest = (event: Event) => {
       handleOpenRequestEvent((event as MessageEvent<string>).data, {
         currentHref: window.location.href,
@@ -1567,62 +1636,108 @@ export function App() {
     };
 
     source.addEventListener("open-request", handleOpenRequest);
+    const stopHello = sync?.onHello(() => {
+      source.removeEventListener("open-request", handleOpenRequest);
+      source.close();
+    });
 
     return () => {
+      stopHello?.();
       source.removeEventListener("open-request", handleOpenRequest);
       source.close();
     };
-  }, [requestedPathState.rawPath]);
+  }, [rawPath, sync]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: startAttempt is the retry trigger; bumping it runs start-up again
   useEffect(() => {
     let cancelled = false;
+    let created: DocumentSync | null = null;
+    let retryTimer: number | null = null;
 
     const initialize = async () => {
-      setLoading(true);
-      setLoadError(null);
-      setDocumentPage(null);
+      setStartup((current) =>
+        current.kind === "error"
+          ? { ...current, retrying: true }
+          : current.kind === "missing"
+            ? current
+            : { kind: "loading" },
+      );
 
       try {
-        const detectedBackend = await detectBackend();
+        const detectedBackend = await detectBackend({
+          requireServer: !!rawPath,
+        });
         if (cancelled) return;
 
         setBackend(detectedBackend);
 
-        if (!requestedPathState.rawPath) {
-          setActiveDocumentPath(null);
-          setLoading(false);
+        if (!rawPath) {
+          setStartup({ kind: "homepage", message: null });
           return;
         }
 
-        syncRequestedPathInUrl(requestedPathState.rawPath);
+        syncRequestedPathInUrl(rawPath);
 
-        if (
-          !requestedPathState.projectPath ||
-          !requestedPathState.documentPath
-        ) {
-          setActiveDocumentPath(null);
-          setLoadError("Roughdraft now opens one .md file at a time.");
-          setLoading(false);
+        if (!projectPath || !documentPath) {
+          setStartup({
+            kind: "homepage",
+            message: "Roughdraft now opens one .md file at a time.",
+          });
           return;
         }
 
         if (detectedBackend.canManageProjects) {
-          await detectedBackend.openProject(requestedPathState.projectPath);
+          await detectedBackend.openProject(projectPath);
         }
-
         if (cancelled) return;
 
-        await loadDocument(detectedBackend, requestedPathState.documentPath);
+        const page = await detectedBackend.getMarkdownFile(documentPath);
         if (cancelled) return;
 
-        setLoading(false);
+        const controller: DocumentSync = new DocumentSync({
+          backend: detectedBackend,
+          path: documentPath,
+          tabId: getOrCreateTabId(readSessionStorage()),
+          initialPage: page,
+          onOpenRequest: (request) =>
+            handleOpenRequestEvent(JSON.stringify(request), {
+              currentHref: window.location.href,
+              focus: () => window.focus(),
+              acknowledge: (requestId) => {
+                if (!controller.acknowledgeOpenRequest(requestId)) {
+                  void acknowledgeOpenRequest(requestId);
+                }
+              },
+              navigate: (href) => window.location.assign(href),
+            }),
+        });
+        created = controller;
+        controller.start();
+        autoRetriesRef.current = 0;
+        setSync(controller);
+        setStartup({ kind: "ready" });
       } catch (error) {
         if (cancelled) return;
-
         console.error("Failed to open markdown file:", error);
-        setActiveDocumentPath(null);
-        setLoadError("Could not open that markdown file.");
-        setLoading(false);
+
+        if (error instanceof MarkdownFileNotFoundError) {
+          setStartup({ kind: "missing" });
+          return;
+        }
+
+        const delay = STARTUP_RETRY_DELAYS_MS[autoRetriesRef.current];
+        setStartup({
+          kind: "error",
+          message: describeStartupError(error),
+          retryAt: delay === undefined ? null : Date.now() + delay,
+          retrying: false,
+        });
+        if (delay !== undefined) {
+          autoRetriesRef.current += 1;
+          retryTimer = window.setTimeout(() => {
+            setStartAttempt((attempt) => attempt + 1);
+          }, delay);
+        }
       }
     };
 
@@ -1630,20 +1745,37 @@ export function App() {
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      created?.dispose();
     };
-  }, [
-    loadDocument,
-    requestedPathState.documentPath,
-    requestedPathState.projectPath,
-    requestedPathState.rawPath,
-  ]);
+  }, [documentPath, projectPath, rawPath, startAttempt]);
+
+  // A file that is not there yet: check every 5 s and open it once it is.
+  const startupKind = startup.kind;
+  useEffect(() => {
+    if (startupKind !== "missing" || !backend || !documentPath) return;
+    let cancelled = false;
+    const interval = window.setInterval(() => {
+      void fileExists(backend, documentPath)
+        .then((exists) => {
+          if (exists && !cancelled) setStartAttempt((attempt) => attempt + 1);
+        })
+        .catch(() => {
+          // The server is not answering; keep checking.
+        });
+    }, MISSING_FILE_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [backend, documentPath, startupKind]);
 
   useEffect(() => {
     const workspaceTitlePath = activeDocumentPath
       ? formatWorkspacePathForDisplay(
           backend?.info.projectPath
             ? joinPath(backend.info.projectPath, activeDocumentPath)
-            : requestedPathState.rawPath,
+            : rawPath,
         )
       : null;
 
@@ -1657,72 +1789,20 @@ export function App() {
     backend,
     isRoughdraftFlavoredMarkdownRoute,
     isPreviewRoute,
-    requestedPathState.rawPath,
+    rawPath,
   ]);
 
-  const handleSaveDocument = useCallback(
-    async (id: string, content: string) => {
-      if (!activeDocumentPath) return;
-      const expectedVersion =
-        documentPageRef.current?.id === id
-          ? documentPageRef.current.version
-          : undefined;
-
-      let savedDocument: Page | undefined;
-      try {
-        savedDocument = await backendRef.current?.saveMarkdownFile(
-          activeDocumentPath,
-          content,
-          expectedVersion,
-        );
-      } catch (error) {
-        if (error instanceof MarkdownFileConflictError) {
-          setDocumentDiskChangeState("conflict");
-        }
-        throw error;
-      }
-
-      const firstLine = content.split("\n")[0] || "";
-      const fallbackTitle = id.split("/").at(-1) || id;
-      const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-      const nextDocument = savedDocument ?? {
-        id,
-        content,
-        title,
-        version: expectedVersion,
-      };
-
-      applyDocumentPage(nextDocument);
-      documentDirtyRef.current = false;
-      setDocumentDiskChangeState("clean");
-    },
-    [activeDocumentPath, applyDocumentPage],
-  );
-
-  const handleDocumentDirtyStateChange = useCallback((isDirty: boolean) => {
-    documentDirtyRef.current = isDirty;
-  }, []);
-
-  const handleDocumentSaveStateChange = useCallback(
-    (state: DocumentSaveState) => {
-      documentSaveStateRef.current = state;
-      setDocumentSaveState(state);
-    },
-    [],
-  );
-
-  const handleDocumentLocalContentChange = useCallback((markdown: string) => {
-    documentDraftContentRef.current = markdown;
-  }, []);
-
   useEffect(() => {
+    if (!sync) return;
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      const view = sync.getView();
+      const { saveState, diskState } = getSyncStatus(view);
       if (
         !shouldWarnBeforeUnload({
-          activeDocumentPath: activeDocumentPathRef.current,
-          isDirty: documentDirtyRef.current,
-          saveState: documentSaveStateRef.current,
-          diskChangeState: documentDiskChangeState,
+          activeDocumentPath: sync.path,
+          isDirty: view.dirty,
+          saveState,
+          diskChangeState: diskState,
         })
       ) {
         return;
@@ -1734,147 +1814,7 @@ export function App() {
 
     window.addEventListener("beforeunload", handleBeforeUnload);
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-  }, [documentDiskChangeState]);
-
-  const handleReloadDocumentFromDisk = useCallback(async () => {
-    const currentBackend = backendRef.current;
-    const currentPath = activeDocumentPathRef.current;
-    if (!currentBackend || !currentPath) return;
-
-    const nextDocument = await currentBackend.getMarkdownFile(currentPath);
-    applyDocumentPage(nextDocument);
-    documentDirtyRef.current = false;
-    setDocumentDiskChangeState("clean");
-    setDocumentForceResetKey(
-      `${currentPath}:${nextDocument.version ?? Date.now()}`,
-    );
-  }, [applyDocumentPage]);
-
-  const handleKeepEditingWithoutAutosave = useCallback(() => {
-    setDocumentDiskChangeState("paused");
-  }, []);
-
-  const handleOverwriteDocumentOnDisk = useCallback(async () => {
-    const currentBackend = backendRef.current;
-    const currentPath = activeDocumentPathRef.current;
-    const currentDocument = documentPageRef.current;
-    if (!currentBackend || !currentPath || !currentDocument) return;
-
-    const content = documentDraftContentRef.current ?? currentDocument.content;
-    const firstLine = content.split("\n")[0] || "";
-    const fallbackTitle =
-      currentDocument.id.split("/").at(-1) || currentDocument.id;
-    const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-    const savedDocument = (await currentBackend.saveMarkdownFile(
-      currentPath,
-      content,
-    )) ?? {
-      ...currentDocument,
-      content,
-      title,
-    };
-
-    applyDocumentPage(savedDocument);
-    documentDirtyRef.current = false;
-    handleDocumentSaveStateChange("saved");
-    setDocumentDiskChangeState("clean");
-    setDocumentForceResetKey(
-      `${currentPath}:${savedDocument.version ?? Date.now()}:overwrite`,
-    );
-  }, [applyDocumentPage, handleDocumentSaveStateChange]);
-
-  const handleCompleteReview = useCallback(
-    async (options?: CompleteReviewOptions) => {
-      const currentBackend = backendRef.current;
-      const currentPath = activeDocumentPathRef.current;
-      const currentDocument = documentPageRef.current;
-      if (!currentBackend || !currentPath || !currentDocument) {
-        return { delivered: false };
-      }
-
-      const content =
-        documentDraftContentRef.current ?? currentDocument.content;
-      const expectedVersion = currentDocument.version;
-      const firstLine = content.split("\n")[0] || "";
-      const fallbackTitle =
-        currentDocument.id.split("/").at(-1) || currentDocument.id;
-      const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-
-      // The editor flushed its own save before this call. Only write again
-      // when the draft still differs from what the page already holds.
-      if (content !== currentDocument.content) {
-        const savedDocument = (await currentBackend.saveMarkdownFile(
-          currentPath,
-          content,
-          expectedVersion,
-        )) ?? {
-          ...currentDocument,
-          content,
-          title,
-        };
-        applyDocumentPage(savedDocument);
-      }
-      documentDirtyRef.current = false;
-      setDocumentDiskChangeState("clean");
-
-      return currentBackend.completeReview
-        ? currentBackend.completeReview(currentPath, options)
-        : { delivered: false };
-    },
-    [applyDocumentPage],
-  );
-
-  useEffect(() => {
-    if (!backend?.watchMarkdownFile || !activeDocumentPath) return;
-
-    let disposed = false;
-    const stopWatching = backend.watchMarkdownFile(
-      activeDocumentPath,
-      (event) => {
-        if (disposed || event.path !== activeDocumentPath) return;
-
-        const currentDocument = documentPageRef.current;
-        if (event.version && currentDocument?.version === event.version) {
-          return;
-        }
-
-        if (!event.exists) {
-          setDocumentDiskChangeState("changed");
-          return;
-        }
-
-        if (documentDiskChangeState === "paused") {
-          return;
-        }
-
-        if (documentDirtyRef.current) {
-          setDocumentDiskChangeState("changed");
-          return;
-        }
-
-        void (async () => {
-          const currentBackend = backendRef.current;
-          const currentPath = activeDocumentPathRef.current;
-          if (!currentBackend || !currentPath || disposed) return;
-
-          try {
-            const nextDocument =
-              await currentBackend.getMarkdownFile(currentPath);
-            if (disposed) return;
-            applyDocumentPage(nextDocument);
-            setDocumentDiskChangeState("clean");
-          } catch (error) {
-            console.error("Failed to reload changed markdown file:", error);
-          }
-        })();
-      },
-    );
-
-    return () => {
-      disposed = true;
-      stopWatching();
-    };
-  }, [activeDocumentPath, applyDocumentPage, backend, documentDiskChangeState]);
+  }, [sync]);
 
   const handleDocumentEditorViewModeChange = useCallback(
     (nextMode: DocumentEditorViewMode) => {
@@ -1891,7 +1831,12 @@ export function App() {
     [],
   );
 
-  if (loading) {
+  const handleStartupRetry = useCallback(() => {
+    autoRetriesRef.current = 0;
+    setStartAttempt((attempt) => attempt + 1);
+  }, []);
+
+  if (startup.kind === "loading") {
     return (
       <div
         className="h-screen bg-[#FCFCFC] dark:bg-background"
@@ -1908,21 +1853,44 @@ export function App() {
     return <PreviewPage />;
   }
 
-  if (!requestedPathState.rawPath || loadError) {
+  if (!rawPath || startup.kind === "homepage") {
     return (
       <Homepage
-        message={loadError ?? <HomepageSubtitle />}
+        message={
+          (startup.kind === "homepage" ? startup.message : null) ?? (
+            <HomepageSubtitle />
+          )
+        }
         updateStatus={updateStatus}
       />
     );
   }
 
   const documentAbsolutePath =
-    activeDocumentPath && backend?.info.projectPath
-      ? joinPath(backend.info.projectPath, activeDocumentPath)
-      : requestedPathState.rawPath;
+    (activeDocumentPath ?? documentPath) && backend?.info.projectPath
+      ? joinPath(
+          backend.info.projectPath,
+          activeDocumentPath ?? documentPath ?? "",
+        )
+      : rawPath;
   const documentFilenameLabel =
     getPathLeaf(documentAbsolutePath ?? activeDocumentPath) ?? "Untitled.md";
+
+  if (startup.kind === "error") {
+    return (
+      <StartupErrorScreen
+        name={documentFilenameLabel}
+        message={startup.message}
+        retryAt={startup.retryAt}
+        retrying={startup.retrying}
+        onRetry={handleStartupRetry}
+      />
+    );
+  }
+
+  if (startup.kind === "missing") {
+    return <StartupFileMissingScreen path={documentAbsolutePath ?? rawPath} />;
+  }
 
   return (
     <main className="relative flex h-screen min-w-0 flex-col overflow-hidden bg-[#FCFCFC] dark:bg-background text-slate-950 dark:text-slate-50">
@@ -1934,22 +1902,12 @@ export function App() {
         </div>
       ) : null}
       <DocumentWorkspace
-        documentPage={documentPage}
+        sync={sync}
         activeDocumentPath={activeDocumentPath}
         documentCopyPath={documentAbsolutePath}
         documentFilenameLabel={documentFilenameLabel}
         documentEditorViewMode={documentEditorViewMode}
         onDocumentEditorViewModeChange={handleDocumentEditorViewModeChange}
-        onSaveDocument={handleSaveDocument}
-        onDocumentSaveStateChange={handleDocumentSaveStateChange}
-        onDocumentDirtyStateChange={handleDocumentDirtyStateChange}
-        onDocumentLocalContentChange={handleDocumentLocalContentChange}
-        documentDiskChangeState={documentDiskChangeState}
-        documentForceResetKey={documentForceResetKey}
-        onReloadDocumentFromDisk={handleReloadDocumentFromDisk}
-        onKeepEditingWithoutAutosave={handleKeepEditingWithoutAutosave}
-        onOverwriteDocumentOnDisk={handleOverwriteDocumentOnDisk}
-        onCompleteReview={handleCompleteReview}
         backend={backend}
       />
     </main>

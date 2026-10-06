@@ -3,12 +3,11 @@ export interface Page {
   title: string;
   content: string;
   version?: string;
-}
-
-export interface MarkdownFileChangeEvent {
-  path: string;
-  exists: boolean;
-  version: string | null;
+  // Batch 2 server fields. Older servers and the in-browser backends leave
+  // them out; the sync controller derives a content hash when they do.
+  contentHash?: string;
+  seq?: number;
+  instanceId?: string;
 }
 
 export class MarkdownFileConflictError extends Error {
@@ -19,6 +18,123 @@ export class MarkdownFileConflictError extends Error {
     this.name = "MarkdownFileConflictError";
     this.current = current;
   }
+}
+
+// The file does not exist (GET or PUT answered 404 for a valid path).
+export class MarkdownFileNotFoundError extends Error {
+  path: string;
+
+  constructor(path: string, message = `File not found: ${path}`) {
+    super(message);
+    this.name = "MarkdownFileNotFoundError";
+    this.path = path;
+  }
+}
+
+// The request never got an answer (connection refused, reset, DNS, abort).
+export class ServerUnreachableError extends Error {
+  constructor(route: string, cause?: unknown) {
+    super(
+      `The Roughdraft server did not answer (${route})${
+        cause instanceof Error && cause.message ? `: ${cause.message}` : ""
+      }`,
+    );
+    this.name = "ServerUnreachableError";
+  }
+}
+
+// The server answered with a status the app does not expect.
+export class ServerResponseError extends Error {
+  status: number;
+  route: string;
+
+  constructor(route: string, status: number, detail?: string) {
+    super(
+      `The Roughdraft server answered ${status} (${route})${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
+    this.name = "ServerResponseError";
+    this.status = status;
+    this.route = route;
+  }
+}
+
+// The server predates a route (a batch 1 server has no state route and no
+// tab channel). Callers fall back to the older route.
+export class UnsupportedRouteError extends Error {
+  constructor(route: string) {
+    super(`The Roughdraft server does not support ${route}`);
+    this.name = "UnsupportedRouteError";
+  }
+}
+
+// `GET /api/markdown-file/state` and the `document` field of `hello`.
+export interface MarkdownFileState {
+  exists: boolean;
+  available: boolean;
+  reason?: string | null;
+  version: string | null;
+  contentHash: string | null;
+  seq: number;
+  instanceId?: string;
+  tabs?: number;
+}
+
+export interface SaveMarkdownFileOptions {
+  expectedContentHash?: string;
+  tabId?: string;
+}
+
+// Tab channel wire types (batch 2 contract, "Tab channel").
+export type TabServerMessage =
+  | {
+      type: "hello";
+      instanceId: string;
+      document: MarkdownFileState;
+      tabs: number;
+      watchers: number;
+      session: SessionRecord | null;
+      handoff: HandoffRecord | null;
+      latestSequence: number | null;
+    }
+  | {
+      type: "change";
+      seq: number;
+      exists: boolean;
+      available: boolean;
+      reason?: string | null;
+      version: string | null;
+      contentHash: string | null;
+      origin: "tab" | "outside" | "unknown";
+      tabId?: string;
+    }
+  | { type: "watchers"; count: number }
+  | { type: "handoff"; handoff: HandoffRecord }
+  | { type: "open-request"; requestId: string; url: string }
+  | { type: "ping"; seq: number };
+
+export type TabClientMessage =
+  | {
+      type: "presence";
+      visible: boolean;
+      dirty: boolean;
+      conflict: boolean;
+      baseHash: string | null;
+    }
+  | { type: "open-request-ack"; requestId: string }
+  | { type: "pong"; seq: number };
+
+export interface TabChannelHandlers {
+  onOpen: () => void;
+  onMessage: (message: TabServerMessage) => void;
+  onClose: () => void;
+}
+
+// One socket. The sync controller opens a new channel to reconnect.
+export interface TabChannel {
+  send: (message: TabClientMessage) => void;
+  close: () => void;
 }
 
 export interface StoredAsset {
@@ -77,14 +193,10 @@ export interface CompleteReviewOptions {
   overallComment?: string;
   // Client-generated id, reused until a 2xx arrives so a retry is idempotent.
   handoffId?: string;
-}
-
-export interface ReviewWatchStatus {
-  watching: boolean;
-  watcherCount: number;
-  tabs?: number;
-  handoff?: HandoffRecord | null;
-  session?: SessionRecord | null;
+  // The version the tab's draft is based on. The server answers 409 with the
+  // current page when the file moved on.
+  expectedVersion?: string;
+  expectedContentHash?: string;
 }
 
 export interface BackendInfo {
@@ -102,16 +214,18 @@ export interface StorageBackend {
     relativePath: string,
     content: string,
     expectedVersion?: string,
+    options?: SaveMarkdownFileOptions,
   ): Promise<Page | undefined>;
-  watchMarkdownFile?(
+  getMarkdownFileState(relativePath: string): Promise<MarkdownFileState>;
+  openTabChannel(
     relativePath: string,
-    onChange: (event: MarkdownFileChangeEvent) => void,
-  ): () => void;
+    tabId: string,
+    handlers: TabChannelHandlers,
+  ): TabChannel;
   completeReview?(
     relativePath: string,
     options?: CompleteReviewOptions,
   ): Promise<CompleteReviewResult>;
-  getReviewWatchStatus?(relativePath: string): Promise<ReviewWatchStatus>;
   saveAsset(file: File): Promise<StoredAsset>;
   resolveFileUrl(path: string): string | null;
   openProject(path: string): Promise<void>;

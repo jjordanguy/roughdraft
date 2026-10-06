@@ -1,4 +1,12 @@
-import type { BackendInfo, Page, StorageBackend, StoredAsset } from "./storage";
+import { localContentHash } from "./content-hash";
+import type {
+  BackendInfo,
+  MarkdownFileState,
+  Page,
+  StorageBackend,
+  StoredAsset,
+  TabChannel,
+} from "./storage";
 
 const PAGES_KEY = "roughdraft:pages";
 const ASSETS_KEY = "roughdraft:assets";
@@ -111,6 +119,23 @@ export class LocalStorageBackend implements StorageBackend {
     const id = relativePath.replace(/\.md$/i, "");
     await this.savePage(id, content);
     return undefined;
+  }
+
+  async getMarkdownFileState(relativePath: string): Promise<MarkdownFileState> {
+    const page = readPages()[relativePath.replace(/\.md$/i, "")];
+    return {
+      exists: !!page,
+      available: true,
+      version: page?.version ?? null,
+      contentHash: page ? localContentHash(page.content) : null,
+      seq: 0,
+    };
+  }
+
+  // Browser storage has no server to push changes, so the channel stays
+  // silent; the sync controller still re-checks on focus and visibility.
+  openTabChannel(): TabChannel {
+    return { send() {}, close() {} };
   }
 
   async completeReview(

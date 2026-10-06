@@ -1,9 +1,11 @@
 /**
  * The agent-facing error contract shared by the CLI and the MCP server.
  *
- * Exit codes: 0 success, 1 internal bug (and a failed `doctor <file>`), 2 the
- * command or path was wrong, 3 the server could not be started, reached or
- * kept, 4 the caller's `--timeout` elapsed, 130 and 143 SIGINT and SIGTERM.
+ * Exit codes: 0 success, 1 internal bug (and a failed `doctor <file>`, and a
+ * review write that was refused with nothing written), 2 the command or path
+ * was wrong, 3 the server could not be started, reached or kept, 4 the
+ * caller's `--timeout` elapsed (or the tab stayed dirty past `apply --wait`),
+ * 130 and 143 SIGINT and SIGTERM.
  */
 
 export const EXIT_OK = 0;
@@ -31,6 +33,12 @@ export type CliErrorCode =
   | "HANDOFF_NOT_FOUND"
   | "WAKE_ROUTE_NOT_FOUND"
   | "WAKE_ROUTE_FAILED"
+  | "REVIEW_REFUSED"
+  | "LEGACY_FORMAT"
+  | "NORMALIZE_REFUSED"
+  | "VERSION_CONFLICT"
+  | "TAB_DIRTY"
+  | "ROUND_NOT_FOUND"
   | "INTERNAL";
 
 const EXIT_BY_CODE: Record<CliErrorCode, number> = {
@@ -50,6 +58,13 @@ const EXIT_BY_CODE: Record<CliErrorCode, number> = {
   HANDOFF_NOT_FOUND: EXIT_USAGE,
   WAKE_ROUTE_NOT_FOUND: EXIT_USAGE,
   WAKE_ROUTE_FAILED: EXIT_SERVER,
+  // Review writes: 1 means refused, nothing written (like a failed doctor).
+  REVIEW_REFUSED: EXIT_INTERNAL,
+  LEGACY_FORMAT: EXIT_INTERNAL,
+  NORMALIZE_REFUSED: EXIT_INTERNAL,
+  VERSION_CONFLICT: EXIT_INTERNAL,
+  TAB_DIRTY: EXIT_TIMEOUT,
+  ROUND_NOT_FOUND: EXIT_USAGE,
   INTERNAL: EXIT_INTERNAL,
 };
 
@@ -60,6 +75,8 @@ const RETRYABLE: ReadonlySet<CliErrorCode> = new Set<CliErrorCode>([
   "WATCH_TIMEOUT",
   "INTERRUPTED",
   "WAKE_ROUTE_FAILED",
+  "VERSION_CONFLICT",
+  "TAB_DIRTY",
 ]);
 
 export interface CliErrorOptions {

@@ -24,7 +24,25 @@ export type TabPresenceUpdate = Partial<
   Pick<TabPresence, "visible" | "dirty" | "conflict" | "baseHash">
 >;
 
-export type RegistryChange = "tabs" | "watchers";
+export type RegistryChange = "tabs" | "watchers" | "round";
+
+/**
+ * The "AI editing" flag of a document: `roughdraft round` opens it, `apply`
+ * closes it, and an open round turns `stalled` after `roundStallMs` (30
+ * minutes) so the tab can tell Jordan he is free. Kept in memory only.
+ */
+export interface RoundFlag {
+  roundId: string;
+  state: "open" | "closed" | "stalled";
+  openedAt: string;
+  updatedAt: string;
+  stalledAt: string | null;
+  closedAt: string | null;
+}
+
+export type RoundFlagResult =
+  | { ok: true; round: RoundFlag }
+  | { ok: false; round: RoundFlag };
 export type RegistryListener = (key: string, change: RegistryChange) => void;
 
 export interface WatcherPresence {
@@ -42,6 +60,10 @@ export interface DocumentView extends DocumentRecord {
    * views rebuilt from the log file on disk (no presence) still type-check.
    */
   tabsDirty?: number;
+  /** Tabs that reported a conflict they have not settled. */
+  tabsConflict?: number;
+  /** The document's round flag; null when no round was seen. */
+  round?: RoundFlag | null;
   watchers: number;
   pendingHandoffs: number;
   url: string;
@@ -64,8 +86,10 @@ export interface RegistryOptions {
   now?: () => number;
   tabGraceMs?: number;
   documentIdleMs?: number;
+  roundStallMs?: number;
 }
 
+export const ROUND_STALL_MS = 30 * 60 * 1000;
 export const TAB_GRACE_MS = 30_000;
 export const DOCUMENT_IDLE_MS = 60 * 60 * 1000;
 
@@ -121,6 +145,11 @@ export class DocumentRegistry {
   private readonly tabGraceMs: number;
   private readonly documentIdleMs: number;
   private readonly listeners = new Set<RegistryListener>();
+  private readonly roundStallMs: number;
+  private readonly rounds = new Map<
+    string,
+    { flag: RoundFlag; timer: NodeJS.Timeout | null }
+  >();
 
   constructor(options: RegistryOptions) {
     this.log = options.log;
@@ -128,6 +157,73 @@ export class DocumentRegistry {
     this.now = options.now ?? Date.now;
     this.tabGraceMs = options.tabGraceMs ?? TAB_GRACE_MS;
     this.documentIdleMs = options.documentIdleMs ?? DOCUMENT_IDLE_MS;
+    this.roundStallMs = options.roundStallMs ?? ROUND_STALL_MS;
+  }
+
+  /**
+   * Opens or closes the round flag. A new open replaces any earlier round; a
+   * close must name the round that is open (or stalled), else it is refused.
+   */
+  setRound(
+    identity: DocumentIdentity,
+    input: { roundId: string; state: "open" | "closed" },
+  ): RoundFlagResult {
+    this.touch(identity, { keepExistingIdentity: true });
+    const key = identity.key;
+    const existing = this.rounds.get(key);
+    const at = new Date(this.now()).toISOString();
+    if (input.state === "closed") {
+      if (
+        existing &&
+        existing.flag.state !== "closed" &&
+        existing.flag.roundId !== input.roundId
+      ) {
+        return { ok: false, round: { ...existing.flag } };
+      }
+      if (existing?.timer) clearTimeout(existing.timer);
+      const flag: RoundFlag = {
+        roundId: input.roundId,
+        state: "closed",
+        openedAt: existing?.flag.openedAt ?? at,
+        updatedAt: at,
+        stalledAt: existing?.flag.stalledAt ?? null,
+        closedAt: at,
+      };
+      this.rounds.set(key, { flag, timer: null });
+      this.emit(key, "round");
+      return { ok: true, round: { ...flag } };
+    }
+    if (existing?.timer) clearTimeout(existing.timer);
+    const flag: RoundFlag = {
+      roundId: input.roundId,
+      state: "open",
+      openedAt: at,
+      updatedAt: at,
+      stalledAt: null,
+      closedAt: null,
+    };
+    const entry: { flag: RoundFlag; timer: NodeJS.Timeout | null } = {
+      flag,
+      timer: null,
+    };
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      if (this.rounds.get(key) !== entry || flag.state !== "open") return;
+      const stalledAt = new Date(this.now()).toISOString();
+      flag.state = "stalled";
+      flag.stalledAt = stalledAt;
+      flag.updatedAt = stalledAt;
+      this.emit(key, "round");
+    }, this.roundStallMs);
+    entry.timer.unref?.();
+    this.rounds.set(key, entry);
+    this.emit(key, "round");
+    return { ok: true, round: { ...flag } };
+  }
+
+  round(key: string): RoundFlag | null {
+    const entry = this.rounds.get(key);
+    return entry ? { ...entry.flag } : null;
   }
 
   touch(
@@ -227,6 +323,10 @@ export class DocumentRegistry {
     return this.tabs(key).filter((tab) => tab.dirty).length;
   }
 
+  tabsConflict(key: string): number {
+    return this.tabs(key).filter((tab) => tab.conflict).length;
+  }
+
   onChange(listener: RegistryListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -271,6 +371,8 @@ export class DocumentRegistry {
       ...structuredClone(document),
       tabs: this.tabCount(key),
       tabsDirty: this.tabsDirty(key),
+      tabsConflict: this.tabsConflict(key),
+      round: this.round(key),
       watchers: this.watcherCount(key),
       pendingHandoffs: document.handoffs.filter(isUnacknowledged).length,
       url: documentUrl(this.publicBaseUrl, document.documentPath),

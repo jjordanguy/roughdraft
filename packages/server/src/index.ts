@@ -150,6 +150,8 @@ interface CreateAppOptions {
   watchReleaseMs?: number;
   /** Tab channel `ping` interval (default 15 s). */
   tabPingMs?: number;
+  /** An open round turns "stalled" after this long (default 30 minutes). */
+  roundStallMs?: number;
 }
 
 interface CreateAppResult {
@@ -562,7 +564,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const openRequestClients = new Set<OpenRequestClient>();
   const openRequestAcks = new Map<string, () => void>();
   const log = new ReviewLog({ stateDir: stateDir ?? undefined });
-  const registry = new DocumentRegistry({ log, publicBaseUrl });
+  const registry = new DocumentRegistry({
+    log,
+    publicBaseUrl,
+    roundStallMs: options.roundStallMs,
+  });
   const reviewEvents = new ReviewEventQueue({
     nextSequence: log.peekNextSequence(),
     seed: log.unacknowledgedEvents(),
@@ -1380,6 +1386,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       watcherCount,
       tabs: registry.tabCount(key),
       tabsDirty: registry.tabsDirty(key),
+      tabsConflict: registry.tabsConflict(key),
+      round: registry.round(key),
       handoff: log.latestHandoff(key),
       session: log.get(key)?.session ?? null,
       latestSequence: reviewEvents.latestSequence(),
@@ -1403,6 +1411,35 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
     res.json(view);
+  });
+
+  // The "AI editing" flag: `roughdraft round` opens it, `apply` closes it.
+  app.post("/api/documents/round", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const roundId = optionalString(req.body?.roundId);
+    const state = req.body?.state;
+    if (!roundId || (state !== "open" && state !== "closed")) {
+      res.status(400).json({
+        error: 'roundId and state ("open" or "closed") are required',
+        code: "USAGE",
+      });
+      return;
+    }
+    const result = registry.setRound(targetIdentity(target), {
+      roundId,
+      state,
+    });
+    if (!result.ok) {
+      res.status(409).json({
+        error: `Round ${result.round.roundId} is open on this document`,
+        code: "ROUND_MISMATCH",
+        round: result.round,
+      });
+      return;
+    }
+    res.json({ ok: true, round: result.round });
   });
 
   app.post("/api/documents/session", (req, res) => {
@@ -1537,6 +1574,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         documentRegistry: true,
         handoffLog: true,
         wakeRoutes: true,
+        reviewRounds: true,
         tokenRequired: apiToken !== null,
       },
       warnings: [...log.warnings, ...wakeRoutes.warnings],

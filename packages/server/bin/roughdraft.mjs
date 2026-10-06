@@ -10,6 +10,8 @@ let reported = false;
 function lastResort(error) {
   if (reported) return;
   reported = true;
+  // The Claude Code guard hook fails open: no output, exit 0, the tool runs.
+  if (args[0] === "guard") process.exit(0);
   const message =
     error instanceof Error && error.message ? error.message : String(error);
   const code =

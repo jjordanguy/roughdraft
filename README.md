@@ -97,13 +97,41 @@ Every Done is written to the session log (`review-log.json` next to `server.json
 
 An agent can register the chat session that opened a file (`roughdraft open <file> --harness claude-code --session-label "..." --session-id <id>`) and a wake route for its harness (`roughdraft route add <harness> --command "<text>"` or `--url <url>`, then `roughdraft route test <harness>`). Done then also fires that route with the file path, the link, and your comment counts.
 
+### How the agent answers
+
+The agent never types review markup. It answers with commands that write the review block in one checked write each, or with a round:
+
+```bash
+roughdraft round ./draft.md            # clean.md, round.json, response.json, base.md
+# edit clean.md with a normal editing tool, fill in response.json
+roughdraft apply "<path printed by round>/response.json"
+```
+
+`round` acknowledges the waiting Done, writes a copy of the document with every review marker removed (`clean.md`), one entry per thread with its highlighted text, section, the paragraphs around it and earlier replies (`round.json`), a response template (`response.json`) and the file as it was (`base.md`) to `<stateDir>/rounds/<roundId>/`. It also tells the open tab that an agent is working (the round flag turns "stalled" after 30 minutes). `apply` rebases the clean.md edits onto the current file by content, keeps every highlight on its text or moves it with the edit, adds the replies, resolutions, decisions and the round note, puts back anything of the reviewer's that changed outside Roughdraft, and either writes it all or writes nothing and lists what to fix. It waits for an open tab with unsaved text to save first. A retry of an applied response answers `already-applied`.
+
+For one thread at a time:
+
+```bash
+roughdraft reply ./draft.md c1 "Cited the 2025 survey."
+roughdraft reply ./draft.md c1 - <<'EOF'
+Text with $dollars, `backticks` and "quotes", read from stdin.
+EOF
+roughdraft resolve ./draft.md c2 --summary "Named the approver."
+roughdraft accept ./draft.md s1            # or reject; --drop-replies when it has replies
+roughdraft note ./draft.md "Round 2: merged the timeline paragraphs."
+```
+
+Each command prints the new entry's id and the doctor breakdown. Writes go through the running server with a version check (rerun up to three times when the tab saved in between), or, with no server, through a temporary file and a rename after checking the file did not change. A file in an older review format is refused until `roughdraft doctor --fix` converts it; `roughdraft doctor --fix --dry-run --report report.md <files...>` writes one report over many files first.
+
+`roughdraft guard --claude-hook` is an optional Claude Code PreToolUse hook that keeps the agent's Edit, MultiEdit and Write tools off review markup and off a file with an open round. See [docs/fork/agent-procedure.md](docs/fork/agent-procedure.md) for the agent instructions and the settings entry.
+
 Experimental MCP clients can start the stdio server with:
 
 ```bash
 roughdraft mcp
 ```
 
-The MCP server exposes tools to read the review index, list pending feedback, watch review events, list open documents and handoffs, acknowledge handoffs, register a session, manage wake routes, append replies, and mark items resolved. CriticMarkup in the Markdown file remains the durable source of truth.
+The MCP server exposes tools to read the review index and the pending feedback (the round list), watch review events, list open documents and handoffs, acknowledge handoffs, register a session, manage wake routes, start and apply a round (`roughdraft_start_round`, `roughdraft_apply_round`), reply, resolve and add the round note as one-thread transactions (with an optional `expectedVersion`), and validate a document. A refused write comes back as an `isError` result listing every problem. CriticMarkup in the Markdown file remains the durable source of truth.
 
 ### Running Roughdraft on another machine
 
@@ -198,6 +226,15 @@ log                Show the session log
 route <action>     list | add <harness> | remove <harness> | test <harness>
 mcp                Start the experimental stdio MCP server
 doctor [path]      Diagnose setup or validate Markdown
+doctor --fix <file>  Convert an older review format (backup first)
+feedback <file>    List every review thread with its context
+round <file>       Start a round: clean copy, round list, response template
+apply <response>   Land a round in one checked write (- reads stdin)
+reply <file> <id> <text|->   Answer one thread
+resolve <file> <id>          Resolve one thread
+accept|reject <file> <sN>    Decide one suggestion
+note <file> <text|->         Add the agent's round note
+guard --claude-hook          Claude Code PreToolUse hook
 help agent         Print the agent setup prompt
 help criticmarkup  Show CriticMarkup examples
 agent-setup        Print the agent setup prompt
@@ -236,7 +273,20 @@ roughdraft doctor --json
 roughdraft doctor ./draft.md
 roughdraft doctor ./draft.md --json
 roughdraft doctor ./draft.md --strict
+roughdraft doctor --fix ./draft.md [--dry-run] [--json]
+roughdraft doctor --fix --dry-run --report report.md ./a.md ./b.md
+roughdraft feedback ./draft.md --json
+roughdraft round ./draft.md [--dir <dir>] [--agent-labels AI,Mike] [--no-ack] --json
+roughdraft apply <response.json | -> [--dry-run] [--skip-failed] [--wait <seconds>] --json
+roughdraft reply ./draft.md c1 "<text>" | - [--author <name>] --json
+roughdraft resolve ./draft.md c1 [--summary "<text>"] --json
+roughdraft accept ./draft.md s1 [--drop-replies] --json
+roughdraft reject ./draft.md s1 [--drop-replies] --json
+roughdraft note ./draft.md "<text>" | - [--author <name>] --json
+roughdraft guard --claude-hook
 ```
+
+`apply --dry-run` checks and reports without writing. `apply --skip-failed` drops failing threads (with the edits tied to them) and applies the rest. `apply --wait` sets how long it waits for a tab with unsaved text (default 10 seconds). `round --dir` writes the round files elsewhere; `apply` finds the round from the response's folder or by its `roundId`.
 
 `open` and `watch` return a Done that is already waiting (`--no-pending` waits for the next one only), and acknowledge what they return after printing it (`--no-ack` leaves it pending). `--after <sequence>` sets the cursor. A watcher that loses the server reconnects for `--reconnect` seconds (default 120) before it gives up.
 
@@ -245,17 +295,21 @@ Exit codes:
 ```text
 0        Done received (status "completed"), or the command succeeded (status "ok")
 1        Unexpected error (code INTERNAL); also `doctor <file>` when the file fails validation
-         (or has warnings, with --strict)
+         (or has warnings, with --strict); and a review write refused with nothing written:
+         REVIEW_REFUSED, LEGACY_FORMAT, NORMALIZE_REFUSED, VERSION_CONFLICT
 2        Bad command or path: USAGE, PATH_NOT_FOUND, NOT_MARKDOWN, PATH_UNREADABLE,
-         HANDOFF_NOT_FOUND, WAKE_ROUTE_NOT_FOUND
+         HANDOFF_NOT_FOUND, WAKE_ROUTE_NOT_FOUND, ROUND_NOT_FOUND
 3        Server problem: SERVER_START_FAILED, SERVER_UNREACHABLE, SERVER_LOST,
          SERVER_VERSION_MISMATCH, SERVER_NOT_MANAGED, SERVER_STOP_FAILED, HTTP_ERROR,
          WAKE_ROUTE_FAILED
-4        WATCH_TIMEOUT: the --timeout elapsed
+4        WATCH_TIMEOUT: the --timeout elapsed; TAB_DIRTY: the tab still had unsaved
+         text (or a conflict) after apply --wait
 130/143  INTERRUPTED by SIGINT or SIGTERM
 ```
 
 With `--json`, every command prints exactly one JSON object on stdout, whatever the outcome: `{ "ok", "status", "exitCode", "path"?, ...command keys, "error"?: { "code", "message", "retryable", "hint"?, "cause"? } }`. `open` and `watch` also write one progress line to stderr in JSON mode. In human mode failures print `roughdraft: <message>` and `hint: <hint>` on stderr; stack traces appear only with `ROUGHDRAFT_DEBUG=1`. `roughdraft status --json` returns exit code `0` even when the JSON says `"running": false` (it then reads `pendingHandoffs` from the log on disk); human `roughdraft status` exits `1` when the server is not running.
+
+`apply --json` prints the apply report itself (`status` is `applied`, `already-applied` or `refused`; `rebase`, `restored`, `replies`, `resolved`, `accepted`, `rejected`, `droppedReplies`, `skipped`, `edits`, `anchors`, `note`, `remaining`, `doctor`, `errors`) plus `written`, `writtenVia`, `document`, `version`, `skippedUnits` and `roundFlag`. A refusal carries the same report with `written: false` and the `errors` list, each `{ code, thread, message, hint }`. The one-thread commands print `id`, `thread`, `written`, `writtenVia`, `version`, `doctor` and the report.
 
 Supported environment variables:
 
@@ -392,7 +446,7 @@ suggestions:
 
 ### Older forms
 
-Files written by earlier versions may hold comment text inline (`{==x==}{>>text<<}{#c1}`, `{>>text<<}{#c1}`), inline attribute blocks (`{id="c1" by="user" at="..."}`, with `re` and `status="resolved"`), or legacy `{@id:c1; by:user; at:...@}` blocks. Roughdraft still reads all of them. Nothing writes them any more, and `roughdraft doctor` warns on them.
+Files written by earlier versions may hold comment text inline (`{==x==}{>>text<<}{#c1}`, `{>>text<<}{#c1}`), inline attribute blocks (`{id="c1" by="user" at="..."}`, with `re` and `status="resolved"`), or legacy `{@id:c1; by:user; at:...@}` blocks. Roughdraft still reads all of them. Nothing writes them any more, and `roughdraft doctor` warns on them. Nothing converts a file on its own: `roughdraft doctor --fix <file>` converts one (with a backup under `<stateDir>/backups/`), after `roughdraft doctor --fix --dry-run --report report.md <files...>` has listed what would change in each. The agent commands refuse an older-format file until then.
 
 ### Checking a file
 
@@ -403,7 +457,7 @@ This matters because the main workflow is often:
 - The AI writes a doc
 - The user opens it in Roughdraft
 - The user leaves comments and suggested changes
-- The AI reads those comments and answers them in the review block of the same markdown file
+- The AI reads those comments and answers them with `roughdraft round` and `apply` (or `reply`, `resolve` and `note`), which write the review block of the same markdown file
 ## Try the demo
 Don't want to install anything? Try the [live demo](https://roughdraft.md) — it runs entirely in your browser using local storage.
 ## License

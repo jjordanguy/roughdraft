@@ -58,3 +58,28 @@ roughdraft status --json
 ```
 
 `serverVersion`, `cliVersion` and `versionMatches` say whether the server and the command agree.
+
+## The guard hook (optional, after batch 3b)
+
+Once the batch 3b build is installed and Jordan has read `docs/fork/agent-procedure.md`, the Claude Code guard can be added to `~/.claude/settings.json` (merge into an existing `hooks` block):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [{ "type": "command", "command": "roughdraft guard --claude-hook" }]
+      }
+    ]
+  }
+}
+```
+
+It denies Edit, MultiEdit and Write on a file with an open review round (naming the round's `clean.md`), Write over a file with review data, and edits that touch review markup outside code. It prints nothing and exits 0 for everything else and on any error of its own, so it never blocks unrelated work. To check it after installing:
+
+```bash
+echo '{"tool_name":"Write","tool_input":{"file_path":"/abs/path/reviewed.md","content":"x"}}' | roughdraft guard --claude-hook
+```
+
+A reviewed file prints a `permissionDecision` of `deny`; any other file prints nothing. Removing the entry from `settings.json` turns it off. Remove it before rolling back: 0.1.10 has no guard command, and Claude Code treats a hook that exits 2 as a block.

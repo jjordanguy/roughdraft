@@ -23,4 +23,8 @@ if (port !== preferredPort) {
   );
 }
 
-await createServer(port, projectDir);
+const stateDir =
+  process.env.ROUGHDRAFT_STATE_DIR?.trim() ||
+  path.join(repoRoot, ".roughdraft-state");
+
+await createServer(port, projectDir, stateDir);

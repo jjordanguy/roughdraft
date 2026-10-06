@@ -8,19 +8,58 @@ import {
   appendRoughdraftDocumentComment,
   extractRoughdraftReviewIndex,
 } from "@roughdraft/rfm";
-import express, { type Express, type Request, type Response } from "express";
+import express, {
+  type Express,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
+import {
+  type DocumentIdentity,
+  type DocumentRecord,
+  eventForHandoff,
+  type HandoffRecord,
+  isUnacknowledged,
+  ReviewLog,
+  type SessionRecord,
+} from "./handoff-log.js";
 import {
   hasNonLoopbackHost,
   ROUGHDRAFT_DEFAULT_PORT,
   ROUGHDRAFT_PUBLIC_HOST,
   resolveBindHosts,
 } from "./network.js";
-import { ReviewEventQueue } from "./review-events.js";
+import {
+  DocumentRegistry,
+  documentKey,
+  documentUrl,
+  identityFor,
+} from "./registry.js";
+import {
+  normalizeTimeoutMs,
+  type ReviewCompletedEvent,
+  ReviewEventQueue,
+} from "./review-events.js";
 import { resolveUpdateStatus } from "./update-status.js";
+import {
+  doneMessage,
+  type RunWakeOptions,
+  runWakeRoute,
+  WakeRouteStore,
+  wakeRouteRouter,
+} from "./wake-routes.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const staticDir = path.resolve(__dirname, "../../app/dist");
 const defaultServerRoot = path.resolve(__dirname, "../../..");
+
+function mergeBySequence(
+  ...lists: ReviewCompletedEvent[][]
+): ReviewCompletedEvent[] {
+  const bySequence = new Map<number, ReviewCompletedEvent>();
+  for (const event of lists.flat()) bySequence.set(event.sequence, event);
+  return [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+}
 
 function readServerVersion(packageJsonPath?: string): string {
   try {
@@ -81,8 +120,16 @@ interface CreateAppOptions {
   packageJsonPath?: string;
   fetchImpl?: typeof fetch;
   packageName?: string;
-  remoteDocumentToken?: string;
   version?: string;
+  /** Directory for review-log.json and wake-routes.json. Memory only when omitted. */
+  stateDir?: string;
+  /** When set, every /api/* route requires `Authorization: Bearer <token>`. */
+  apiToken?: string;
+  keepaliveMs?: number;
+  sweepIntervalMs?: number;
+  openRequestAckMs?: number;
+  deliveryWaitMs?: number;
+  wakeTimeoutMs?: number;
 }
 
 interface CreateAppResult {
@@ -92,7 +139,8 @@ interface CreateAppResult {
 
 interface OpenRequestClient {
   id: number;
-  path: string | null;
+  key: string | null;
+  tabId: string;
   response: Response;
 }
 
@@ -101,59 +149,84 @@ interface OpenRequestPayload {
   url?: string;
 }
 
-interface RemoteSession {
-  id: string;
-  originPath: string;
-  content: string;
-  version: string;
-  saveClient: Response | null;
-  viewers: Set<Response>;
-  disconnectedAt: number | null;
-}
-
-interface RemoteDocumentRegisterPayload {
-  sessionId?: string;
-  originPath?: string;
-  content?: string;
-}
-
-interface RemoteDocumentSavePayload {
-  content?: string;
-  expectedVersion?: string;
-}
-
-const REMOTE_SESSION_TTL_MS = 5 * 60 * 1000;
-const REMOTE_SESSION_SWEEP_INTERVAL_MS = 60 * 1000;
-const REMOTE_SESSION_KEEPALIVE_MS = 15 * 1000;
 const MAX_OVERALL_COMMENT_LENGTH = 4_000;
+const MAX_HANDOFF_ID_LENGTH = 200;
+const KEEPALIVE_MS = 15_000;
+const SWEEP_INTERVAL_MS = 60_000;
+const OPEN_REQUEST_ACK_MS = 1_000;
+const DELIVERY_WAIT_MS = 2_000;
 
 let nextOpenRequestClientId = 1;
 
-function remoteSessionVersion(content: string): string {
-  const hash = crypto.createHash("sha256").update(content).digest("hex");
-  return `${hash}:${crypto.randomUUID()}`;
-}
-
-function remoteSessionView(session: RemoteSession): {
-  id: string;
-  originPath: string;
-  content: string;
-  version: string;
-} {
-  return {
-    id: session.id,
-    originPath: session.originPath,
-    content: session.content,
-    version: session.version,
-  };
-}
-
-function writeRemoteSessionEvent(
+function writeSseEvent(
   response: Response,
   event: string,
   data: unknown,
+  id?: number,
 ): void {
-  response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  const idLine = id !== undefined ? `id: ${id}\n` : "";
+  response.write(`${idLine}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function startEventStream(res: Response, retryMs: number): void {
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+  res.write(`retry: ${retryMs}\n\n`);
+}
+
+function isOpen(res: Response): boolean {
+  return !res.destroyed && !res.writableEnded;
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function isTruthyFlag(value: unknown): boolean {
+  return value === true || value === "true" || value === "1";
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  fallback: T,
+): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    void promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
+}
+
+function tokenMatches(supplied: string, expected: string): boolean {
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function requestToken(req: Request): string {
+  const header = req.get("authorization") ?? "";
+  if (header.startsWith("Bearer "))
+    return header.slice("Bearer ".length).trim();
+  return req.method === "GET" && typeof req.query.token === "string"
+    ? req.query.token
+    : "";
 }
 
 function listMdFiles(projectDir: string): string[] {
@@ -183,6 +256,14 @@ function fileVersionFromContent(
 function fileVersionFromFile(filePath: string): string {
   const content = fs.readFileSync(filePath);
   const stats = fs.statSync(filePath);
+  return fileVersionFromContent(stats, content);
+}
+
+async function readFileVersion(filePath: string): Promise<string> {
+  const [content, stats] = await Promise.all([
+    fs.promises.readFile(filePath),
+    fs.promises.stat(filePath),
+  ]);
   return fileVersionFromContent(stats, content);
 }
 
@@ -414,61 +495,47 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const serverRoot = path.resolve(options.serverRoot ?? defaultServerRoot);
   const staticDirPath = options.staticDirPath ?? staticDir;
   const fetchImpl = options.fetchImpl ?? fetch;
-  const remoteDocumentToken =
-    typeof options.remoteDocumentToken === "string" &&
-    options.remoteDocumentToken.length > 0
-      ? options.remoteDocumentToken
-      : null;
+  const stateDir = options.stateDir ? path.resolve(options.stateDir) : null;
+  const apiToken = optionalString(options.apiToken);
+  const keepaliveMs = options.keepaliveMs ?? KEEPALIVE_MS;
   const app = express();
   const serverVersion =
     options.version ?? readServerVersion(options.packageJsonPath);
   const instanceId = `srv_${process.pid}_${crypto.randomUUID().slice(0, 8)}`;
+  const publicBaseUrl = `http://${ROUGHDRAFT_PUBLIC_HOST}:${port}`;
   const openRequestClients = new Set<OpenRequestClient>();
-  const reviewEvents = new ReviewEventQueue();
-  const remoteSessions = new Map<string, RemoteSession>();
+  const openRequestAcks = new Map<string, () => void>();
+  const log = new ReviewLog({ stateDir: stateDir ?? undefined });
+  const registry = new DocumentRegistry({ log, publicBaseUrl });
+  const reviewEvents = new ReviewEventQueue({
+    nextSequence: log.peekNextSequence(),
+    seed: log.unacknowledgedEvents(),
+  });
+  const wakeRoutes = new WakeRouteStore({ stateDir: stateDir ?? undefined });
+  const wakeRunOptions = (): RunWakeOptions => ({
+    timeoutMs: options.wakeTimeoutMs,
+    fetchImpl,
+  });
 
-  function isAuthorizedRemoteDocumentRequest(req: Request): boolean {
-    if (!remoteDocumentToken) return true;
+  const sweeper = setInterval(
+    () => registry.sweep(),
+    options.sweepIntervalMs ?? SWEEP_INTERVAL_MS,
+  );
+  sweeper.unref?.();
 
-    const header =
-      typeof req.headers.authorization === "string"
-        ? req.headers.authorization
-        : "";
-    if (header.startsWith("Bearer ")) {
-      const supplied = header.slice("Bearer ".length).trim();
-      if (supplied === remoteDocumentToken) return true;
-    }
-
-    const acceptsQueryToken =
-      req.method === "GET" &&
-      req.path.startsWith("/api/remote-document/") &&
-      req.path.endsWith("/events");
-    const queryToken =
-      acceptsQueryToken && typeof req.query.token === "string"
-        ? req.query.token
-        : "";
-    return queryToken === remoteDocumentToken;
-  }
-
-  function rejectUnauthorizedRemoteDocumentRequest(res: Response): void {
-    res.status(401).json({
-      error:
-        "Remote document endpoints require a valid token. Set ROUGHDRAFT_TOKEN on the client; browser event streams may include ?token=... in the URL.",
+  if (apiToken) {
+    app.use("/api", (req: Request, res: Response, next: NextFunction) => {
+      if (tokenMatches(requestToken(req), apiToken)) {
+        next();
+        return;
+      }
+      res.status(401).json({
+        error:
+          "This Roughdraft server requires a token. Send Authorization: Bearer <ROUGHDRAFT_TOKEN>; event streams may pass ?token=... instead.",
+        code: "UNAUTHORIZED",
+      });
     });
   }
-
-  const remoteSessionSweeper = setInterval(() => {
-    const now = Date.now();
-    for (const [id, session] of remoteSessions) {
-      if (
-        session.disconnectedAt !== null &&
-        now - session.disconnectedAt > REMOTE_SESSION_TTL_MS
-      ) {
-        remoteSessions.delete(id);
-      }
-    }
-  }, REMOTE_SESSION_SWEEP_INTERVAL_MS);
-  remoteSessionSweeper.unref?.();
 
   app.use(express.json({ limit: "50mb" }));
 
@@ -535,6 +602,171 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     return { relativePath, absolutePath, projectDir };
   }
 
+  type MarkdownTarget = NonNullable<ReturnType<typeof markdownPathFromRequest>>;
+
+  function targetIdentity(target: MarkdownTarget): DocumentIdentity {
+    return identityFor(
+      target.absolutePath,
+      target.projectDir,
+      target.relativePath,
+    );
+  }
+
+  function resolveUserPath(rawPath: string): string {
+    if (rawPath === "~") return homeDir;
+    if (rawPath.startsWith("~/")) return path.join(homeDir, rawPath.slice(2));
+    return path.resolve(rawPath);
+  }
+
+  function handoffsFor(events: ReviewCompletedEvent[]): HandoffRecord[] {
+    return events
+      .map((event) => log.findHandoff({ sequence: event.sequence })?.handoff)
+      .filter((handoff): handoff is HandoffRecord => handoff !== undefined);
+  }
+
+  function recordDelivery(
+    events: ReviewCompletedEvent[],
+    watcherId: string,
+    ackedBy: string | null,
+  ): void {
+    for (const event of events) {
+      const handoff = log.markDelivered(event.sequence, watcherId);
+      if (handoff && ackedBy) log.acknowledge(handoff, ackedBy);
+    }
+  }
+
+  /**
+   * Starting point for a watcher: an explicit cursor wins, otherwise `fromNow`
+   * (the default) means "only events after this moment".
+   */
+  function resolveAfterSequence(
+    explicit: number | undefined,
+    fromNow: unknown,
+  ): number {
+    if (explicit !== undefined) return Math.max(0, explicit);
+    return fromNow === false || fromNow === "false" || fromNow === "0"
+      ? 0
+      : reviewEvents.latestSequence();
+  }
+
+  function pendingEvents(document: DocumentRecord | undefined) {
+    if (!document) return [];
+    return document.handoffs
+      .filter(isUnacknowledged)
+      .map((handoff) => eventForHandoff(document, handoff));
+  }
+
+  function longPollBody(events: ReviewCompletedEvent[], timedOut: boolean) {
+    return {
+      events,
+      timedOut,
+      nextSequence: reviewEvents.peekNextSequence(),
+      instanceId,
+      handoffs: handoffsFor(events),
+    };
+  }
+
+  /**
+   * Ends a long poll and resolves true once the body has been flushed. Legacy
+   * clients never acknowledge, so for them a finished response is the ack.
+   */
+  function finishLongPoll(
+    res: Response,
+    events: ReviewCompletedEvent[],
+    timedOut: boolean,
+    delivery: { watcherId: string; legacyAck: boolean },
+  ): Promise<boolean> {
+    if (!isOpen(res)) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      res.once("finish", () => {
+        recordDelivery(
+          events,
+          delivery.watcherId,
+          delivery.legacyAck ? "long-poll" : null,
+        );
+        resolve(true);
+      });
+      res.once("close", () => {
+        if (!res.writableFinished) resolve(false);
+      });
+      if (!res.headersSent) {
+        res.status(200);
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+      }
+      res.end(JSON.stringify(longPollBody(events, timedOut)));
+    });
+  }
+
+  function wakeRouteIdFor(session: SessionRecord | null | undefined) {
+    return session && wakeRoutes.get(session.harness) ? session.harness : null;
+  }
+
+  async function fireWake(key: string, sequence: number): Promise<void> {
+    const document = log.get(key);
+    const handoff = log.findHandoff({ sequence })?.handoff;
+    const session = document?.session;
+    if (!document || !handoff || !session) return;
+    const route = wakeRoutes.get(session.harness);
+    const at = () => new Date().toISOString();
+    if (!route) {
+      log.setWake(sequence, {
+        routeId: null,
+        state: "failed",
+        at: at(),
+        error: `No wake route for ${session.harness}`,
+      });
+      return;
+    }
+    const outcome = await runWakeRoute(
+      route,
+      {
+        event: "done",
+        message: doneMessage(
+          document.documentPath,
+          handoff.summary,
+          handoff.overallComment,
+        ),
+        documentPath: document.documentPath,
+        link: documentUrl(publicBaseUrl, document.documentPath),
+        counts: {
+          comments: handoff.summary.comments,
+          suggestions: handoff.summary.suggestions,
+          unresolved: handoff.summary.unresolved,
+        },
+        handoffId: handoff.handoffId,
+        session: {
+          harness: session.harness,
+          label: session.label,
+          sessionId: session.sessionId,
+        },
+      },
+      wakeRunOptions(),
+    );
+    log.setWake(sequence, {
+      routeId: route.harness,
+      state: outcome.sent ? "sent" : "failed",
+      at: at(),
+      error: outcome.error,
+    });
+    wakeRoutes.recordOutcome(route.harness, outcome);
+  }
+
+  function doneResponse(
+    document: DocumentIdentity,
+    handoff: HandoffRecord,
+    delivered: boolean,
+    event: ReviewCompletedEvent = eventForHandoff(document, handoff),
+  ) {
+    return {
+      delivered,
+      pending: handoff.state === "pending",
+      event,
+      handoff,
+      wake: handoff.wake,
+      instanceId,
+    };
+  }
+
   // --- API routes ---
 
   app.get("/api/pages", (req, res) => {
@@ -584,7 +816,12 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    res.json(markdownPageFromFile(relativePath, absolutePath));
+    const page = markdownPageFromFile(relativePath, absolutePath);
+    registry.recordVersion(
+      identityFor(absolutePath, projectDir, relativePath),
+      page.version,
+    );
+    res.json(page);
   });
 
   app.get("/api/markdown-file/events", (req, res) => {
@@ -605,21 +842,28 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders?.();
-    res.write("retry: 1000\n\n");
+    startEventStream(res, 1000);
+    const identity = identityFor(absolutePath, projectDir, relativePath);
 
-    const sendChange = (stats: fs.Stats) => {
+    const sendChange = async (stats: fs.Stats) => {
       const exists = stats.nlink > 0;
-      res.write(
-        `event: change\ndata: ${JSON.stringify({
-          path: relativePath,
-          exists,
-          version: exists ? fileVersionFromFile(absolutePath) : null,
-        })}\n\n`,
-      );
+      let version: string | null = null;
+      let available = true;
+      if (exists) {
+        try {
+          version = await readFileVersion(absolutePath);
+        } catch {
+          available = false;
+        }
+      }
+      if (available) registry.recordVersion(identity, version);
+      if (!isOpen(res)) return;
+      writeSseEvent(res, "change", {
+        path: relativePath,
+        exists,
+        version,
+        available,
+      });
     };
 
     const listener = (current: fs.Stats, previous: fs.Stats) => {
@@ -631,12 +875,12 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         return;
       }
 
-      sendChange(current);
+      void sendChange(current);
     };
 
     fs.watchFile(absolutePath, { interval: 500 }, listener);
 
-    req.on("close", () => {
+    res.on("close", () => {
       fs.unwatchFile(absolutePath, listener);
     });
   });
@@ -655,7 +899,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     });
   });
 
-  app.post("/api/review-events", (req, res) => {
+  app.post("/api/review-events", async (req, res) => {
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
 
@@ -670,6 +914,29 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    const suppliedHandoffId = optionalString(req.body?.handoffId);
+    if (suppliedHandoffId && suppliedHandoffId.length > MAX_HANDOFF_ID_LENGTH) {
+      res.status(400).json({
+        error: `handoffId must be ${MAX_HANDOFF_ID_LENGTH} characters or fewer`,
+      });
+      return;
+    }
+    const replay = suppliedHandoffId
+      ? log.findHandoff({ handoffId: suppliedHandoffId })
+      : null;
+    if (replay) {
+      res
+        .status(200)
+        .json(
+          doneResponse(
+            replay.document,
+            replay.handoff,
+            replay.handoff.deliveredTo.length > 0,
+          ),
+        );
+      return;
+    }
+
     const markdown = fs.readFileSync(target.absolutePath, "utf-8");
     const persistedMarkdown = overallComment
       ? appendRoughdraftDocumentComment(markdown, {
@@ -681,61 +948,302 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       fs.writeFileSync(target.absolutePath, persistedMarkdown);
     }
 
+    const identity = targetIdentity(target);
     const index = extractRoughdraftReviewIndex(persistedMarkdown);
-    const result = reviewEvents.emit({
-      documentPath: target.absolutePath,
-      projectPath: target.projectDir,
-      relativePath: target.relativePath,
-      version: fileVersionFromFile(target.absolutePath),
+    const version = fileVersionFromFile(target.absolutePath);
+    const handoff = log.recordHandoff(identity, {
+      handoffId: suppliedHandoffId ?? crypto.randomUUID(),
+      version,
       summary: index.summary,
-      overallComment,
+      overallComment: overallComment ?? null,
+      wakeRouteId: wakeRouteIdFor(log.get(identity.key)?.session),
     });
+    const result = reviewEvents.emit(
+      {
+        documentPath: target.absolutePath,
+        projectPath: target.projectDir,
+        relativePath: target.relativePath,
+        version,
+        summary: index.summary,
+        overallComment,
+      },
+      {
+        documentKey: identity.key,
+        sequence: handoff.sequence,
+        createdAt: handoff.createdAt,
+      },
+    );
+    const delivered = await withTimeout(
+      result.delivery,
+      options.deliveryWaitMs ?? DELIVERY_WAIT_MS,
+      false,
+    );
 
-    res.status(201).json(result);
+    res
+      .status(201)
+      .json(doneResponse(identity, handoff, delivered, result.event));
+    if (handoff.wake.routeId) {
+      setImmediate(() => {
+        void fireWake(identity.key, handoff.sequence);
+      });
+    }
   });
 
-  app.post("/api/review-events/watch", async (req, res) => {
+  app.post("/api/review-events/watch", (req, res) => {
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
 
-    const fromNow = req.body?.fromNow !== false;
-    const timeoutSeconds =
-      typeof req.body?.timeoutSeconds === "number"
-        ? req.body.timeoutSeconds
-        : undefined;
-    const batchWindowSeconds =
-      typeof req.body?.batchWindowSeconds === "number"
-        ? req.body.batchWindowSeconds
-        : 0.25;
-    const afterSequence =
-      typeof req.body?.afterSequence === "number" ? req.body.afterSequence : 0;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const identity = targetIdentity(target);
+    const legacyAck = !("includePending" in body);
+    const afterSequence = resolveAfterSequence(
+      optionalNumber(body.afterSequence),
+      body.fromNow,
+    );
+    const timeoutSeconds = optionalNumber(body.timeoutSeconds);
+    const batchWindowSeconds = optionalNumber(body.batchWindowSeconds) ?? 0.25;
 
-    const result = await reviewEvents.wait({
-      documentPath: target.absolutePath,
-      afterSequence: fromNow ? reviewEvents.latestSequence() : afterSequence,
-      timeoutMs:
-        timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined,
-      batchWindowMs: batchWindowSeconds * 1000,
+    const pending =
+      body.includePending === true
+        ? pendingEvents(log.get(identity.key)).slice(-1)
+        : [];
+    const ready =
+      pending.length > 0
+        ? pending
+        : reviewEvents.eventsAfter({
+            documentKey: identity.key,
+            afterSequence,
+          });
+    if (ready.length > 0) {
+      void finishLongPoll(res, ready, false, {
+        watcherId: `w_${crypto.randomUUID().slice(0, 12)}`,
+        legacyAck,
+      });
+      return;
+    }
+
+    res.status(200);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.flushHeaders();
+
+    const watcher = registry.addWatcher(identity, {
+      kind: "long-poll",
+      client: optionalString(body.client),
+      afterSequence,
+    });
+    const controller = new AbortController();
+    const keepalive = setInterval(() => res.write("\n"), keepaliveMs);
+    let timer: NodeJS.Timeout | null = null;
+    const cleanup = () => {
+      clearInterval(keepalive);
+      if (timer) clearTimeout(timer);
+      watcher.remove();
+    };
+    res.on("close", () => {
+      if (!res.writableFinished) controller.abort();
+      cleanup();
     });
 
-    res.json(result);
+    const delivery = { watcherId: watcher.watcherId, legacyAck };
+    const subscription = reviewEvents.subscribe({
+      documentKey: identity.key,
+      afterSequence,
+      batchWindowMs: batchWindowSeconds * 1000,
+      once: true,
+      signal: controller.signal,
+      onMatch: () => {
+        if (timer) clearTimeout(timer);
+      },
+      deliver: (events) => {
+        cleanup();
+        return finishLongPoll(res, events, false, delivery);
+      },
+    });
+    if (timeoutSeconds !== undefined) {
+      timer = setTimeout(
+        () => {
+          subscription?.close();
+          cleanup();
+          void finishLongPoll(res, [], true, delivery);
+        },
+        normalizeTimeoutMs(timeoutSeconds * 1000),
+      );
+    }
+  });
+
+  app.get("/api/review-events/stream", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const identity = targetIdentity(target);
+    const afterSequence = resolveAfterSequence(
+      optionalNumber(req.get("last-event-id")) ??
+        optionalNumber(req.query.afterSequence),
+      req.query.fromNow,
+    );
+    const timeoutSeconds = optionalNumber(req.query.timeoutSeconds);
+
+    startEventStream(res, 2000);
+    const watcher = registry.addWatcher(identity, {
+      kind: "stream",
+      client: optionalString(req.query.client),
+      afterSequence,
+    });
+    writeSseEvent(res, "hello", {
+      instanceId,
+      logId: log.logId,
+      latestSequence: reviewEvents.latestSequence(),
+      afterSequence,
+      pending: log.unacknowledged(identity.key),
+    });
+
+    const sendEvents = (events: ReviewCompletedEvent[]): boolean => {
+      if (!isOpen(res)) return false;
+      for (const event of events) {
+        const handoff = log.markDelivered(event.sequence, watcher.watcherId);
+        writeSseEvent(
+          res,
+          "review.completed",
+          { ...event, handoff },
+          event.sequence,
+        );
+      }
+      return true;
+    };
+
+    const initial = mergeBySequence(
+      reviewEvents.eventsAfter({ documentKey: identity.key, afterSequence }),
+      isTruthyFlag(req.query.includePending)
+        ? pendingEvents(log.get(identity.key))
+        : [],
+    );
+    if (initial.length > 0) sendEvents(initial);
+
+    const controller = new AbortController();
+    reviewEvents.subscribe({
+      documentKey: identity.key,
+      afterSequence: Math.max(afterSequence, initial.at(-1)?.sequence ?? 0),
+      batchWindowMs: 0,
+      signal: controller.signal,
+      deliver: sendEvents,
+    });
+    const keepalive = setInterval(
+      () => res.write(": keepalive\n\n"),
+      keepaliveMs,
+    );
+    const timer =
+      timeoutSeconds !== undefined
+        ? setTimeout(
+            () => {
+              writeSseEvent(res, "timeout", {
+                nextSequence: reviewEvents.peekNextSequence(),
+              });
+              res.end();
+            },
+            normalizeTimeoutMs(timeoutSeconds * 1000),
+          )
+        : null;
+
+    res.on("close", () => {
+      controller.abort();
+      clearInterval(keepalive);
+      if (timer) clearTimeout(timer);
+      watcher.remove();
+    });
+  });
+
+  app.post("/api/review-events/ack", (req, res) => {
+    const handoffId = optionalString(req.body?.handoffId);
+    const sequence = optionalNumber(req.body?.sequence);
+    if (!handoffId && sequence === undefined) {
+      res
+        .status(400)
+        .json({ error: "handoffId or sequence is required", code: "USAGE" });
+      return;
+    }
+    const found = log.findHandoff(handoffId ? { handoffId } : { sequence });
+    if (!found) {
+      res
+        .status(404)
+        .json({ error: "Handoff not found", code: "HANDOFF_NOT_FOUND" });
+      return;
+    }
+    registry.touch(found.document, { keepExistingIdentity: true });
+    const handoff = log.acknowledge(
+      found.handoff,
+      optionalString(req.body?.by),
+    );
+    res.json({ ok: true, handoff });
   });
 
   app.get("/api/review-events/status", (req, res) => {
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
 
-    const watcherCount = reviewEvents.waiterCountForDocument(
-      target.absolutePath,
-    );
+    const key = targetIdentity(target).key;
+    const watcherCount = registry.watcherCount(key);
     res.json({
       documentPath: target.absolutePath,
       projectPath: target.projectDir,
       relativePath: target.relativePath,
       watching: watcherCount > 0,
       watcherCount,
+      tabs: registry.tabCount(key),
+      handoff: log.latestHandoff(key),
+      session: log.get(key)?.session ?? null,
+      instanceId,
     });
   });
+
+  app.get("/api/documents", (_req, res) => {
+    res.json({ instanceId, logId: log.logId, documents: registry.list() });
+  });
+
+  app.get("/api/documents/one", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const view = registry.view(targetIdentity(target).key);
+    if (!view) {
+      res
+        .status(404)
+        .json({ error: "Document not tracked", code: "DOCUMENT_NOT_FOUND" });
+      return;
+    }
+    res.json(view);
+  });
+
+  app.post("/api/documents/session", (req, res) => {
+    const target = markdownPathFromRequest(req, res);
+    if (!target) return;
+
+    const harness = optionalString(req.body?.harness);
+    const label = optionalString(req.body?.label);
+    if (!harness || !label) {
+      res
+        .status(400)
+        .json({ error: "harness and label are required", code: "USAGE" });
+      return;
+    }
+    const session = log.setSession(targetIdentity(target), {
+      harness,
+      label,
+      link: optionalString(req.body?.link),
+      sessionId: optionalString(req.body?.sessionId),
+      routeId: wakeRoutes.get(harness) ? harness : null,
+    });
+    res.json({ ok: true, session });
+  });
+
+  app.use(
+    "/api/wake-routes",
+    wakeRouteRouter({
+      store: wakeRoutes,
+      tokenRequired: apiToken !== null,
+      runOptions: wakeRunOptions,
+    }),
+  );
 
   app.put("/api/pages/:id", (req, res) => {
     const projectDir = projectDirFromRequest(req, res);
@@ -785,7 +1293,12 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     }
 
     fs.writeFileSync(absolutePath, content);
-    res.json(markdownPageFromFile(relativePath, absolutePath));
+    const page = markdownPageFromFile(relativePath, absolutePath);
+    registry.recordVersion(
+      identityFor(absolutePath, projectDir, relativePath),
+      page.version,
+    );
+    res.json(page);
   });
 
   app.post("/api/pages", (req, res) => {
@@ -831,23 +1344,29 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       version: serverVersion,
       instanceId,
       stateless: true,
+      stateDir,
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
-        remoteDocuments: true,
-        remoteDocumentTokenRequired: remoteDocumentToken !== null,
+        reviewEventStream: true,
+        documentRegistry: true,
+        handoffLog: true,
+        wakeRoutes: true,
+        tokenRequired: apiToken !== null,
       },
+      warnings: [...log.warnings, ...wakeRoutes.warnings],
     });
   });
 
   app.get("/api/open-requests", (req, res) => {
-    const requestedPath =
-      typeof req.query.path === "string" && req.query.path.trim().length > 0
-        ? req.query.path.trim()
-        : null;
+    const requestedPath = optionalString(req.query.path);
+    const tabId =
+      optionalString(req.query.tabId) ?? `tab_${nextOpenRequestClientId}`;
+    const resolvedPath = requestedPath ? resolveUserPath(requestedPath) : null;
     const client: OpenRequestClient = {
       id: nextOpenRequestClientId,
-      path: requestedPath,
+      key: resolvedPath ? documentKey(resolvedPath) : null,
+      tabId,
       response: res,
     };
     nextOpenRequestClientId += 1;
@@ -856,255 +1375,79 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
-    res.write(
-      `event: connected\ndata: ${JSON.stringify({ id: client.id })}\n\n`,
-    );
+    writeSseEvent(res, "connected", { id: client.id, tabId });
 
     openRequestClients.add(client);
+    const disconnectTab = resolvedPath
+      ? registry.connectTab(identityFor(resolvedPath), {
+          tabId,
+          visible: req.query.visible !== "false",
+        })
+      : () => {};
     const keepAlive = setInterval(() => {
       res.write(": keep-alive\n\n");
-    }, 15_000);
+    }, keepaliveMs);
 
-    req.on("close", () => {
+    res.on("close", () => {
       clearInterval(keepAlive);
       openRequestClients.delete(client);
+      disconnectTab();
     });
   });
 
-  app.post("/api/open-request", (req, res) => {
+  function waitForOpenRequestAck(requestId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        openRequestAcks.delete(requestId);
+        resolve(false);
+      }, options.openRequestAckMs ?? OPEN_REQUEST_ACK_MS);
+      openRequestAcks.set(requestId, () => {
+        clearTimeout(timer);
+        openRequestAcks.delete(requestId);
+        resolve(true);
+      });
+    });
+  }
+
+  app.post("/api/open-request", async (req, res) => {
     const payload = req.body as OpenRequestPayload;
-    const targetPath =
-      typeof payload.path === "string" && payload.path.trim().length > 0
-        ? payload.path.trim()
-        : null;
-    const targetUrl =
-      typeof payload.url === "string" && payload.url.trim().length > 0
-        ? payload.url.trim()
-        : null;
+    const targetPath = optionalString(payload.path);
+    const targetUrl = optionalString(payload.url);
 
     if (!targetPath || !targetUrl) {
       res.status(400).json({ error: "path and url are required" });
       return;
     }
 
-    const matchingClient = Array.from(openRequestClients)
-      .reverse()
-      .find((client) => client.path === targetPath);
+    const resolvedPath = resolveUserPath(targetPath);
+    const key = documentKey(resolvedPath);
+    registry.recordOpenRequest(identityFor(resolvedPath));
+    const clients = [...openRequestClients].filter(
+      (client) => client.key === key && isOpen(client.response),
+    );
+    const tabs = new Set(clients.map((client) => client.tabId)).size;
+    const matchingClient = clients.at(-1);
 
     if (!matchingClient) {
-      res.json({ delivered: false });
+      res.json({ delivered: false, acknowledged: false, tabs });
       return;
     }
 
-    matchingClient.response.write(
-      `event: open-request\ndata: ${JSON.stringify({
-        path: targetPath,
-        url: targetUrl,
-      })}\n\n`,
-    );
-    res.json({ delivered: true });
-  });
-
-  app.post("/api/remote-document", (req, res) => {
-    if (!isAuthorizedRemoteDocumentRequest(req)) {
-      rejectUnauthorizedRemoteDocumentRequest(res);
-      return;
-    }
-    const payload = req.body as RemoteDocumentRegisterPayload;
-    const sessionId =
-      typeof payload.sessionId === "string" &&
-      payload.sessionId.trim().length > 0
-        ? payload.sessionId.trim()
-        : null;
-    const originPath =
-      typeof payload.originPath === "string" &&
-      payload.originPath.trim().length > 0
-        ? payload.originPath.trim()
-        : null;
-    const content =
-      typeof payload.content === "string" ? payload.content : null;
-
-    if (!sessionId || !originPath || content === null) {
-      res
-        .status(400)
-        .json({ error: "sessionId, originPath, and content are required" });
-      return;
-    }
-
-    if (remoteSessions.has(sessionId)) {
-      res.status(409).json({ error: "session already exists" });
-      return;
-    }
-
-    const session: RemoteSession = {
-      id: sessionId,
-      originPath,
-      content,
-      version: remoteSessionVersion(content),
-      saveClient: null,
-      viewers: new Set<Response>(),
-      disconnectedAt: null,
-    };
-    remoteSessions.set(sessionId, session);
-
-    const host = req.get("host");
-    const viewerUrl =
-      host !== undefined
-        ? `${req.protocol}://${host}/?session=${encodeURIComponent(sessionId)}`
-        : null;
-
-    res.status(201).json({
-      id: session.id,
-      version: session.version,
-      viewerUrl,
+    const requestId = crypto.randomUUID();
+    const acknowledged = waitForOpenRequestAck(requestId);
+    writeSseEvent(matchingClient.response, "open-request", {
+      path: targetPath,
+      url: targetUrl,
+      requestId,
     });
+    res.json({ delivered: true, acknowledged: await acknowledged, tabs });
   });
 
-  app.get("/api/remote-document/:id", (req, res) => {
-    if (!isAuthorizedRemoteDocumentRequest(req)) {
-      rejectUnauthorizedRemoteDocumentRequest(res);
-      return;
-    }
-    const session = remoteSessions.get(req.params.id);
-    if (!session) {
-      res.status(404).json({ error: "Remote document session not found" });
-      return;
-    }
-    res.json(remoteSessionView(session));
-  });
-
-  app.put("/api/remote-document/:id", (req, res) => {
-    if (!isAuthorizedRemoteDocumentRequest(req)) {
-      rejectUnauthorizedRemoteDocumentRequest(res);
-      return;
-    }
-    const session = remoteSessions.get(req.params.id);
-    if (!session) {
-      res.status(404).json({ error: "Remote document session not found" });
-      return;
-    }
-
-    const payload = req.body as RemoteDocumentSavePayload;
-    const content =
-      typeof payload.content === "string" ? payload.content : null;
-
-    if (content === null) {
-      res.status(400).json({ error: "content is required" });
-      return;
-    }
-
-    if (
-      typeof payload.expectedVersion === "string" &&
-      payload.expectedVersion !== session.version
-    ) {
-      res.status(409).json({
-        error: "Remote document changed",
-        current: remoteSessionView(session),
-      });
-      return;
-    }
-
-    session.content = content;
-    session.version = remoteSessionVersion(content);
-
-    let deliveredToClient = true;
-    if (session.saveClient) {
-      try {
-        writeRemoteSessionEvent(session.saveClient, "save", {
-          content: session.content,
-          version: session.version,
-        });
-      } catch {
-        deliveredToClient = false;
-        session.saveClient = null;
-        session.disconnectedAt = Date.now();
-      }
-    } else {
-      deliveredToClient = false;
-    }
-
-    if (!deliveredToClient) {
-      res.status(503).json({
-        error: "No active CLI session; save not delivered to disk.",
-        version: session.version,
-      });
-      return;
-    }
-
-    res.json({ id: session.id, version: session.version });
-  });
-
-  app.get("/api/remote-document/:id/events", (req, res) => {
-    if (!isAuthorizedRemoteDocumentRequest(req)) {
-      rejectUnauthorizedRemoteDocumentRequest(res);
-      return;
-    }
-    const session = remoteSessions.get(req.params.id);
-    if (!session) {
-      res.status(404).json({ error: "Remote document session not found" });
-      return;
-    }
-
-    const role = req.query.role === "viewer" ? "viewer" : "cli";
-
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders?.();
-
-    if (role === "cli") {
-      if (session.saveClient) {
-        session.saveClient.end();
-      }
-
-      session.saveClient = res;
-      session.disconnectedAt = null;
-
-      writeRemoteSessionEvent(res, "connected", {
-        id: session.id,
-        role,
-        version: session.version,
-      });
-      for (const viewer of session.viewers) {
-        writeRemoteSessionEvent(viewer, "connected", {
-          id: session.id,
-          role: "viewer",
-          version: session.version,
-        });
-      }
-    } else {
-      session.viewers.add(res);
-      writeRemoteSessionEvent(
-        res,
-        session.saveClient ? "connected" : "disconnected",
-        {
-          id: session.id,
-          role,
-          version: session.version,
-        },
-      );
-    }
-
-    const keepAlive = setInterval(() => {
-      res.write(": keep-alive\n\n");
-    }, REMOTE_SESSION_KEEPALIVE_MS);
-
-    req.on("close", () => {
-      clearInterval(keepAlive);
-      if (role === "cli" && session.saveClient === res) {
-        session.saveClient = null;
-        session.disconnectedAt = Date.now();
-        for (const viewer of session.viewers) {
-          writeRemoteSessionEvent(viewer, "disconnected", {
-            id: session.id,
-            role: "viewer",
-            version: session.version,
-          });
-        }
-      } else if (role === "viewer") {
-        session.viewers.delete(res);
-      }
-    });
+  app.post("/api/open-request/ack", (req, res) => {
+    const requestId = optionalString(req.body?.requestId);
+    const resolveAck = requestId ? openRequestAcks.get(requestId) : undefined;
+    resolveAck?.();
+    res.json({ ok: resolveAck !== undefined });
   });
 
   app.get("/api/update-status", async (_req, res) => {
@@ -1260,21 +1603,34 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
 
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";
 
+export const ROUGHDRAFT_STATE_DIR_ENV = "ROUGHDRAFT_STATE_DIR";
+
+export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  const explicitDir = env[ROUGHDRAFT_STATE_DIR_ENV]?.trim();
+  if (explicitDir) return path.resolve(explicitDir);
+  const explicitFile = env.ROUGHDRAFT_STATE_FILE?.trim();
+  if (explicitFile) return path.dirname(path.resolve(explicitFile));
+  return path.join(os.homedir(), ".roughdraft");
+}
+
 export async function createServer(
   port = ROUGHDRAFT_DEFAULT_PORT,
   projectDir?: string,
+  stateDir = resolveStateDir(),
 ): Promise<void> {
   const bindHosts = resolveBindHosts();
-  const remoteDocumentToken = process.env[ROUGHDRAFT_TOKEN_ENV] ?? "";
+  const token = process.env[ROUGHDRAFT_TOKEN_ENV]?.trim() ?? "";
+  const exposed = hasNonLoopbackHost(bindHosts);
 
-  if (hasNonLoopbackHost(bindHosts) && remoteDocumentToken.length === 0) {
+  if (exposed && token.length === 0) {
     throw new Error(
       [
         `Roughdraft refuses to bind ${bindHosts.join(", ")} without a token.`,
-        "Non-loopback bindings expose the remote-document endpoints, which can",
-        "rewrite files on every connected CLI machine. Set ROUGHDRAFT_TOKEN to",
-        "a strong secret and pass the same value to your CLI before retrying,",
-        "or remove ROUGHDRAFT_BIND_HOST to keep loopback-only.",
+        "Non-loopback bindings expose every /api route, which can read and",
+        "rewrite Markdown files and run wake routes on this machine. Set",
+        "ROUGHDRAFT_TOKEN to a strong secret and pass the same value to your",
+        "CLI before retrying, or remove ROUGHDRAFT_BIND_HOST to keep",
+        "loopback-only.",
       ].join(" "),
     );
   }
@@ -1282,8 +1638,8 @@ export async function createServer(
   const { app } = createApp({
     port,
     projectDir,
-    remoteDocumentToken:
-      remoteDocumentToken.length > 0 ? remoteDocumentToken : undefined,
+    stateDir,
+    apiToken: exposed ? token : undefined,
   });
   const listeningHosts: string[] = [];
 

@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,8 +14,49 @@ import {
   ROUGHDRAFT_LOOPBACK_HOSTS,
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
+import {
+  CliError,
+  EXIT_SERVER,
+  errorEnvelope,
+  interruptedError,
+  toCliError,
+  usageError,
+} from "./errors.js";
 import { findAvailablePort } from "./ports.js";
+import {
+  type ApiContext,
+  ackHandoffs,
+  authHeaders,
+  collectHandoffs,
+  createServerResolver,
+  type DocumentRecord,
+  type DocumentView,
+  documentKey,
+  documentViewFromRecord,
+  getServerStateFilePath,
+  getStateDir,
+  type HandoffRecord,
+  type ListedHandoff,
+  listDocuments,
+  listWakeRoutes,
+  putWakeRoute,
+  readReviewLogFromDisk,
+  readWakeRoutesFromDisk,
+  registerSession,
+  removeWakeRoute,
+  type ServerStatus,
+  type SessionRecord,
+  testWakeRoute,
+  type WakeRoute,
+  type WatchNotice,
+  type WatchResult,
+  type WatchTuning,
+  watchReviewEvents,
+} from "./review-watch-client.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
+
+export { CliError } from "./errors.js";
+export { getServerStateFilePath } from "./review-watch-client.js";
 
 const AGENT_SETUP_URL = "https://roughdraft.md/setup.md";
 const ROUGHDRAFT_FLAVORED_MARKDOWN_SPEC_URL =
@@ -24,11 +64,11 @@ const ROUGHDRAFT_FLAVORED_MARKDOWN_SPEC_URL =
 const AGENT_SETUP_PROMPT = `Install Roughdraft for me using \`npm i -g roughdraft\`, then read ${AGENT_SETUP_URL} and set yourself up to use it.`;
 const STATUS_PATH = "/api/status";
 const STATUS_TIMEOUT_MS = 750;
+const OPEN_REQUEST_TIMEOUT_MS = 2_500;
 const SERVER_WAIT_ATTEMPTS = 40;
 const SERVER_WAIT_DELAY_MS = 150;
 const PROCESS_WAIT_ATTEMPTS = 20;
 const PROCESS_WAIT_DELAY_MS = 150;
-const USAGE_ERROR = 2;
 const KNOWN_COMMANDS = [
   "open",
   "start",
@@ -36,6 +76,10 @@ const KNOWN_COMMANDS = [
   "stop",
   "restart",
   "watch",
+  "pending",
+  "ack",
+  "log",
+  "route",
   "mcp",
   "doctor",
   "help",
@@ -58,27 +102,10 @@ interface StatusPayload {
   port?: number;
   version?: string;
   instanceId?: string;
+  warnings?: string[];
 }
 
-export class CliError extends Error {
-  code: string;
-  exitCode: number;
-  hint: string | null;
-
-  constructor(
-    code: string,
-    message: string,
-    options: { exitCode?: number; hint?: string } = {},
-  ) {
-    super(message);
-    this.name = "CliError";
-    this.code = code;
-    this.exitCode = options.exitCode ?? 1;
-    this.hint = options.hint ?? null;
-  }
-}
-
-const SERVER_ERROR = 3;
+const SERVER_ERROR = EXIT_SERVER;
 
 interface DevFrontendState {
   apiPort: number | null;
@@ -98,6 +125,8 @@ export interface SpawnedServer {
   pid: number;
 }
 
+export type InterruptSignal = "SIGINT" | "SIGTERM";
+
 export interface CliDependencies {
   env: NodeJS.ProcessEnv;
   cwd: string;
@@ -107,6 +136,8 @@ export interface CliDependencies {
   spawnServerProcess: (options: {
     port: number;
     projectDir: string;
+    stateDir: string;
+    env: NodeJS.ProcessEnv;
   }) => Promise<SpawnedServer> | SpawnedServer;
   isProcessRunning: (pid: number) => boolean;
   stopProcess: (pid: number) => Promise<void>;
@@ -114,6 +145,12 @@ export interface CliDependencies {
   resolveUpdateStatus: () => Promise<UpdateStatus>;
   log: (message: string) => void;
   error: (message: string) => void;
+  /** Subscribes to SIGINT and SIGTERM while a watch runs; returns the unsubscribe. */
+  onInterrupt: (handler: (signal: InterruptSignal) => void) => () => void;
+  /** Watch timing overrides (tests shorten polls and backoff). */
+  watchTuning?: Partial<WatchTuning>;
+  /** Clock for the watch deadline (tests use a fake one). */
+  now?: () => number;
 }
 
 type OpenMode =
@@ -161,32 +198,32 @@ interface ParsedCli {
 }
 
 interface ParsedCommandOptions {
+  ack: boolean;
+  after?: number;
   all: boolean;
   batchWindowSeconds: number;
+  command?: string;
+  harness?: string;
   help: boolean;
   json: boolean;
+  label?: string;
+  noAck: boolean;
   noOpen: boolean;
   noWatch: boolean;
+  pending: boolean | null;
   printUrl: boolean;
   port?: string;
+  reconnectSeconds?: number;
   replay: boolean;
+  sessionId?: string;
+  sessionLabel?: string;
+  sessionLink?: string;
   stateDir?: string;
   stateFile?: string;
   timeoutSeconds?: number;
+  url?: string;
   watch: boolean;
   positionals: string[];
-}
-
-interface ParsedWatchOptions {
-  batchWindowSeconds: number;
-  help: boolean;
-  json: boolean;
-  positionals: string[];
-  replay: boolean;
-  serverUrl?: string;
-  stateDir?: string;
-  stateFile?: string;
-  timeoutSeconds?: number;
 }
 
 const currentServerRoot = path.resolve(
@@ -251,7 +288,7 @@ function parseGlobalArgs(args: string[]): ParsedCli {
     }
 
     if (arg.startsWith("-")) {
-      throw new Error(`Unknown flag: ${arg}`);
+      throw usageError(`Unknown flag: ${arg}`);
     }
 
     commandParts.push(arg, ...rest);
@@ -272,37 +309,87 @@ function takeFlagValue(
   flag: string,
 ): { value: string; nextIndex: number } {
   const value = args[index + 1];
-  if (!value || value.startsWith("-")) {
-    throw new Error(`${flag} requires a value.`);
+  if (value === undefined || (value.startsWith("-") && value !== "-")) {
+    throw usageError(`${flag} requires a value.`);
   }
 
   return { value, nextIndex: index + 1 };
 }
 
+type FlagGroup =
+  | "all"
+  | "open"
+  | "port"
+  | "watch"
+  | "session"
+  | "pendingAck"
+  | "route";
+
+const FLAG_GROUPS: Record<string, FlagGroup> = {
+  "--all": "all",
+  "--no-open": "open",
+  "--print-url": "open",
+  "--port": "port",
+  "--watch": "watch",
+  "--no-watch": "watch",
+  "--replay": "watch",
+  "--timeout": "watch",
+  "--batch-window": "watch",
+  "--pending": "watch",
+  "--no-pending": "watch",
+  "--after": "watch",
+  "--no-ack": "watch",
+  "--reconnect": "watch",
+  "--harness": "session",
+  "--session-label": "session",
+  "--session-link": "session",
+  "--session-id": "session",
+  "--ack": "pendingAck",
+  "--command": "route",
+  "--url": "route",
+  "--label": "route",
+};
+
+const VALUE_FLAGS = new Set([
+  "--port",
+  "--timeout",
+  "--batch-window",
+  "--after",
+  "--reconnect",
+  "--harness",
+  "--session-label",
+  "--session-link",
+  "--session-id",
+  "--command",
+  "--url",
+  "--label",
+  "--state-file",
+  "--state-dir",
+]);
+
 function parseCommandOptions(
   args: string[],
-  options: {
-    allowAll?: boolean;
-    allowOpen?: boolean;
-    allowPort?: boolean;
-    allowWatch?: boolean;
-  },
+  allowed: FlagGroup[] = [],
 ): ParsedCommandOptions {
   const parsed: ParsedCommandOptions = {
+    ack: false,
     all: false,
     batchWindowSeconds: 0.25,
     help: false,
     json: false,
+    noAck: false,
     noOpen: false,
     noWatch: false,
+    pending: null,
     positionals: [],
     printUrl: false,
     replay: false,
     watch: false,
   };
+  const allowedGroups = new Set(allowed);
 
   for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
+    const arg = args[index] ?? "";
 
     if (arg === "--") {
       parsed.positionals.push(...args.slice(index + 1));
@@ -319,120 +406,115 @@ function parseCommandOptions(
       continue;
     }
 
-    if (arg === "--all") {
-      if (!options.allowAll) throw new Error(`Unknown flag: ${arg}`);
-      parsed.all = true;
+    if (!arg.startsWith("-") || arg === "-") {
+      parsed.positionals.push(arg);
       continue;
     }
 
-    if (arg === "--no-open") {
-      if (!options.allowOpen) throw new Error(`Unknown flag: ${arg}`);
-      parsed.noOpen = true;
-      continue;
+    const equals = arg.indexOf("=");
+    const flag = equals === -1 ? arg : arg.slice(0, equals);
+    const group = FLAG_GROUPS[flag];
+    const known =
+      flag === "--state-file" ||
+      flag === "--state-dir" ||
+      (group !== undefined && allowedGroups.has(group));
+    if (!known) {
+      throw usageError(`Unknown flag: ${flag}`);
     }
 
-    if (arg === "--print-url") {
-      if (!options.allowOpen) throw new Error(`Unknown flag: ${arg}`);
-      parsed.printUrl = true;
-      parsed.noOpen = true;
-      continue;
+    let value: string | undefined;
+    if (VALUE_FLAGS.has(flag)) {
+      if (equals !== -1) {
+        value = arg.slice(equals + 1);
+      } else {
+        const next = takeFlagValue(args, index, flag);
+        value = next.value;
+        index = next.nextIndex;
+      }
+    } else if (equals !== -1) {
+      throw usageError(`${flag} does not take a value.`);
     }
 
-    if (arg === "--watch") {
-      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
-      parsed.watch = true;
-      continue;
+    switch (flag) {
+      case "--all":
+        parsed.all = true;
+        break;
+      case "--no-open":
+        parsed.noOpen = true;
+        break;
+      case "--print-url":
+        parsed.printUrl = true;
+        parsed.noOpen = true;
+        break;
+      case "--watch":
+        parsed.watch = true;
+        break;
+      case "--no-watch":
+        parsed.noWatch = true;
+        break;
+      case "--replay":
+        parsed.replay = true;
+        break;
+      case "--pending":
+        parsed.pending = true;
+        break;
+      case "--no-pending":
+        parsed.pending = false;
+        break;
+      case "--no-ack":
+        parsed.noAck = true;
+        break;
+      case "--ack":
+        parsed.ack = true;
+        break;
+      case "--timeout":
+        parsed.timeoutSeconds = parsePositiveNumber(value ?? "", flag);
+        break;
+      case "--batch-window":
+        parsed.batchWindowSeconds = parsePositiveNumber(value ?? "", flag);
+        break;
+      case "--reconnect":
+        parsed.reconnectSeconds = parsePositiveNumber(value ?? "", flag);
+        break;
+      case "--after": {
+        const after = Number.parseInt(value ?? "", 10);
+        if (!Number.isInteger(after) || after < 0) {
+          throw usageError("--after must be a sequence number (0 or more).");
+        }
+        parsed.after = after;
+        break;
+      }
+      case "--port":
+        parsed.port = value;
+        break;
+      case "--harness":
+        parsed.harness = value;
+        break;
+      case "--session-label":
+        parsed.sessionLabel = value;
+        break;
+      case "--session-link":
+        parsed.sessionLink = value;
+        break;
+      case "--session-id":
+        parsed.sessionId = value;
+        break;
+      case "--command":
+        parsed.command = value;
+        break;
+      case "--url":
+        parsed.url = value;
+        break;
+      case "--label":
+        parsed.label = value;
+        break;
+      case "--state-file":
+        parsed.stateFile = value;
+        break;
+      case "--state-dir":
+        parsed.stateDir = value;
+        break;
     }
-
-    if (arg === "--no-watch") {
-      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
-      parsed.noWatch = true;
-      continue;
-    }
-
-    if (arg === "--replay") {
-      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
-      parsed.replay = true;
-      continue;
-    }
-
-    if (arg === "--timeout") {
-      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
-      const next = takeFlagValue(args, index, arg);
-      parsed.timeoutSeconds = parsePositiveNumber(next.value, arg);
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--timeout=")) {
-      if (!options.allowWatch) throw new Error(`Unknown flag: --timeout`);
-      parsed.timeoutSeconds = parsePositiveNumber(
-        arg.slice("--timeout=".length),
-        "--timeout",
-      );
-      continue;
-    }
-
-    if (arg === "--batch-window") {
-      if (!options.allowWatch) throw new Error(`Unknown flag: ${arg}`);
-      const next = takeFlagValue(args, index, arg);
-      parsed.batchWindowSeconds = parsePositiveNumber(next.value, arg);
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--batch-window=")) {
-      if (!options.allowWatch) throw new Error(`Unknown flag: --batch-window`);
-      parsed.batchWindowSeconds = parsePositiveNumber(
-        arg.slice("--batch-window=".length),
-        "--batch-window",
-      );
-      continue;
-    }
-
-    if (arg === "--port") {
-      if (!options.allowPort) throw new Error(`Unknown flag: ${arg}`);
-      const next = takeFlagValue(args, index, arg);
-      parsed.port = next.value;
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--port=")) {
-      if (!options.allowPort) throw new Error(`Unknown flag: --port`);
-      parsed.port = arg.slice("--port=".length);
-      continue;
-    }
-
-    if (arg === "--state-file") {
-      const next = takeFlagValue(args, index, arg);
-      parsed.stateFile = next.value;
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--state-file=")) {
-      parsed.stateFile = arg.slice("--state-file=".length);
-      continue;
-    }
-
-    if (arg === "--state-dir") {
-      const next = takeFlagValue(args, index, arg);
-      parsed.stateDir = next.value;
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--state-dir=")) {
-      parsed.stateDir = arg.slice("--state-dir=".length);
-      continue;
-    }
-
-    if (arg.startsWith("-")) {
-      throw new Error(`Unknown flag: ${arg}`);
-    }
-
-    parsed.positionals.push(arg);
   }
 
   return parsed;
@@ -455,124 +537,12 @@ function applyCliEnvOverrides(
   };
 }
 
-function parseWatchOptions(args: string[]): ParsedWatchOptions {
-  const parsed: ParsedWatchOptions = {
-    batchWindowSeconds: 0.25,
-    help: false,
-    json: false,
-    positionals: [],
-    replay: false,
-  };
-
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-
-    if (arg === "--") {
-      parsed.positionals.push(...args.slice(index + 1));
-      break;
-    }
-
-    if (arg === "-h" || arg === "--help") {
-      parsed.help = true;
-      continue;
-    }
-
-    if (arg === "--json") {
-      parsed.json = true;
-      continue;
-    }
-
-    if (arg === "--replay") {
-      parsed.replay = true;
-      continue;
-    }
-
-    if (arg === "--timeout") {
-      const next = takeFlagValue(args, index, arg);
-      parsed.timeoutSeconds = parsePositiveNumber(next.value, arg);
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--timeout=")) {
-      parsed.timeoutSeconds = parsePositiveNumber(
-        arg.slice("--timeout=".length),
-        "--timeout",
-      );
-      continue;
-    }
-
-    if (arg === "--batch-window") {
-      const next = takeFlagValue(args, index, arg);
-      parsed.batchWindowSeconds = parsePositiveNumber(next.value, arg);
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--batch-window=")) {
-      parsed.batchWindowSeconds = parsePositiveNumber(
-        arg.slice("--batch-window=".length),
-        "--batch-window",
-      );
-      continue;
-    }
-
-    if (arg === "--state-file") {
-      const next = takeFlagValue(args, index, arg);
-      parsed.stateFile = next.value;
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--state-file=")) {
-      parsed.stateFile = arg.slice("--state-file=".length);
-      continue;
-    }
-
-    if (arg === "--state-dir") {
-      const next = takeFlagValue(args, index, arg);
-      parsed.stateDir = next.value;
-      index = next.nextIndex;
-      continue;
-    }
-
-    if (arg.startsWith("--state-dir=")) {
-      parsed.stateDir = arg.slice("--state-dir=".length);
-      continue;
-    }
-
-    if (arg.startsWith("-")) {
-      throw new Error(`Unknown flag: ${arg}`);
-    }
-
-    parsed.positionals.push(arg);
-  }
-
-  return parsed;
-}
-
 function parsePositiveNumber(value: string, flag: string): number {
   const parsed = Number.parseFloat(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error(`${flag} must be a positive number.`);
+    throw usageError(`${flag} must be a positive number.`);
   }
   return parsed;
-}
-
-function applyWatchEnvOverrides(
-  deps: CliDependencies,
-  options: ParsedWatchOptions,
-): CliDependencies {
-  return {
-    ...deps,
-    env: {
-      ...deps.env,
-      ...(options.stateDir ? { ROUGHDRAFT_STATE_DIR: options.stateDir } : {}),
-      ...(options.stateFile
-        ? { ROUGHDRAFT_STATE_FILE: options.stateFile }
-        : {}),
-    },
-  };
 }
 
 function isKnownCommand(value: string): value is KnownCommand {
@@ -794,6 +764,8 @@ async function defaultStopProcess(pid: number): Promise<void> {
 function defaultSpawnServerProcess(options: {
   port: number;
   projectDir: string;
+  stateDir: string;
+  env: NodeJS.ProcessEnv;
 }): SpawnedServer {
   const serverEntryPath = fileURLToPath(new URL("./child.js", import.meta.url));
   const child = spawn(
@@ -804,23 +776,42 @@ function defaultSpawnServerProcess(options: {
       String(options.port),
       "--project-dir",
       options.projectDir,
+      "--state-dir",
+      options.stateDir,
     ],
     {
       cwd: options.projectDir,
       detached: true,
       stdio: "ignore",
       windowsHide: true,
-      env: process.env,
+      env: options.env,
     },
   );
 
   child.unref();
 
   if (!child.pid) {
-    throw new Error("Failed to start Roughdraft in the background.");
+    throw new CliError(
+      "SERVER_START_FAILED",
+      "Failed to start Roughdraft in the background.",
+      { hint: "Run `roughdraft doctor` to check the install." },
+    );
   }
 
   return { pid: child.pid };
+}
+
+function defaultOnInterrupt(
+  handler: (signal: InterruptSignal) => void,
+): () => void {
+  const onSigint = () => handler("SIGINT");
+  const onSigterm = () => handler("SIGTERM");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+  return () => {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+  };
 }
 
 export function createCliDependencies(
@@ -844,6 +835,26 @@ export function createCliDependencies(
       (() => resolveUpdateStatus({ fetchImpl })),
     log: overrides.log ?? ((message) => console.log(message)),
     error: overrides.error ?? ((message) => console.error(message)),
+    onInterrupt: overrides.onInterrupt ?? defaultOnInterrupt,
+    watchTuning: overrides.watchTuning,
+    now: overrides.now,
+  };
+}
+
+/** Request options with the token header added when ROUGHDRAFT_TOKEN is set. */
+function withAuth(deps: CliDependencies, init: RequestInit = {}): RequestInit {
+  const headers = new Headers(init.headers);
+  for (const [name, value] of Object.entries(authHeaders(deps.env))) {
+    if (!headers.has(name)) headers.set(name, value);
+  }
+  return { ...init, headers };
+}
+
+function apiContext(deps: CliDependencies, baseUrl: string): ApiContext {
+  return {
+    fetchImpl: deps.fetchImpl,
+    baseUrl,
+    headers: authHeaders(deps.env),
   };
 }
 
@@ -858,6 +869,15 @@ async function printUpdateNoticeIfAvailable(deps: CliDependencies) {
   } catch {}
 }
 
+const DONE_LOG_PARAGRAPH = [
+  "Every Done Reviewing click is written to the session log, so a Done that no",
+  "agent was waiting for is kept until one asks. `roughdraft pending <file>`",
+  "lists what is waiting (`--ack` to acknowledge it), `roughdraft ack <id>`",
+  "acknowledges one, `roughdraft log` shows each document with its session,",
+  "wake route and latest Done, and `roughdraft route add|test` registers and",
+  "checks how Done wakes your harness.",
+];
+
 function printHelp(log: (message: string) => void) {
   log("Roughdraft is a local Markdown review app for AI-assisted workflows.");
   log("");
@@ -868,10 +888,14 @@ function printHelp(log: (message: string) => void) {
   log("Commands:");
   log("  open <path>        Open a Markdown file and wait for Done Reviewing");
   log("  start              Start or reuse the background server");
-  log("  status             Show server status");
+  log("  status             Show server status and open documents");
   log("  stop               Stop the managed background server");
   log("  restart            Stop the managed server and start this version");
   log("  watch <path>       Wait for a Done Reviewing event");
+  log("  pending [path]     List Dones no agent has acknowledged yet");
+  log("  ack <id>...        Acknowledge Dones by handoff id");
+  log("  log                Show the session log");
+  log("  route <action>     List, add, remove or test wake routes");
   log("  mcp                Start the experimental stdio MCP server");
   log("  doctor [path]      Diagnose setup or validate Markdown");
   log("  help agent         Print the agent setup prompt");
@@ -891,11 +915,30 @@ function printHelp(log: (message: string) => void) {
   log("  roughdraft open ./draft.md --json");
   log("  roughdraft open ./draft.md --no-watch");
   log("  roughdraft watch ./draft.md --json");
+  log("  roughdraft pending ./draft.md --json --ack");
   log("  roughdraft status --json");
+  log("");
+  for (const line of DONE_LOG_PARAGRAPH) log(line);
+  log("");
+  log(
+    "Exit codes: 0 done, 2 bad command or path, 3 server problem, 4 timeout,",
+  );
+  log("130 or 143 stopped by a signal, 1 unexpected error.");
   log("");
   log(`Agent setup: ${AGENT_SETUP_URL}`);
   log("Use `roughdraft help agent` for a copyable setup prompt.");
 }
+
+const WATCH_FLAG_HELP = [
+  "  --timeout <seconds>       Give up after this long (exit 4); omitted means no limit",
+  "  --pending                 Return a Done no agent has acknowledged yet (default)",
+  "  --no-pending              Only wait for the next Done",
+  "  --after <sequence>        Only return Dones after this sequence number",
+  "  --no-ack                  Do not acknowledge the returned Done",
+  "  --reconnect <seconds>     How long to wait for a lost server, default 120",
+  "  --replay                  Return every retained Done for this file",
+  "  --batch-window <seconds>  Small event batching window, default 0.25",
+];
 
 function printCommandHelp(
   command: KnownCommand,
@@ -906,46 +949,51 @@ function printCommandHelp(
     log(
       "  roughdraft open <path> [--no-open] [--no-watch] [--print-url] [--port <port>]",
     );
+    log(
+      "                         [--harness <name>] [--session-label <text>] [--session-link <url>] [--session-id <id>]",
+    );
     log("");
     log(
       "Opens one Markdown file and waits for Done Reviewing. Starts Roughdraft if needed.",
     );
+    log(
+      "The watcher is armed before the window opens, so an early Done is not missed.",
+    );
     log("");
     log("Flags:");
     log(
-      "  --no-open            Start/reuse the server without opening a browser",
+      "  --no-open                 Start/reuse the server without opening a browser",
     );
     log(
-      "  --print-url          Print only the document URL and do not open it",
+      "  --print-url               Print only the document URL and do not open it",
     );
-    log("  --no-watch           Open the file without waiting");
-    log("  --timeout <seconds>  Maximum watch time; omitted means no timeout");
-    log("  --replay             Allow watch to return retained older events");
-    log("  --json               Print machine-readable output");
-    log("  --port <port>        Preferred server port");
-    log("  --state-file <path>  Server state file");
-    log("  --state-dir <dir>    Directory containing server.json");
+    log("  --no-watch                Open the file without waiting");
+    for (const line of WATCH_FLAG_HELP) log(line);
+    log(
+      "  --harness <name>          Register the session that opened the file (ROUGHDRAFT_HARNESS)",
+    );
+    log(
+      "  --session-label <text>    Session label shown in the app (ROUGHDRAFT_SESSION_LABEL)",
+    );
+    log(
+      "  --session-link <url>      Link back to the session (ROUGHDRAFT_SESSION_LINK)",
+    );
+    log(
+      "  --session-id <id>         Session id passed to the wake route (ROUGHDRAFT_SESSION_ID)",
+    );
+    log("  --json                    Print one JSON object");
+    log("  --port <port>             Preferred server port");
+    log("  --state-file <path>       Server state file");
+    log("  --state-dir <dir>         Directory containing server.json");
     log("");
     log("Environment variables:");
     log(
-      "  ROUGHDRAFT_HOST       Route open through a hosted Roughdraft instance",
+      "  ROUGHDRAFT_TOKEN      Bearer token sent on every request. Required when",
     );
-    log("                        (remote mode). The CLI registers a session,");
-    log("                        opens an SSE channel, and writes save events");
-    log("                        back to disk.");
     log(
-      "  ROUGHDRAFT_TOKEN      Bearer token sent on remote-document requests.",
+      "                        the server binds a non-loopback host (ROUGHDRAFT_BIND_HOST).",
     );
-    log("                        Required when the hosted server binds to a");
-    log("                        non-loopback host. Must match the value the");
-    log("                        hosted server was started with.");
     log("  ROUGHDRAFT_NO_OPEN    Set to 1 to suppress browser launch.");
-    log("  ROUGHDRAFT_BIND_HOST  Comma-separated bind hosts for the hosted");
-    log(
-      "                        server (default: loopback). Set to 0.0.0.0 or",
-    );
-    log("                        a Tailscale interface to expose remotely.");
-    log("                        Requires ROUGHDRAFT_TOKEN.");
     return;
   }
 
@@ -967,7 +1015,10 @@ function printCommandHelp(
     log("Usage:");
     log("  roughdraft status [--json]");
     log("");
-    log("Shows whether Roughdraft is running.");
+    log(
+      "Shows whether Roughdraft is running, and one line per open document: tabs,",
+    );
+    log("whether an agent is listening, and whether a Done is waiting.");
     log("");
     log("Flags:");
     log("  --json               Print machine-readable output");
@@ -1005,22 +1056,76 @@ function printCommandHelp(
     log("  roughdraft watch <path> [--json] [--timeout <seconds>]");
     log("");
     log(
-      "Waits until Roughdraft receives Done Reviewing for one Markdown file.",
+      "Waits until Roughdraft receives Done Reviewing for one Markdown file. A Done",
+    );
+    log(
+      "that is already waiting comes back at once. Survives server restarts.",
     );
     log("");
     log("Flags:");
-    log("  --json                    Print machine-readable output");
-    log(
-      "  --timeout <seconds>       Maximum wait time; omitted means no timeout",
-    );
-    log(
-      "  --batch-window <seconds>  Small event batching window, default 0.25",
-    );
-    log(
-      "  --replay                  Return retained older events if available",
-    );
+    log("  --json                    Print one JSON object");
+    for (const line of WATCH_FLAG_HELP) log(line);
     log("  --state-file <path>       Server state file");
     log("  --state-dir <dir>         Directory containing server.json");
+    return;
+  }
+
+  if (command === "pending") {
+    log("Usage:");
+    log("  roughdraft pending [<path>] [--ack] [--all] [--json]");
+    log("");
+    log(
+      "Lists Dones no agent has acknowledged, for one file or all of them. Reads",
+    );
+    log("the session log on disk when the server is not running.");
+    log("");
+    log("Flags:");
+    log("  --ack    Acknowledge what it lists");
+    log("  --all    Include acknowledged Dones from the last 7 days");
+    log("  --json   Print one JSON object");
+    return;
+  }
+
+  if (command === "ack") {
+    log("Usage:");
+    log("  roughdraft ack <handoffId>... [--json]");
+    log("");
+    log("Acknowledges Dones by handoff id. Exits 2 when no id is known.");
+    return;
+  }
+
+  if (command === "log") {
+    log("Usage:");
+    log("  roughdraft log [--json]");
+    log("");
+    log(
+      "Shows the session log: each document with its session, wake route, latest",
+    );
+    log("Done and the result of its wake.");
+    return;
+  }
+
+  if (command === "route") {
+    log("Usage:");
+    log("  roughdraft route list");
+    log(
+      '  roughdraft route add <harness> --command "<text>" | --url <url> [--label <text>]',
+    );
+    log("  roughdraft route test <harness>");
+    log("  roughdraft route remove <harness>");
+    log("");
+    log(
+      "Wake routes tell Roughdraft how to reach a harness when you click Done.",
+    );
+    log(
+      "A command runs through the shell with {message}, {file}, {link} and {sessionId}",
+    );
+    log(
+      "replaced, and ROUGHDRAFT_* variables set. A url receives a JSON POST.",
+    );
+    log(
+      "`route test` exits 0 when the test wake was sent and 3 when it failed.",
+    );
     return;
   }
 
@@ -1066,6 +1171,8 @@ function printAgentHelp(log: (message: string) => void) {
   log(AGENT_SETUP_PROMPT);
   log("");
   log(`Live setup instructions: ${AGENT_SETUP_URL}`);
+  log("");
+  for (const line of DONE_LOG_PARAGRAPH) log(line);
   log("");
   log(
     "This command only prints setup text. It does not edit agent instruction files.",
@@ -1174,258 +1281,10 @@ function buildTargetUrl(baseUrl: string, openPath: string): string {
   return url.toString();
 }
 
-interface SseEvent {
-  event: string;
-  data: string;
-}
-
-interface ParsedSseChunk {
-  events: SseEvent[];
-  remainder: string;
-}
-
-function parseSseEvents(buffer: string): ParsedSseChunk {
-  // Normalize CRLF to LF up front so the rest of the parser can treat \n
-  // as the only line terminator. SSE allows \r\n; some proxies rewrite it.
-  const normalized = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const events: SseEvent[] = [];
-  let cursor = 0;
-  while (true) {
-    const blank = normalized.indexOf("\n\n", cursor);
-    if (blank === -1) break;
-    const block = normalized.slice(cursor, blank);
-    let eventName = "message";
-    const dataLines: string[] = [];
-    for (const line of block.split("\n")) {
-      if (line.startsWith("event: ")) {
-        eventName = line.slice(7).trim();
-      } else if (line.startsWith("data: ")) {
-        dataLines.push(line.slice(6));
-      }
-    }
-    if (dataLines.length > 0) {
-      events.push({ event: eventName, data: dataLines.join("\n") });
-    }
-    cursor = blank + 2;
-  }
-  return { events, remainder: normalized.slice(cursor) };
-}
-
-async function atomicWriteFile(
-  targetPath: string,
-  content: string,
-): Promise<void> {
-  const tmpPath = `${targetPath}.tmp-${process.pid}-${Date.now()}`;
-  await fs.promises.writeFile(tmpPath, content);
-  await fs.promises.rename(tmpPath, targetPath);
-}
-
-function appendTokenToViewerUrl(viewerUrl: string, token: string): string {
-  if (token.length === 0) return viewerUrl;
-  try {
-    const parsed = new URL(viewerUrl);
-    parsed.searchParams.set("token", token);
-    return parsed.toString();
-  } catch {
-    // Fall back to a simple suffix if the URL is malformed; the browser will
-    // reject it the same way it would have without the token.
-    const separator = viewerUrl.includes("?") ? "&" : "?";
-    return `${viewerUrl}${separator}token=${encodeURIComponent(token)}`;
-  }
-}
-
-interface RemoteOpenOptions {
-  host: string;
-  openPath: string;
-  noOpen: boolean;
-  printUrl: boolean;
-  json: boolean;
-}
-
-async function runRemoteOpen(
-  deps: CliDependencies,
-  options: RemoteOpenOptions,
-): Promise<number> {
-  const baseUrl = options.host.replace(/\/$/, "");
-  const remoteToken =
-    typeof deps.env.ROUGHDRAFT_TOKEN === "string"
-      ? deps.env.ROUGHDRAFT_TOKEN.trim()
-      : "";
-  const authHeaders: Record<string, string> =
-    remoteToken.length > 0 ? { Authorization: `Bearer ${remoteToken}` } : {};
-
-  let content: string;
-  try {
-    content = await fs.promises.readFile(options.openPath, "utf-8");
-  } catch (error) {
-    deps.error(
-      error instanceof Error
-        ? error.message
-        : `Could not read ${options.openPath}`,
-    );
-    return 1;
-  }
-
-  const sessionId = crypto.randomUUID();
-
-  const REGISTER_TIMEOUT_MS = 10_000;
-  let registerResponse: Response;
-  try {
-    registerResponse = await deps.fetchImpl(`${baseUrl}/api/remote-document`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders },
-      body: JSON.stringify({
-        sessionId,
-        originPath: options.openPath,
-        content,
-      }),
-      signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
-    });
-  } catch (error) {
-    deps.error(
-      `Could not register remote session at ${baseUrl}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    return 1;
-  }
-
-  if (!registerResponse.ok) {
-    if (registerResponse.status === 401) {
-      deps.error(
-        `Remote host rejected the session register (HTTP 401). Set ROUGHDRAFT_TOKEN to the token configured on the host before retrying.`,
-      );
-    } else {
-      deps.error(
-        `Remote host rejected the session register (HTTP ${registerResponse.status}).`,
-      );
-    }
-    return 1;
-  }
-
-  const registerPayload = (await registerResponse.json()) as {
-    id?: string;
-    version?: string;
-    viewerUrl?: string;
-  };
-
-  // The browser viewer must include the same token so its fetches and
-  // EventSource connection authenticate. The server's viewerUrl response field
-  // is unaware of the token (it doesn't see secrets in plaintext over the wire
-  // unless we add them); the CLI knows the token and can append it.
-  const baseViewer =
-    typeof registerPayload.viewerUrl === "string"
-      ? registerPayload.viewerUrl
-      : `${baseUrl}/?session=${encodeURIComponent(sessionId)}`;
-  const viewerUrl = appendTokenToViewerUrl(baseViewer, remoteToken);
-
-  if (options.printUrl) {
-    deps.log(viewerUrl);
-    return 0;
-  }
-
-  if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
-    deps.openUrl(viewerUrl);
-  }
-
-  if (options.json) {
-    emitJson(deps.log, {
-      opened: true,
-      mode: "remote",
-      sessionId,
-      url: viewerUrl,
-      host: baseUrl,
-      path: options.openPath,
-    });
-  } else {
-    deps.log(`Opened remote Roughdraft session: ${viewerUrl}`);
-    deps.log(`Holding session open for ${options.openPath}. Ctrl-C to exit.`);
-  }
-
-  const SSE_CONNECT_TIMEOUT_MS = 10_000;
-  const eventsUrl = new URL(
-    `/api/remote-document/${encodeURIComponent(sessionId)}/events`,
-    baseUrl,
-  );
-  eventsUrl.searchParams.set("role", "cli");
-
-  let eventsResponse: Response;
-  try {
-    eventsResponse = await deps.fetchImpl(eventsUrl.toString(), {
-      headers: { Accept: "text/event-stream", ...authHeaders },
-      signal: AbortSignal.timeout(SSE_CONNECT_TIMEOUT_MS),
-    });
-  } catch (error) {
-    deps.error(
-      `Lost connection to remote host: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    return 1;
-  }
-
-  if (!eventsResponse.ok || !eventsResponse.body) {
-    deps.error(
-      `Could not open remote event stream (HTTP ${eventsResponse.status}).`,
-    );
-    return 1;
-  }
-
-  const reader = eventsResponse.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  try {
-    while (true) {
-      let chunk: ReadableStreamReadResult<Uint8Array>;
-      try {
-        chunk = await reader.read();
-      } catch {
-        break;
-      }
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      const parsed = parseSseEvents(buffer);
-      buffer = parsed.remainder;
-      for (const event of parsed.events) {
-        if (event.event === "save") {
-          let payload: { content?: unknown } = {};
-          try {
-            payload = JSON.parse(event.data) as { content?: unknown };
-          } catch {
-            continue;
-          }
-          if (typeof payload.content === "string") {
-            try {
-              await atomicWriteFile(options.openPath, payload.content);
-              if (!options.json) {
-                deps.log(`Saved ${options.openPath} from remote.`);
-              }
-            } catch (error) {
-              deps.error(
-                `Failed to write ${options.openPath}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            }
-          }
-        }
-      }
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // The stream may already be in an errored state; ignore.
-    }
-  }
-
-  if (!options.json) {
-    deps.log("Remote session disconnected.");
-  }
-  return 0;
-}
-
+/**
+ * Asks a tab that already shows this file to come forward. Only a tab that
+ * acknowledges the request counts; anything else opens a new window.
+ */
 async function sendOpenRequestToExistingWindow(
   deps: CliDependencies,
   baseUrl: string,
@@ -1434,77 +1293,86 @@ async function sendOpenRequestToExistingWindow(
 ): Promise<boolean> {
   try {
     const requestUrl = new URL("/api/open-request", baseUrl);
-    const response = await deps.fetchImpl(requestUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: openPath, url: targetUrl }),
-      signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
-    });
+    const response = await deps.fetchImpl(
+      requestUrl,
+      withAuth(deps, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: openPath, url: targetUrl }),
+        // The server waits up to 1 s for the tab's acknowledgement.
+        signal: AbortSignal.timeout(OPEN_REQUEST_TIMEOUT_MS),
+      }),
+    );
 
     if (!response.ok) {
       return false;
     }
 
-    const payload = (await response.json()) as { delivered?: unknown };
-    return payload.delivered === true;
+    const payload = (await response.json()) as {
+      delivered?: unknown;
+      acknowledged?: unknown;
+    };
+    return payload.acknowledged === true;
   } catch {
     return false;
   }
 }
 
-function resolveTargetPath(inputPath: string): ResolvedTargetPath {
-  const resolvedPath = path.resolve(inputPath);
+function resolveTargetPath(
+  inputPath: string,
+  cwd?: string,
+): ResolvedTargetPath {
+  const resolvedPath = cwd
+    ? path.resolve(cwd, inputPath)
+    : path.resolve(inputPath);
   const looksLikeMarkdownFile = resolvedPath.toLowerCase().endsWith(".md");
+  let stat: fs.Stats;
 
   try {
-    const stat = fs.statSync(resolvedPath);
-    if (stat.isDirectory()) {
-      throw new Error(`Roughdraft can only open .md files: ${resolvedPath}`);
-    }
-
-    if (stat.isFile()) {
-      if (!looksLikeMarkdownFile) {
-        throw new Error(`Roughdraft can only open .md files: ${resolvedPath}`);
-      }
-
-      return {
-        projectDir: path.dirname(resolvedPath),
-        openPath: resolvedPath,
-      };
-    }
+    stat = fs.statSync(resolvedPath);
   } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message.startsWith("Roughdraft can only open")
-    ) {
-      throw error;
-    }
-
     const errorCode = (error as NodeJS.ErrnoException).code;
-    if (errorCode === "ENOENT") {
-      throw new Error(`Path not found: ${resolvedPath}`);
+    if (errorCode === "ENOENT" || errorCode === "ENOTDIR") {
+      throw new CliError("PATH_NOT_FOUND", `Path not found: ${resolvedPath}`, {
+        details: { path: resolvedPath },
+      });
     }
 
-    throw new Error(`Failed to read path: ${resolvedPath}`);
+    throw new CliError(
+      "PATH_UNREADABLE",
+      `Failed to read path: ${resolvedPath}`,
+      { cause: error, details: { path: resolvedPath } },
+    );
   }
 
-  throw new Error(`Unsupported path: ${resolvedPath}`);
-}
-
-export function getServerStateFilePath(
-  env: NodeJS.ProcessEnv = process.env,
-): string {
-  const explicitFile = env.ROUGHDRAFT_STATE_FILE?.trim();
-  if (explicitFile) {
-    return path.resolve(explicitFile);
+  if (stat.isDirectory() || (stat.isFile() && !looksLikeMarkdownFile)) {
+    throw new CliError(
+      "NOT_MARKDOWN",
+      `Roughdraft can only open .md files: ${resolvedPath}`,
+      { details: { path: resolvedPath } },
+    );
   }
 
-  const explicitDir = env.ROUGHDRAFT_STATE_DIR?.trim();
-  if (explicitDir) {
-    return path.join(path.resolve(explicitDir), "server.json");
+  if (!stat.isFile()) {
+    throw new CliError("PATH_UNREADABLE", `Unsupported path: ${resolvedPath}`, {
+      details: { path: resolvedPath },
+    });
   }
 
-  return path.join(os.homedir(), ".roughdraft", "server.json");
+  try {
+    fs.accessSync(resolvedPath, fs.constants.R_OK);
+  } catch (error) {
+    throw new CliError(
+      "PATH_UNREADABLE",
+      `Failed to read path: ${resolvedPath}`,
+      { cause: error, details: { path: resolvedPath } },
+    );
+  }
+
+  return {
+    projectDir: path.dirname(resolvedPath),
+    openPath: resolvedPath,
+  };
 }
 
 function isValidServerState(value: unknown): value is RoughdraftServerState {
@@ -1599,9 +1467,9 @@ async function getStatusPayload(
     try {
       const response = await deps.fetchImpl(
         buildLoopbackUrl(host, port, STATUS_PATH),
-        {
+        withAuth(deps, {
           signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
-        },
+        }),
       );
 
       if (!response.ok) {
@@ -1627,7 +1495,13 @@ async function waitForServer(port: number, deps: CliDependencies) {
     await deps.sleepImpl(SERVER_WAIT_DELAY_MS);
   }
 
-  throw new Error("Timed out waiting for Roughdraft to start.");
+  throw new CliError(
+    "SERVER_START_FAILED",
+    `Timed out waiting for Roughdraft to start on port ${port}.`,
+    {
+      hint: "Run `roughdraft doctor`, then `roughdraft start` to try again.",
+    },
+  );
 }
 
 async function waitForServerToStop(
@@ -1675,9 +1549,10 @@ async function resolveLiveDevFrontendBaseUrl(
       }
     } else {
       const statusUrl = new URL("/api/status", frontendUrl);
-      const response = await deps.fetchImpl(statusUrl, {
-        signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
-      });
+      const response = await deps.fetchImpl(
+        statusUrl,
+        withAuth(deps, { signal: AbortSignal.timeout(STATUS_TIMEOUT_MS) }),
+      );
 
       if (!response.ok) {
         return null;
@@ -1864,13 +1739,26 @@ export async function ensureServerRunning(
   const preferredPort = getPreferredPort(deps.env);
   const port = await deps.findAvailablePortImpl(preferredPort);
   const projectDir = path.resolve(options.projectDir ?? deps.cwd);
-  const spawned = await deps.spawnServerProcess({
-    port,
-    projectDir,
-  });
-
+  let spawned: SpawnedServer;
   try {
-    await waitForServer(port, deps);
+    spawned = await deps.spawnServerProcess({
+      port,
+      projectDir,
+      stateDir: getStateDir(deps.env),
+      env: deps.env,
+    });
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError(
+      "SERVER_START_FAILED",
+      `Could not start Roughdraft: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error, hint: "Run `roughdraft doctor` to check the install." },
+    );
+  }
+
+  let startedStatus: StatusPayload;
+  try {
+    startedStatus = await waitForServer(port, deps);
   } catch (error) {
     await deps.stopProcess(spawned.pid);
     throw error;
@@ -1892,7 +1780,10 @@ export async function ensureServerRunning(
       pid: state.pid,
       startedAt: state.startedAt,
       version: readPackageVersion(),
-      instanceId: null,
+      instanceId:
+        typeof startedStatus.instanceId === "string"
+          ? startedStatus.instanceId
+          : null,
       versionMatches: true,
     },
     reused: false,
@@ -2027,6 +1918,7 @@ async function runDoctor(
     serverRoot: trackedStatus?.serverRoot ?? null,
     serverRootMatches,
     browserOpeningDisabled: deps.env.ROUGHDRAFT_NO_OPEN === "1",
+    serverWarnings: trackedStatus?.warnings ?? preferredStatus?.warnings ?? [],
     cwd: deps.cwd,
     cwdReadable,
     devWrapper:
@@ -2044,7 +1936,7 @@ async function runDoctor(
   };
 
   if (json) {
-    emitJson(deps.log, report);
+    emitJson(deps.log, okEnvelope(report));
     return 0;
   }
 
@@ -2077,6 +1969,9 @@ async function runDoctor(
     `Browser opening disabled: ${report.browserOpeningDisabled ? "yes" : "no"}`,
   );
   deps.log(`Current directory readable: ${report.cwdReadable ? "yes" : "no"}`);
+  for (const warning of report.serverWarnings) {
+    deps.log(`Server warning: ${warning}`);
+  }
   if (report.devWrapper) {
     deps.log(
       `Dev wrapper command: ${report.devWrapper.commandName ?? "unknown"}`,
@@ -2097,8 +1992,10 @@ async function runMarkdownDoctor(
   json: boolean,
 ): Promise<number> {
   if (!isMarkdownPath(targetPath)) {
-    deps.error(`Roughdraft doctor can only validate .md files: ${targetPath}`);
-    return USAGE_ERROR;
+    throw new CliError(
+      "NOT_MARKDOWN",
+      `Roughdraft doctor can only validate .md files: ${targetPath}`,
+    );
   }
 
   const absolutePath = path.resolve(deps.cwd, targetPath);
@@ -2107,21 +2004,31 @@ async function runMarkdownDoctor(
   try {
     const stat = fs.statSync(absolutePath);
     if (!stat.isFile()) {
-      deps.error(`Path is not a file: ${absolutePath}`);
-      return USAGE_ERROR;
+      throw new CliError(
+        "NOT_MARKDOWN",
+        `Path is not a file: ${absolutePath}`,
+        { details: { path: absolutePath } },
+      );
     }
     markdown = fs.readFileSync(absolutePath, "utf8");
   } catch (error) {
+    if (error instanceof CliError) throw error;
     const code =
       error instanceof Error && "code" in error
         ? String((error as NodeJS.ErrnoException).code)
         : "";
-    deps.error(
-      code === "ENOENT"
-        ? `Path not found: ${absolutePath}`
-        : `Could not read path: ${absolutePath}`,
-    );
-    return USAGE_ERROR;
+    throw code === "ENOENT"
+      ? new CliError("PATH_NOT_FOUND", `Path not found: ${absolutePath}`, {
+          details: { path: absolutePath },
+        })
+      : new CliError(
+          "PATH_UNREADABLE",
+          `Could not read path: ${absolutePath}`,
+          {
+            cause: error,
+            details: { path: absolutePath },
+          },
+        );
   }
 
   const validation = validateRoughdraftMarkdown(markdown);
@@ -2137,8 +2044,13 @@ async function runMarkdownDoctor(
   };
 
   if (json) {
-    emitJson(deps.log, payload);
-    return validation.ok ? 0 : 1;
+    const exitCode = validation.ok ? 0 : 1;
+    emitJson(deps.log, {
+      ...payload,
+      status: validation.ok ? "ok" : "error",
+      exitCode,
+    });
+    return exitCode;
   }
 
   const displayPath = relativeDisplayPath(deps.cwd, absolutePath);
@@ -2171,71 +2083,668 @@ async function runMarkdownDoctor(
   return validation.ok ? 0 : 1;
 }
 
-async function runWatch(
-  deps: CliDependencies,
-  targetPath: string,
-  options: ParsedWatchOptions,
-  json: boolean,
-): Promise<number> {
-  const target = resolveTargetPath(targetPath);
-  let serverUrl = options.serverUrl;
-  if (!serverUrl) {
-    const result = await ensureServerRunning(deps, {
-      projectDir: target.projectDir,
-    });
-    serverUrl = result.server.url;
-  }
-  const relativePath = path.relative(target.projectDir, target.openPath);
-  const body: {
-    projectPath: string;
-    path: string;
-    timeoutSeconds?: number;
-    batchWindowSeconds: number;
-    fromNow: boolean;
-  } = {
-    projectPath: target.projectDir,
-    path: relativePath,
-    batchWindowSeconds: options.batchWindowSeconds,
-    fromNow: !options.replay,
-  };
-  if (options.timeoutSeconds !== undefined) {
-    body.timeoutSeconds = options.timeoutSeconds;
-  }
+interface CommandContext {
+  /** Included as `path` in every envelope, errors too. */
+  path?: string;
+  /** Command keys every envelope of this command carries (errors too). */
+  extra: () => Record<string, unknown>;
+}
 
-  const response = await deps.fetchImpl(
-    new URL("/api/review-events/watch", serverUrl),
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      ...(options.timeoutSeconds !== undefined
-        ? { signal: AbortSignal.timeout((options.timeoutSeconds + 5) * 1000) }
-        : {}),
-    },
+function okEnvelope(
+  payload: Record<string, unknown>,
+  options: { status?: "ok" | "completed"; exitCode?: number } = {},
+): Record<string, unknown> {
+  const exitCode = options.exitCode ?? 0;
+  return {
+    ok: exitCode === 0,
+    status: exitCode === 0 ? (options.status ?? "ok") : "error",
+    exitCode,
+    ...payload,
+  };
+}
+
+function quoteArg(value: string): string {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function plural(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+function describeSummary(summary: HandoffRecord["summary"] | undefined) {
+  if (!summary) return "no counts";
+  return [
+    plural(summary.comments, "comment"),
+    plural(summary.suggestions, "suggestion"),
+    `${summary.unresolved} unresolved`,
+  ].join(", ");
+}
+
+function formatTime(iso: string | null | undefined): string {
+  if (!iso) return "unknown time";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const time = date.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return time;
+  return `${date.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${time}`;
+}
+
+function describeHandoffState(handoff: HandoffRecord): string {
+  if (handoff.state === "acknowledged") {
+    return `picked up at ${formatTime(handoff.ackedAt)}${handoff.ackedBy ? ` by ${handoff.ackedBy}` : ""}`;
+  }
+  if (handoff.state === "superseded") return "superseded by a later Done";
+  if (handoff.state === "delivered") return "delivered, not acknowledged";
+  return "waiting";
+}
+
+function describeWake(handoff: HandoffRecord): string {
+  const wake = handoff.wake;
+  if (!wake || (wake.routeId === null && wake.state === "none")) {
+    return "no wake route";
+  }
+  if (wake.state === "sent") {
+    return `sent to ${wake.routeId} at ${formatTime(wake.at)}`;
+  }
+  if (wake.state === "failed") {
+    return `failed${wake.routeId ? ` (${wake.routeId})` : ""}: ${wake.error ?? "unknown error"}`;
+  }
+  return `sending to ${wake.routeId}`;
+}
+
+function describeRoute(route: WakeRoute | null | undefined): string {
+  if (!route) return "none registered";
+  const target = route.kind === "url" ? route.url : route.command;
+  const state = route.lastError
+    ? `last test failed: ${route.lastError}`
+    : route.verifiedAt
+      ? `verified ${formatTime(route.verifiedAt)}`
+      : "not verified";
+  return `${route.harness} (${route.kind} ${target}), ${state}`;
+}
+
+/** "plan.md: 1 tab, no agent listening, Done waiting since 3:42 PM (4 comments)" */
+function formatDocumentLine(view: DocumentView): string {
+  const parts = [
+    plural(view.tabs, "tab"),
+    view.watchers > 0
+      ? `${plural(view.watchers, "agent")} listening`
+      : "no agent listening",
+  ];
+  const latest = view.handoffs.at(-1);
+  if (!latest) {
+    parts.push("no Done yet");
+  } else if (latest.state === "pending" || latest.state === "delivered") {
+    parts.push(
+      `Done waiting since ${formatTime(latest.createdAt)} (${plural(latest.summary.comments, "comment")})`,
+    );
+  } else if (latest.state === "acknowledged") {
+    parts.push(`Done picked up at ${formatTime(latest.ackedAt)}`);
+  }
+  if (view.session) parts.push(`opened by ${view.session.label}`);
+  return `${path.basename(view.documentPath)}: ${parts.join(", ")}`;
+}
+
+function printWatchNotice(deps: CliDependencies, notice: WatchNotice) {
+  if (notice.type === "connection-lost") {
+    deps.error(
+      `roughdraft: lost the connection to Roughdraft${notice.serverUrl ? ` at ${notice.serverUrl}` : ""}; reconnecting.`,
+    );
+    return;
+  }
+  deps.error(
+    `roughdraft: reconnected to ${notice.serverUrl}${notice.instanceChanged ? " (a new server instance)" : ""}.`,
   );
+}
 
-  if (!response.ok) {
-    throw new Error(`Failed to watch review events: ${response.status}`);
+interface WatchFlowOptions {
+  command: "watch" | "open";
+  target: ResolvedTargetPath;
+  json: boolean;
+  includePending: boolean;
+  afterSequence?: number;
+  replay: boolean;
+  timeoutSeconds?: number;
+  reconnectSeconds?: number;
+  batchWindowSeconds: number;
+  ack: boolean;
+  /** The dev API behind a live dev frontend; otherwise found from server.json. */
+  fixedServerUrl?: string;
+  /** Runs once the server holds the watcher (open opens the window here). */
+  onArmed?: (server: ServerStatus) => Promise<void>;
+}
+
+function pendingHint(openPath: string): string {
+  return `Run \`roughdraft pending ${quoteArg(openPath)} --json\` to check for a Done, then \`roughdraft watch ${quoteArg(openPath)} --json\` to keep waiting.`;
+}
+
+async function runWatchFlow(
+  deps: CliDependencies,
+  options: WatchFlowOptions,
+  ctx: CommandContext,
+): Promise<number> {
+  const { target } = options;
+  const relativePath = path.relative(target.projectDir, target.openPath);
+  const hint = pendingHint(target.openPath);
+  const controller = new AbortController();
+  const unsubscribe = deps.onInterrupt((signal) => {
+    controller.abort(interruptedError(signal, hint));
+  });
+
+  let result: WatchResult;
+  try {
+    result = await watchReviewEvents({
+      fetchImpl: deps.fetchImpl,
+      resolveServer: createServerResolver({
+        env: deps.env,
+        fetchImpl: deps.fetchImpl,
+        fixedUrl: options.fixedServerUrl,
+        serverRoot: currentServerRoot,
+      }),
+      projectPath: target.projectDir,
+      relativePath,
+      afterSequence: options.afterSequence,
+      fromNow: !options.replay,
+      includePending: options.includePending,
+      timeoutMs:
+        options.timeoutSeconds !== undefined
+          ? options.timeoutSeconds * 1000
+          : undefined,
+      batchWindowSeconds: options.batchWindowSeconds,
+      client: `roughdraft-cli ${options.command}`,
+      headers: authHeaders(deps.env),
+      signal: controller.signal,
+      tuning: {
+        ...deps.watchTuning,
+        ...(options.reconnectSeconds !== undefined
+          ? { reconnectMs: options.reconnectSeconds * 1000 }
+          : {}),
+      },
+      now: deps.now,
+      onArmed: async ({ server }) => {
+        await options.onArmed?.(server);
+      },
+      onNotice: (notice) => printWatchNotice(deps, notice),
+    });
+  } catch (error) {
+    if (error instanceof CliError && error.code === "SERVER_LOST") {
+      error.hint = hint;
+    }
+    throw error;
+  } finally {
+    unsubscribe();
   }
 
-  const payload = (await response.json()) as {
-    events?: unknown[];
-    timedOut?: boolean;
-    nextSequence?: number;
+  if (result.status === "timeout") {
+    throw new CliError(
+      "WATCH_TIMEOUT",
+      `No Done Reviewing for ${target.openPath} within ${options.timeoutSeconds ?? 0} s.`,
+      {
+        hint,
+        details: {
+          events: [],
+          timedOut: true,
+          nextSequence: result.nextSequence,
+          handoff: null,
+          server: result.server,
+        },
+      },
+    );
+  }
+
+  if (options.json) {
+    emitJson(
+      deps.log,
+      okEnvelope(
+        {
+          path: target.openPath,
+          ...ctx.extra(),
+          server: result.server,
+          handoff: result.handoff,
+          events: result.events,
+          timedOut: false,
+          nextSequence: result.nextSequence,
+        },
+        { status: "completed" },
+      ),
+    );
+  } else {
+    deps.log(`Review completed for ${target.openPath}.`);
+    deps.log(`Received ${result.events.length} event(s).`);
+    const last = result.events.at(-1);
+    if (last?.summary) deps.log(`Feedback: ${describeSummary(last.summary)}.`);
+    if (last?.overallComment) {
+      deps.log(`Overall comment: ${last.overallComment}`);
+    }
+  }
+
+  // The handoff is acknowledged only after the result is out, so a reader
+  // that never got it (a closed pipe, a crash) leaves it pending.
+  const handoffIds = result.handoffs
+    .filter((handoff) => handoff.state !== "acknowledged")
+    .map((handoff) => handoff.handoffId);
+  if (options.ack && handoffIds.length > 0) {
+    try {
+      await ackHandoffs(
+        apiContext(deps, result.server.url),
+        handoffIds,
+        `roughdraft-cli ${options.command}`,
+      );
+    } catch (error) {
+      deps.error(
+        `roughdraft: could not acknowledge the Done (${error instanceof Error ? error.message : String(error)}). Run \`roughdraft ack ${handoffIds.join(" ")}\`.`,
+      );
+    }
+  }
+
+  return 0;
+}
+
+type DocumentsSnapshot =
+  | {
+      source: "server";
+      server: ServerStatus;
+      instanceId: string | null;
+      logId: string | null;
+      documents: DocumentView[];
+    }
+  | {
+      source: "disk";
+      server: null;
+      instanceId: null;
+      logId: string | null;
+      documents: DocumentView[];
+      stateDir: string;
+    };
+
+/** The session log from the running server, or from disk when it is down. */
+async function readDocumentsSnapshot(
+  deps: CliDependencies,
+  server?: ServerStatus | null,
+): Promise<DocumentsSnapshot> {
+  const live =
+    server === undefined
+      ? await createServerResolver({
+          env: deps.env,
+          fetchImpl: deps.fetchImpl,
+          serverRoot: currentServerRoot,
+        })()
+      : server;
+  if (live && live.capabilities.documentRegistry === true) {
+    const listed = await listDocuments(apiContext(deps, live.url));
+    return {
+      source: "server",
+      server: live,
+      instanceId: listed.instanceId,
+      logId: listed.logId,
+      documents: listed.documents,
+    };
+  }
+  const stateDir = live?.stateDir ?? getStateDir(deps.env);
+  const disk = readReviewLogFromDisk(stateDir);
+  return {
+    source: "disk",
+    server: null,
+    instanceId: null,
+    logId: disk.logId,
+    documents: disk.documents.map((record: DocumentRecord) =>
+      documentViewFromRecord(record, null),
+    ),
+    stateDir,
   };
+}
+
+function countPending(documents: DocumentView[]): number {
+  return documents.reduce(
+    (total, document) =>
+      total +
+      document.handoffs.filter(
+        (handoff) =>
+          handoff.state === "pending" || handoff.state === "delivered",
+      ).length,
+    0,
+  );
+}
+
+async function runPending(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+  ctx: CommandContext,
+): Promise<number> {
+  if (options.positionals.length > 1) {
+    throw usageError("Usage: roughdraft pending [<path>] [--ack] [--all]");
+  }
+  const target = options.positionals[0]
+    ? resolveTargetPath(options.positionals[0], deps.cwd)
+    : null;
+  if (target) ctx.path = target.openPath;
+  const snapshot = await readDocumentsSnapshot(deps);
+  const handoffs: ListedHandoff[] = collectHandoffs(snapshot.documents, {
+    key: target ? documentKey(target.openPath) : undefined,
+    includeAcked: options.all,
+  });
+
+  let acked: string[] | undefined;
+  let ackError: string | undefined;
+  if (options.ack) {
+    const toAck = handoffs
+      .filter(
+        (handoff) =>
+          handoff.state === "pending" || handoff.state === "delivered",
+      )
+      .map((handoff) => handoff.handoffId);
+    if (snapshot.source === "server") {
+      acked =
+        toAck.length > 0
+          ? (
+              await ackHandoffs(
+                apiContext(deps, snapshot.server.url),
+                toAck,
+                "roughdraft-cli pending",
+              )
+            ).acked
+          : [];
+    } else {
+      acked = [];
+      if (toAck.length > 0) {
+        ackError =
+          "Roughdraft is not running, so nothing was acknowledged. Start it with `roughdraft start` and run this again.";
+      }
+    }
+  }
 
   if (json) {
-    emitJson(deps.log, payload);
-    return payload.timedOut ? 1 : 0;
+    emitJson(
+      deps.log,
+      okEnvelope({
+        ...(target ? { path: target.openPath } : {}),
+        source: snapshot.source,
+        handoffs,
+        ...(acked !== undefined ? { acked } : {}),
+        ...(ackError ? { ackError } : {}),
+      }),
+    );
+    return 0;
   }
 
-  if (payload.timedOut) {
-    deps.log(`No review completed event received for ${target.openPath}.`);
-    return 1;
+  if (handoffs.length === 0) {
+    deps.log(
+      target
+        ? `No Done waiting for ${target.openPath}.`
+        : "No Done waiting for any document.",
+    );
+  }
+  for (const handoff of handoffs) {
+    deps.log(
+      `${handoff.documentPath}: Done at ${formatTime(handoff.createdAt)} (${describeSummary(handoff.summary)}), ${describeHandoffState(handoff)}`,
+    );
+    deps.log(`  id: ${handoff.handoffId}`);
+    if (handoff.overallComment) {
+      deps.log(`  overall comment: ${handoff.overallComment}`);
+    }
+  }
+  if (snapshot.source === "disk") {
+    deps.log("(Roughdraft is not running; read from the session log on disk.)");
+  }
+  if (acked && acked.length > 0) {
+    deps.log(`Acknowledged ${plural(acked.length, "Done")}.`);
+  }
+  if (ackError) deps.error(`roughdraft: ${ackError}`);
+  return 0;
+}
+
+async function requireLiveServer(
+  deps: CliDependencies,
+  action: string,
+): Promise<ServerStatus> {
+  const server = await createServerResolver({
+    env: deps.env,
+    fetchImpl: deps.fetchImpl,
+    serverRoot: currentServerRoot,
+  })();
+  if (!server) {
+    throw new CliError(
+      "SERVER_UNREACHABLE",
+      `Roughdraft is not running, so it cannot ${action}.`,
+      { hint: "Start it with `roughdraft start`, then try again." },
+    );
+  }
+  return server;
+}
+
+async function runAck(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+): Promise<number> {
+  const ids = options.positionals;
+  if (ids.length === 0) {
+    throw usageError("Usage: roughdraft ack <handoffId>... [--json]");
+  }
+  const server = await requireLiveServer(deps, "acknowledge a Done");
+  const result = await ackHandoffs(
+    apiContext(deps, server.url),
+    ids,
+    "roughdraft-cli ack",
+  );
+  if (result.acked.length === 0) {
+    throw new CliError(
+      "HANDOFF_NOT_FOUND",
+      `No handoff found for ${ids.join(", ")}.`,
+      {
+        hint: "Run `roughdraft pending --json` to list the Dones that are waiting.",
+        details: { acked: [], unknown: result.unknown },
+      },
+    );
+  }
+  if (json) {
+    emitJson(
+      deps.log,
+      okEnvelope({ acked: result.acked, unknown: result.unknown }),
+    );
+    return 0;
+  }
+  for (const id of result.acked) deps.log(`Acknowledged ${id}.`);
+  for (const id of result.unknown)
+    deps.error(`roughdraft: unknown handoff ${id}`);
+  return 0;
+}
+
+async function runLog(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+): Promise<number> {
+  if (options.positionals.length > 0) {
+    throw usageError("Usage: roughdraft log [--json]");
+  }
+  const snapshot = await readDocumentsSnapshot(deps);
+  const routes =
+    snapshot.source === "server"
+      ? await listWakeRoutes(apiContext(deps, snapshot.server.url))
+      : readWakeRoutesFromDisk(snapshot.stateDir);
+  const documents = snapshot.documents.map((view) => ({
+    documentPath: view.documentPath,
+    url: view.url || null,
+    session: view.session,
+    route: view.session
+      ? (routes.find((route) => route.harness === view.session?.harness) ??
+        null)
+      : null,
+    latestHandoff: view.handoffs.at(-1) ?? null,
+    pendingHandoffs: view.pendingHandoffs,
+    tabs: view.tabs,
+    watchers: view.watchers,
+    lastActivityAt: view.lastActivityAt,
+  }));
+
+  if (json) {
+    emitJson(
+      deps.log,
+      okEnvelope({
+        source: snapshot.source,
+        ...(snapshot.server ? { serverUrl: snapshot.server.publicUrl } : {}),
+        documents,
+        routes,
+      }),
+    );
+    return 0;
   }
 
-  deps.log(`Review completed for ${target.openPath}.`);
-  deps.log(`Received ${(payload.events ?? []).length} event(s).`);
+  if (snapshot.source === "disk") {
+    deps.log("Roughdraft is not running; this is the session log on disk.");
+  }
+  if (documents.length === 0) {
+    deps.log("The session log is empty.");
+  }
+  for (const document of documents) {
+    deps.log(document.documentPath);
+    if (document.url) deps.log(`  Link: ${document.url}`);
+    const session = document.session as SessionRecord | null;
+    deps.log(
+      session
+        ? `  Session: ${session.label} (${session.harness}${session.sessionId ? `, id ${session.sessionId}` : ""})${session.link ? ` ${session.link}` : ""}`
+        : "  Session: none registered",
+    );
+    if (session) deps.log(`  Wake route: ${describeRoute(document.route)}`);
+    const latest = document.latestHandoff;
+    if (latest) {
+      deps.log(
+        `  Latest Done: ${formatTime(latest.createdAt)} (${describeSummary(latest.summary)}), ${describeHandoffState(latest)}`,
+      );
+      deps.log(`  Wake: ${describeWake(latest)}`);
+    } else {
+      deps.log("  Latest Done: none");
+    }
+  }
+  if (routes.length > 0) {
+    deps.log("");
+    deps.log("Wake routes:");
+    for (const route of routes) deps.log(`  ${describeRoute(route)}`);
+  }
+  return 0;
+}
+
+async function runRoute(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+): Promise<number> {
+  const [action, harness, ...extra] = options.positionals;
+  const usage =
+    "Usage: roughdraft route list | add <harness> --command <text> | --url <url> [--label <text>] | remove <harness> | test <harness>";
+  if (!action || extra.length > 0) throw usageError(usage);
+
+  if (action === "list") {
+    if (harness) throw usageError(usage);
+    const server = await createServerResolver({
+      env: deps.env,
+      fetchImpl: deps.fetchImpl,
+      serverRoot: currentServerRoot,
+    })();
+    const routes = server
+      ? await listWakeRoutes(apiContext(deps, server.url))
+      : readWakeRoutesFromDisk(getStateDir(deps.env));
+    if (json) {
+      emitJson(
+        deps.log,
+        okEnvelope({ source: server ? "server" : "disk", routes }),
+      );
+      return 0;
+    }
+    if (routes.length === 0) deps.log("No wake routes registered.");
+    for (const route of routes) deps.log(describeRoute(route));
+    return 0;
+  }
+
+  if (!["add", "remove", "test"].includes(action)) throw usageError(usage);
+  if (!harness) throw usageError(usage);
+  if (action !== "add" && (options.command || options.url || options.label)) {
+    throw usageError(usage);
+  }
+
+  if (action === "add") {
+    if ((options.command ? 1 : 0) + (options.url ? 1 : 0) !== 1) {
+      throw usageError(
+        "route add needs exactly one of --command <text> or --url <url>.",
+      );
+    }
+  }
+
+  const { server } = await ensureServerRunning(deps);
+  const api = apiContext(deps, server.url);
+
+  if (action === "add") {
+    const route = await putWakeRoute(api, harness, {
+      kind: options.command ? "command" : "url",
+      ...(options.command ? { command: options.command } : {}),
+      ...(options.url ? { url: options.url } : {}),
+      label: options.label ?? null,
+    });
+    if (json) {
+      emitJson(deps.log, okEnvelope({ route }));
+      return 0;
+    }
+    deps.log(`Saved the wake route for ${harness}.`);
+    deps.log(`Test it with \`roughdraft route test ${quoteArg(harness)}\`.`);
+    return 0;
+  }
+
+  if (action === "remove") {
+    const removed = await removeWakeRoute(api, harness);
+    if (!removed) {
+      throw new CliError(
+        "WAKE_ROUTE_NOT_FOUND",
+        `No wake route for ${harness}.`,
+        {
+          details: { harness, removed: false },
+        },
+      );
+    }
+    if (json) {
+      emitJson(deps.log, okEnvelope({ harness, removed: true }));
+      return 0;
+    }
+    deps.log(`Removed the wake route for ${harness}.`);
+    return 0;
+  }
+
+  const tested = await testWakeRoute(api, harness, "roughdraft-cli route test");
+  if (!tested.sent) {
+    throw new CliError(
+      "WAKE_ROUTE_FAILED",
+      `The wake route for ${harness} failed: ${tested.error ?? "unknown error"}`,
+      {
+        hint: `Fix it with \`roughdraft route add ${quoteArg(harness)} ...\` and test again.`,
+        details: {
+          harness,
+          sent: false,
+          error: tested.error,
+          durationMs: tested.durationMs,
+        },
+      },
+    );
+  }
+  if (json) {
+    emitJson(
+      deps.log,
+      okEnvelope({
+        harness,
+        sent: true,
+        error: null,
+        durationMs: tested.durationMs,
+      }),
+    );
+    return 0;
+  }
+  deps.log(
+    `Sent a test wake through the ${harness} route${tested.durationMs !== null ? ` in ${tested.durationMs} ms` : ""}.`,
+  );
   return 0;
 }
 
@@ -2271,23 +2780,501 @@ function getConfidentStopCandidate(
   return payload.pid;
 }
 
+async function runStop(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+): Promise<number> {
+  const stateFilePath = getServerStateFilePath(deps.env);
+  const stopResult = await stopTrackedServer(deps);
+  const emit = (payload: Record<string, unknown>, exitCode: number) => {
+    emitJson(deps.log, okEnvelope(payload, { exitCode }));
+    return exitCode;
+  };
+
+  if (!stopResult.persistedState) {
+    const preferredPort = getPreferredPort(deps.env);
+    const unmanagedServer = await getStatusPayload(preferredPort, deps);
+    if (unmanagedServer) {
+      const candidatePid = options.all
+        ? getConfidentStopCandidate(unmanagedServer)
+        : null;
+      if (candidatePid !== null) {
+        await deps.stopProcess(candidatePid);
+        const stopped = await waitForServerToStop(preferredPort, deps);
+        if (stopped) {
+          if (json) {
+            return emit(
+              {
+                stopped: true,
+                managed: false,
+                pid: candidatePid,
+                url: buildPublicBaseUrl(preferredPort),
+                stateFile: stateFilePath,
+              },
+              0,
+            );
+          }
+
+          deps.log(
+            `Stopped unmanaged Roughdraft at ${buildPublicBaseUrl(preferredPort)}.`,
+          );
+          return 0;
+        }
+      }
+
+      if (json) {
+        return emit(
+          {
+            stopped: false,
+            managed: false,
+            url: buildPublicBaseUrl(preferredPort),
+            ...(options.all
+              ? { reason: "No confident unmanaged process candidate." }
+              : {}),
+            stateFile: stateFilePath,
+          },
+          1,
+        );
+      }
+
+      deps.error(
+        options.all
+          ? `Roughdraft is still running at ${buildPublicBaseUrl(preferredPort)}, but it could not be matched to a safe process candidate. Stop it manually.`
+          : `Roughdraft is still running at ${buildPublicBaseUrl(preferredPort)}, but it is not managed by ${stateFilePath}. Stop it manually.`,
+      );
+      return 1;
+    }
+
+    if (json) {
+      return emit(
+        {
+          stopped: false,
+          running: false,
+          stateFile: stateFilePath,
+        },
+        0,
+      );
+    }
+
+    deps.log("Roughdraft is not running.");
+    return 0;
+  }
+
+  if (stopResult.failedPid !== null) {
+    if (json) {
+      return emit(
+        {
+          stopped: false,
+          pid: stopResult.failedPid,
+          stateFile: stateFilePath,
+        },
+        1,
+      );
+    }
+
+    deps.error(`Failed to stop Roughdraft process ${stopResult.failedPid}.`);
+    return 1;
+  }
+
+  if (!stopResult.portIsQuiet) {
+    if (options.all) {
+      const unmanagedServer = await getStatusPayload(
+        stopResult.persistedState.port,
+        deps,
+      );
+      const candidatePid = getConfidentStopCandidate(unmanagedServer);
+      if (candidatePid !== null) {
+        await deps.stopProcess(candidatePid);
+        const stopped = await waitForServerToStop(
+          stopResult.persistedState.port,
+          deps,
+        );
+        if (stopped) {
+          if (json) {
+            return emit(
+              {
+                stopped: true,
+                pid: stopResult.persistedState.pid,
+                unmanagedPid: candidatePid,
+                url: buildPublicBaseUrl(stopResult.persistedState.port),
+                stateFile: stateFilePath,
+              },
+              0,
+            );
+          }
+
+          deps.log(
+            `Stopped Roughdraft at ${buildPublicBaseUrl(stopResult.persistedState.port)}.`,
+          );
+          deps.log(`Stopped unmanaged Roughdraft process ${candidatePid}.`);
+          return 0;
+        }
+      }
+    }
+
+    if (json) {
+      return emit(
+        {
+          stopped: true,
+          pid: stopResult.persistedState.pid,
+          url: buildPublicBaseUrl(stopResult.persistedState.port),
+          anotherInstanceRunning: true,
+          ...(options.all
+            ? { reason: "No confident unmanaged process candidate." }
+            : {}),
+          stateFile: stateFilePath,
+        },
+        1,
+      );
+    }
+
+    deps.error(
+      `Stopped tracked Roughdraft process ${stopResult.persistedState.pid}, but another Roughdraft instance is still running at ${buildPublicBaseUrl(stopResult.persistedState.port)}.`,
+    );
+    return 1;
+  }
+
+  if (json) {
+    return emit(
+      {
+        stopped: true,
+        pid: stopResult.persistedState.pid,
+        url: buildPublicBaseUrl(stopResult.persistedState.port),
+        stateFile: stateFilePath,
+      },
+      0,
+    );
+  }
+
+  deps.log(
+    `Stopped Roughdraft at ${buildPublicBaseUrl(stopResult.persistedState.port)}.`,
+  );
+  return 0;
+}
+
+interface SessionOptions {
+  harness: string;
+  label: string;
+  link: string | null;
+  sessionId: string | null;
+}
+
+/**
+ * The session to register on `open`: flags first, then ROUGHDRAFT_HARNESS,
+ * ROUGHDRAFT_SESSION_LABEL, ROUGHDRAFT_SESSION_LINK, ROUGHDRAFT_SESSION_ID.
+ * Nothing is registered without a harness.
+ */
+function resolveSessionOptions(
+  options: ParsedCommandOptions,
+  env: NodeJS.ProcessEnv,
+): SessionOptions | null {
+  const pick = (flag: string | undefined, envName: string) => {
+    const value = flag ?? env[envName];
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  };
+  const harness = pick(options.harness, "ROUGHDRAFT_HARNESS");
+  if (!harness) {
+    if (options.sessionLabel || options.sessionLink || options.sessionId) {
+      throw usageError(
+        "--harness is required to register a session (or set ROUGHDRAFT_HARNESS).",
+      );
+    }
+    return null;
+  }
+  return {
+    harness,
+    label: pick(options.sessionLabel, "ROUGHDRAFT_SESSION_LABEL") ?? harness,
+    link: pick(options.sessionLink, "ROUGHDRAFT_SESSION_LINK"),
+    sessionId: pick(options.sessionId, "ROUGHDRAFT_SESSION_ID"),
+  };
+}
+
+function describeOpenMode(openMode: OpenMode, targetUrl: string): string {
+  if (openMode === "chrome-app") {
+    return `Opened Roughdraft in a Chrome app window: ${targetUrl}`;
+  }
+  if (openMode === "existing-window") {
+    return `Reused an existing Roughdraft window: ${targetUrl}`;
+  }
+  if (openMode === "browser") {
+    return `Opened Roughdraft in the default browser: ${targetUrl}`;
+  }
+  return `Roughdraft is running at ${targetUrl}`;
+}
+
+async function runOpen(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+  ctx: CommandContext,
+): Promise<number> {
+  const target = options.positionals[0];
+  if (!target || options.positionals.length > 1) {
+    throw usageError("Usage: roughdraft open <path>");
+  }
+  if (options.watch && options.noWatch) {
+    throw usageError("Use either --watch or --no-watch, not both.");
+  }
+  if (options.watch && options.printUrl) {
+    throw usageError("Use either --watch or --print-url, not both.");
+  }
+
+  const resolvedTarget = resolveTargetPath(target, deps.cwd);
+  const { projectDir, openPath } = resolvedTarget;
+  ctx.path = openPath;
+  const sessionOptions = resolveSessionOptions(options, deps.env);
+
+  const liveDevFrontend = await resolveLiveDevFrontendBaseUrl(deps);
+  let result: EnsureRunningResult | null = null;
+  let baseUrl: string;
+
+  if (liveDevFrontend) {
+    baseUrl = liveDevFrontend.frontendUrl;
+  } else {
+    result = await ensureServerRunning(deps, { projectDir });
+    baseUrl = buildPublicBaseUrl(result.server.port);
+  }
+  const apiBaseUrl = liveDevFrontend ? liveDevFrontend.apiUrl : baseUrl;
+
+  const targetUrl = buildTargetUrl(baseUrl, openPath);
+  let openMode: OpenMode = "none";
+  let session: SessionRecord | null = null;
+  ctx.extra = () => ({
+    url: targetUrl,
+    serverUrl: baseUrl,
+    openMode,
+    session,
+  });
+
+  if (result?.portChanged) {
+    const message = `Preferred port ${getPreferredPort(deps.env)} is busy, using ${result.server.port}.`;
+    if (options.printUrl || json) {
+      deps.error(message);
+    } else {
+      deps.log(message);
+    }
+  }
+
+  if (options.printUrl) {
+    if (json) {
+      emitJson(deps.log, okEnvelope({ path: openPath, url: targetUrl }));
+    } else {
+      deps.log(targetUrl);
+    }
+    return 0;
+  }
+
+  // The session goes on the document before the window opens, so a Done
+  // clicked in the first second already knows where to wake.
+  if (sessionOptions && apiBaseUrl) {
+    session = await registerSession(apiContext(deps, apiBaseUrl), {
+      projectPath: projectDir,
+      path: path.relative(projectDir, openPath),
+      ...sessionOptions,
+    });
+  }
+
+  const openWindow = async () => {
+    openMode = "disabled";
+    if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
+      openMode = (await sendOpenRequestToExistingWindow(
+        deps,
+        apiBaseUrl ?? baseUrl,
+        targetUrl,
+        openPath,
+      ))
+        ? "existing-window"
+        : deps.openUrl(targetUrl);
+    }
+  };
+
+  const shouldWatch = !options.noWatch;
+  if (shouldWatch) {
+    shouldPrintUpdateNoticeFor(ctx, false);
+    if (liveDevFrontend && !liveDevFrontend.apiUrl) {
+      // The preview-web frontend has no API behind it; Done goes to the
+      // background server, so make sure one runs (as before).
+      await ensureServerRunning(deps, { projectDir });
+    }
+    return runWatchFlow(
+      deps,
+      {
+        command: "open",
+        target: resolvedTarget,
+        json,
+        includePending: options.pending ?? true,
+        afterSequence: options.after,
+        replay: options.replay,
+        timeoutSeconds: options.timeoutSeconds,
+        reconnectSeconds: options.reconnectSeconds,
+        batchWindowSeconds: options.batchWindowSeconds,
+        ack: !options.noAck,
+        fixedServerUrl: liveDevFrontend?.apiUrl ?? undefined,
+        // The watcher is registered before the window opens, so a Done in
+        // the first second is not missed.
+        onArmed: async () => {
+          await openWindow();
+          if (json) {
+            deps.error(
+              `${describeOpenMode(openMode, targetUrl)}. Waiting for Done Reviewing.`,
+            );
+          } else {
+            deps.log(describeOpenMode(openMode, targetUrl));
+            deps.log("Waiting for Done Reviewing...");
+          }
+        },
+      },
+      ctx,
+    );
+  }
+
+  await openWindow();
+  if (json) {
+    emitJson(
+      deps.log,
+      okEnvelope({
+        opened: true,
+        url: targetUrl,
+        serverUrl: baseUrl,
+        path: openPath,
+        openMode,
+        session,
+      }),
+    );
+    return 0;
+  }
+
+  shouldPrintUpdateNoticeFor(ctx, true);
+  deps.log(describeOpenMode(openMode, targetUrl));
+  if (session) {
+    deps.log(`Registered session: ${session.label} (${session.harness}).`);
+  }
+  return 0;
+}
+
+const updateNoticeRequests = new WeakMap<CommandContext, boolean>();
+
+function shouldPrintUpdateNoticeFor(ctx: CommandContext, value: boolean) {
+  updateNoticeRequests.set(ctx, value);
+}
+
+async function runStatus(
+  deps: CliDependencies,
+  json: boolean,
+): Promise<number> {
+  const stateFile = getServerStateFilePath(deps.env);
+  const server = await findReusableServer(deps);
+  if (!server) {
+    const snapshot = await readDocumentsSnapshot(deps, null);
+    const pendingHandoffs = countPending(snapshot.documents);
+    if (json) {
+      emitJson(
+        deps.log,
+        okEnvelope({
+          ...buildServerStatusJson(null, stateFile),
+          source: "disk",
+          pendingHandoffs,
+        }),
+      );
+      return 0;
+    }
+
+    deps.log("Roughdraft is not running. Start it with `roughdraft start`.");
+    if (pendingHandoffs > 0) {
+      deps.log(
+        `${plural(pendingHandoffs, "Done")} waiting in the session log. Run \`roughdraft pending\` to see them.`,
+      );
+    }
+    return 1;
+  }
+
+  let documents: DocumentView[] | null = null;
+  try {
+    const listed = await listDocuments(apiContext(deps, server.url));
+    documents = listed.documents;
+  } catch {}
+
+  if (json) {
+    emitJson(
+      deps.log,
+      okEnvelope({
+        ...buildServerStatusJson(server, stateFile),
+        ...(documents
+          ? { documents, pendingHandoffs: countPending(documents) }
+          : {}),
+      }),
+    );
+    return 0;
+  }
+
+  deps.log(`Roughdraft is running at ${server.url}`);
+  if (!server.versionMatches) {
+    deps.log(
+      `Version mismatch: the server is ${server.version ?? "older than 0.2.0"} and this command is ${readPackageVersion()}. Run \`roughdraft restart\`.`,
+    );
+  }
+  if (server.tracked && server.pid !== null && server.startedAt !== null) {
+    deps.log(`PID: ${server.pid}`);
+    deps.log(`Started: ${server.startedAt}`);
+    deps.log(`State file: ${stateFile}`);
+  } else {
+    deps.log(`This server is not managed by ${stateFile}.`);
+  }
+  if (documents && documents.length > 0) {
+    deps.log("");
+    for (const document of documents) {
+      deps.log(formatDocumentLine(document));
+      if (document.url) deps.log(`  ${document.url}`);
+    }
+  }
+  return 0;
+}
+
+function printFailure(
+  deps: CliDependencies,
+  error: CliError,
+  json: boolean,
+  ctx: CommandContext,
+) {
+  if (json) {
+    let extra: Record<string, unknown> = {};
+    try {
+      extra = ctx.extra();
+    } catch {}
+    emitJson(
+      deps.log,
+      errorEnvelope(error, {
+        ...(ctx.path ? { path: ctx.path } : {}),
+        ...extra,
+      }),
+    );
+  } else {
+    deps.error(`roughdraft: ${error.message}`);
+    if (error.hint) deps.error(`hint: ${error.hint}`);
+  }
+  if (deps.env.ROUGHDRAFT_DEBUG === "1") {
+    const cause = (error as Error & { cause?: unknown }).cause;
+    const stack =
+      error.code === "INTERNAL" && cause instanceof Error
+        ? cause.stack
+        : error.stack;
+    if (stack) deps.error(stack);
+  }
+}
+
 export async function runCli(
   args: string[],
   overrides: Partial<CliDependencies> = {},
 ): Promise<number> {
   let deps = createCliDependencies(overrides);
-  let parsed: ParsedCli;
   let shouldPrintUpdateNotice = false;
-  let jsonOutputRequested = args.includes("--json");
+  let json = args.includes("--json");
+  const ctx: CommandContext = { extra: () => ({}) };
 
   try {
-    try {
-      parsed = parseGlobalArgs(args);
-      jsonOutputRequested = parsed.global.json || jsonOutputRequested;
-    } catch (error) {
-      deps.error(error instanceof Error ? error.message : "Invalid usage.");
-      return USAGE_ERROR;
-    }
+    const parsed = parseGlobalArgs(args);
+    json = parsed.global.json || json;
 
     if (parsed.global.version) {
       deps.log(readPackageVersion());
@@ -2302,8 +3289,7 @@ export async function runCli(
     if (parsed.command === "help") {
       const [topic, ...extra] = parsed.rest;
       if (extra.length > 0) {
-        deps.error("Usage: roughdraft help [agent|criticmarkup|command]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft help [agent|criticmarkup|command]");
       }
 
       if (!topic) {
@@ -2326,8 +3312,7 @@ export async function runCli(
         return 0;
       }
 
-      deps.error(`Unknown help topic: ${topic}`);
-      return USAGE_ERROR;
+      throw usageError(`Unknown help topic: ${topic}`);
     }
 
     let command = parsed.command;
@@ -2339,10 +3324,9 @@ export async function runCli(
         command = "open";
       } else {
         const suggestion = suggestCommand(command);
-        deps.error(
+        throw usageError(
           `Unknown command: ${command}.${suggestion ? ` Did you mean ${suggestion}?` : ""}`,
         );
-        return USAGE_ERROR;
       }
     }
 
@@ -2363,38 +3347,49 @@ export async function runCli(
       return 0;
     }
 
+    const groupsByCommand: Record<string, FlagGroup[]> = {
+      start: ["port"],
+      status: [],
+      restart: ["port"],
+      stop: ["all"],
+      watch: ["watch"],
+      pending: ["all", "pendingAck"],
+      ack: [],
+      log: [],
+      route: ["route", "port"],
+      mcp: [],
+      doctor: [],
+      open: ["open", "port", "watch", "session"],
+    };
+    const options = parseCommandOptions(rest, groupsByCommand[command] ?? []);
+    json = json || options.json;
+
+    if (options.help) {
+      printCommandHelp(command as KnownCommand, deps.log);
+      return 0;
+    }
+
+    deps = applyCliEnvOverrides(deps, options);
+
     if (command === "start") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, { allowPort: true });
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("start", deps.log);
-        return 0;
-      }
-
       if (options.positionals.length > 0) {
-        deps.error("Usage: roughdraft start [--port <port>] [--json]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft start [--port <port>] [--json]");
       }
 
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
       shouldPrintUpdateNotice = !json;
       const result = await ensureServerRunning(deps);
       if (json) {
-        emitJson(deps.log, {
-          ...buildServerStatusJson(
-            result.server,
-            getServerStateFilePath(deps.env),
-          ),
-          reused: result.reused,
-          portChanged: result.portChanged,
-        });
+        emitJson(
+          deps.log,
+          okEnvelope({
+            ...buildServerStatusJson(
+              result.server,
+              getServerStateFilePath(deps.env),
+            ),
+            reused: result.reused,
+            portChanged: result.portChanged,
+          }),
+        );
         return 0;
       }
 
@@ -2420,90 +3415,18 @@ export async function runCli(
     }
 
     if (command === "status") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, {});
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("status", deps.log);
-        return 0;
-      }
-
       if (options.positionals.length > 0) {
-        deps.error("Usage: roughdraft status [--json]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft status [--json]");
       }
-
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
       shouldPrintUpdateNotice = !json;
-      const server = await findReusableServer(deps);
-      if (!server) {
-        if (json) {
-          emitJson(
-            deps.log,
-            buildServerStatusJson(null, getServerStateFilePath(deps.env)),
-          );
-          return 0;
-        }
-
-        deps.log(
-          "Roughdraft is not running. Start it with `roughdraft start`.",
-        );
-        return 1;
-      }
-
-      if (json) {
-        emitJson(
-          deps.log,
-          buildServerStatusJson(server, getServerStateFilePath(deps.env)),
-        );
-        return 0;
-      }
-
-      deps.log(`Roughdraft is running at ${server.url}`);
-      if (!server.versionMatches) {
-        deps.log(
-          `Version mismatch: the server is ${server.version ?? "older than 0.2.0"} and this command is ${readPackageVersion()}. Run \`roughdraft restart\`.`,
-        );
-      }
-      if (server.tracked && server.pid !== null && server.startedAt !== null) {
-        deps.log(`PID: ${server.pid}`);
-        deps.log(`Started: ${server.startedAt}`);
-        deps.log(`State file: ${getServerStateFilePath(deps.env)}`);
-      } else {
-        deps.log(
-          `This server is not managed by ${getServerStateFilePath(deps.env)}.`,
-        );
-      }
-      return 0;
+      return await runStatus(deps, json);
     }
 
     if (command === "restart") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, { allowPort: true });
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("restart", deps.log);
-        return 0;
-      }
-
       if (options.positionals.length > 0) {
-        deps.error("Usage: roughdraft restart [--port <port>] [--json]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft restart [--port <port>] [--json]");
       }
 
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
       const stopResult = await stopTrackedServer(deps);
       if (stopResult.failedPid !== null) {
         throw new CliError(
@@ -2532,14 +3455,17 @@ export async function runCli(
 
       const result = await ensureServerRunning(deps);
       if (json) {
-        emitJson(deps.log, {
-          ...buildServerStatusJson(
-            result.server,
-            getServerStateFilePath(deps.env),
-          ),
-          restarted: true,
-          stoppedPid: stopResult.persistedState?.pid ?? null,
-        });
+        emitJson(
+          deps.log,
+          okEnvelope({
+            ...buildServerStatusJson(
+              result.server,
+              getServerStateFilePath(deps.env),
+            ),
+            restarted: true,
+            stoppedPid: stopResult.persistedState?.pid ?? null,
+          }),
+        );
         return 0;
       }
 
@@ -2551,219 +3477,68 @@ export async function runCli(
     }
 
     if (command === "stop") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, { allowAll: true });
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("stop", deps.log);
-        return 0;
-      }
-
       if (options.positionals.length > 0) {
-        deps.error("Usage: roughdraft stop [--all]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft stop [--all]");
       }
 
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
       shouldPrintUpdateNotice = !json;
-      const stateFilePath = getServerStateFilePath(deps.env);
-      const stopResult = await stopTrackedServer(deps);
-
-      if (!stopResult.persistedState) {
-        const preferredPort = getPreferredPort(deps.env);
-        const unmanagedServer = await getStatusPayload(preferredPort, deps);
-        if (unmanagedServer) {
-          const candidatePid = options.all
-            ? getConfidentStopCandidate(unmanagedServer)
-            : null;
-          if (candidatePid !== null) {
-            await deps.stopProcess(candidatePid);
-            const stopped = await waitForServerToStop(preferredPort, deps);
-            if (stopped) {
-              if (json) {
-                emitJson(deps.log, {
-                  stopped: true,
-                  managed: false,
-                  pid: candidatePid,
-                  url: buildPublicBaseUrl(preferredPort),
-                  stateFile: stateFilePath,
-                });
-                return 0;
-              }
-
-              deps.log(
-                `Stopped unmanaged Roughdraft at ${buildPublicBaseUrl(preferredPort)}.`,
-              );
-              return 0;
-            }
-          }
-
-          if (json) {
-            emitJson(deps.log, {
-              stopped: false,
-              managed: false,
-              url: buildPublicBaseUrl(preferredPort),
-              ...(options.all
-                ? { reason: "No confident unmanaged process candidate." }
-                : {}),
-              stateFile: stateFilePath,
-            });
-            return 1;
-          }
-
-          deps.error(
-            options.all
-              ? `Roughdraft is still running at ${buildPublicBaseUrl(preferredPort)}, but it could not be matched to a safe process candidate. Stop it manually.`
-              : `Roughdraft is still running at ${buildPublicBaseUrl(preferredPort)}, but it is not managed by ${stateFilePath}. Stop it manually.`,
-          );
-          return 1;
-        }
-
-        if (json) {
-          emitJson(deps.log, {
-            stopped: false,
-            running: false,
-            stateFile: stateFilePath,
-          });
-          return 0;
-        }
-
-        deps.log("Roughdraft is not running.");
-        return 0;
-      }
-
-      if (stopResult.failedPid !== null) {
-        if (json) {
-          emitJson(deps.log, {
-            stopped: false,
-            pid: stopResult.failedPid,
-            stateFile: stateFilePath,
-          });
-          return 1;
-        }
-
-        deps.error(
-          `Failed to stop Roughdraft process ${stopResult.failedPid}.`,
-        );
-        return 1;
-      }
-
-      if (!stopResult.portIsQuiet) {
-        if (options.all) {
-          const unmanagedServer = await getStatusPayload(
-            stopResult.persistedState.port,
-            deps,
-          );
-          const candidatePid = getConfidentStopCandidate(unmanagedServer);
-          if (candidatePid !== null) {
-            await deps.stopProcess(candidatePid);
-            const stopped = await waitForServerToStop(
-              stopResult.persistedState.port,
-              deps,
-            );
-            if (stopped) {
-              if (json) {
-                emitJson(deps.log, {
-                  stopped: true,
-                  pid: stopResult.persistedState.pid,
-                  unmanagedPid: candidatePid,
-                  url: buildPublicBaseUrl(stopResult.persistedState.port),
-                  stateFile: stateFilePath,
-                });
-                return 0;
-              }
-
-              deps.log(
-                `Stopped Roughdraft at ${buildPublicBaseUrl(stopResult.persistedState.port)}.`,
-              );
-              deps.log(`Stopped unmanaged Roughdraft process ${candidatePid}.`);
-              return 0;
-            }
-          }
-        }
-
-        if (json) {
-          emitJson(deps.log, {
-            stopped: true,
-            pid: stopResult.persistedState.pid,
-            url: buildPublicBaseUrl(stopResult.persistedState.port),
-            anotherInstanceRunning: true,
-            ...(options.all
-              ? { reason: "No confident unmanaged process candidate." }
-              : {}),
-            stateFile: stateFilePath,
-          });
-          return 1;
-        }
-
-        deps.error(
-          `Stopped tracked Roughdraft process ${stopResult.persistedState.pid}, but another Roughdraft instance is still running at ${buildPublicBaseUrl(stopResult.persistedState.port)}.`,
-        );
-        return 1;
-      }
-
-      if (json) {
-        emitJson(deps.log, {
-          stopped: true,
-          pid: stopResult.persistedState.pid,
-          url: buildPublicBaseUrl(stopResult.persistedState.port),
-          stateFile: stateFilePath,
-        });
-        return 0;
-      }
-
-      deps.log(
-        `Stopped Roughdraft at ${buildPublicBaseUrl(stopResult.persistedState.port)}.`,
-      );
-      return 0;
+      return await runStop(deps, options, json);
     }
 
     if (command === "watch") {
-      let options: ParsedWatchOptions;
-      try {
-        options = parseWatchOptions(rest);
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("watch", deps.log);
-        return 0;
-      }
-
       if (options.positionals.length !== 1) {
-        deps.error("Usage: roughdraft watch <path> [--json]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft watch <path> [--json]");
       }
 
-      deps = applyWatchEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
-      shouldPrintUpdateNotice = !json;
-      return runWatch(deps, options.positionals[0] ?? "", options, json);
+      shouldPrintUpdateNotice = false;
+      const target = resolveTargetPath(options.positionals[0] ?? "", deps.cwd);
+      ctx.path = target.openPath;
+      ctx.extra = () => ({ events: [], timedOut: false });
+      await ensureServerRunning(deps, { projectDir: target.projectDir });
+      return await runWatchFlow(
+        deps,
+        {
+          command: "watch",
+          target,
+          json,
+          includePending: options.pending ?? true,
+          afterSequence: options.after,
+          replay: options.replay,
+          timeoutSeconds: options.timeoutSeconds,
+          reconnectSeconds: options.reconnectSeconds,
+          batchWindowSeconds: options.batchWindowSeconds,
+          ack: !options.noAck,
+          onArmed: async (server) => {
+            if (json) {
+              deps.error(
+                `Waiting for Done Reviewing on ${target.openPath} (${server.publicUrl}).`,
+              );
+            }
+          },
+        },
+        ctx,
+      );
+    }
+
+    if (command === "pending") {
+      return await runPending(deps, options, json, ctx);
+    }
+
+    if (command === "ack") {
+      return await runAck(deps, options, json);
+    }
+
+    if (command === "log") {
+      return await runLog(deps, options, json);
+    }
+
+    if (command === "route") {
+      return await runRoute(deps, options, json);
     }
 
     if (command === "mcp") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, {});
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-      if (options.help) {
-        printCommandHelp("mcp", deps.log);
-        return 0;
-      }
       if (options.positionals.length > 0) {
-        deps.error("Usage: roughdraft mcp");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft mcp");
       }
 
       const { startMcpServer } = await import("./mcp.js");
@@ -2772,220 +3547,34 @@ export async function runCli(
     }
 
     if (command === "doctor") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, {});
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("doctor", deps.log);
-        return 0;
-      }
-
       if (options.positionals.length > 1) {
-        deps.error("Usage: roughdraft doctor [path] [--json]");
-        return USAGE_ERROR;
+        throw usageError("Usage: roughdraft doctor [path] [--json]");
       }
 
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
       if (options.positionals.length === 1) {
-        return runMarkdownDoctor(deps, options.positionals[0] ?? "", json);
+        return await runMarkdownDoctor(
+          deps,
+          options.positionals[0] ?? "",
+          json,
+        );
       }
 
       shouldPrintUpdateNotice = !json;
-      return runDoctor(deps, json);
+      return await runDoctor(deps, json);
     }
 
     if (command === "open") {
-      let options: ParsedCommandOptions;
-      try {
-        options = parseCommandOptions(rest, {
-          allowOpen: true,
-          allowPort: true,
-          allowWatch: true,
-        });
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid usage.");
-        return USAGE_ERROR;
-      }
-
-      if (options.help) {
-        printCommandHelp("open", deps.log);
-        return 0;
-      }
-
-      const target = options.positionals[0];
-      if (!target) {
-        deps.error("Usage: roughdraft open <path>");
-        return USAGE_ERROR;
-      }
-
-      if (options.positionals.length > 1) {
-        deps.error("Usage: roughdraft open <path>");
-        return USAGE_ERROR;
-      }
-
-      if (options.watch && options.noWatch) {
-        deps.error("Use either --watch or --no-watch, not both.");
-        return USAGE_ERROR;
-      }
-
-      if (options.watch && options.printUrl) {
-        deps.error("Use either --watch or --print-url, not both.");
-        return USAGE_ERROR;
-      }
-
-      deps = applyCliEnvOverrides(deps, options);
-      const json = parsed.global.json || options.json;
-      let resolvedTarget: ResolvedTargetPath;
-      try {
-        resolvedTarget = resolveTargetPath(target);
-      } catch (error) {
-        deps.error(error instanceof Error ? error.message : "Invalid path.");
-        return 1;
-      }
-
-      const { projectDir, openPath } = resolvedTarget;
-
-      const remoteHost =
-        typeof deps.env.ROUGHDRAFT_HOST === "string"
-          ? deps.env.ROUGHDRAFT_HOST.trim()
-          : "";
-      if (remoteHost.length > 0) {
-        return runRemoteOpen(deps, {
-          host: remoteHost,
-          openPath,
-          noOpen: options.noOpen,
-          printUrl: options.printUrl,
-          json,
-        });
-      }
-
-      const liveDevFrontend = await resolveLiveDevFrontendBaseUrl(deps);
-      let result: EnsureRunningResult | null = null;
-      let baseUrl: string;
-
-      if (liveDevFrontend) {
-        baseUrl = liveDevFrontend.frontendUrl;
-      } else {
-        result = await ensureServerRunning(deps, { projectDir });
-        baseUrl = buildPublicBaseUrl(result.server.port);
-      }
-
-      const targetUrl = buildTargetUrl(baseUrl, openPath);
-      let openMode: OpenMode = "disabled";
-      if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
-        openMode = (await sendOpenRequestToExistingWindow(
-          deps,
-          baseUrl,
-          targetUrl,
-          openPath,
-        ))
-          ? "existing-window"
-          : deps.openUrl(targetUrl);
-      }
-
-      if (result?.portChanged) {
-        const message = `Preferred port ${getPreferredPort(deps.env)} is busy, using ${result.server.port}.`;
-        if (options.printUrl) {
-          deps.error(message);
-        } else if (!json) {
-          deps.log(message);
-        }
-      }
-
-      if (options.printUrl) {
-        deps.log(targetUrl);
-        return 0;
-      }
-
-      const shouldWatch = !options.noWatch && !options.printUrl;
-
-      if (shouldWatch) {
-        if (!json) {
-          if (openMode === "chrome-app") {
-            deps.log(`Opened Roughdraft in a Chrome app window: ${targetUrl}`);
-          } else if (openMode === "existing-window") {
-            deps.log(`Reused an existing Roughdraft window: ${targetUrl}`);
-          } else if (openMode === "browser") {
-            deps.log(`Opened Roughdraft in the default browser: ${targetUrl}`);
-          } else {
-            deps.log(`Roughdraft is running at ${targetUrl}`);
-          }
-          deps.log("Waiting for Done Reviewing...");
-        }
-
-        const watchOptions: ParsedWatchOptions = {
-          batchWindowSeconds: options.batchWindowSeconds,
-          help: false,
-          json,
-          positionals: [target],
-          replay: options.replay,
-          serverUrl: liveDevFrontend?.apiUrl ?? undefined,
-          stateDir: options.stateDir,
-          stateFile: options.stateFile,
-          timeoutSeconds: options.timeoutSeconds,
-        };
-        shouldPrintUpdateNotice = false;
-        return runWatch(deps, target, watchOptions, json);
-      }
-
-      if (json) {
-        emitJson(deps.log, {
-          opened: true,
-          url: targetUrl,
-          serverUrl: baseUrl,
-          path: openPath,
-          openMode,
-        });
-        return 0;
-      }
-
-      shouldPrintUpdateNotice = true;
-      if (openMode === "chrome-app") {
-        deps.log(`Opened Roughdraft in a Chrome app window: ${targetUrl}`);
-        return 0;
-      }
-
-      if (openMode === "existing-window") {
-        deps.log(`Reused an existing Roughdraft window: ${targetUrl}`);
-        return 0;
-      }
-
-      if (openMode === "browser") {
-        deps.log(`Opened Roughdraft in the default browser: ${targetUrl}`);
-        return 0;
-      }
-
-      deps.log(`Roughdraft is running at ${targetUrl}`);
-      return 0;
+      const exitCode = await runOpen(deps, options, json, ctx);
+      shouldPrintUpdateNotice = updateNoticeRequests.get(ctx) ?? false;
+      return exitCode;
     }
 
-    return USAGE_ERROR;
+    throw usageError(`Unknown command: ${command}`);
   } catch (error) {
-    if (error instanceof CliError) {
-      if (jsonOutputRequested) {
-        emitJson(deps.log, {
-          ok: false,
-          status: "error",
-          exitCode: error.exitCode,
-          error: {
-            code: error.code,
-            message: error.message,
-            ...(error.hint ? { hint: error.hint } : {}),
-          },
-        });
-      } else {
-        deps.error(`roughdraft: ${error.message}`);
-        if (error.hint) deps.error(`hint: ${error.hint}`);
-      }
-      return error.exitCode;
-    }
-    throw error;
+    const cliError = toCliError(error);
+    shouldPrintUpdateNotice = false;
+    printFailure(deps, cliError, json, ctx);
+    return cliError.exitCode;
   } finally {
     if (shouldPrintUpdateNotice) {
       await printUpdateNoticeIfAvailable(deps);

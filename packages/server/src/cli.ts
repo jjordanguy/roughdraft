@@ -1,19 +1,13 @@
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import {
   type RfmDiagnostic,
   validateRoughdraftMarkdown,
 } from "@roughdraft/rfm";
-import {
-  ROUGHDRAFT_BIND_HOST,
-  ROUGHDRAFT_DEFAULT_PORT,
-  ROUGHDRAFT_LOOPBACK_HOSTS,
-  ROUGHDRAFT_PUBLIC_HOST,
-} from "./network.js";
 import {
   CliError,
   EXIT_SERVER,
@@ -22,6 +16,12 @@ import {
   toCliError,
   usageError,
 } from "./errors.js";
+import {
+  ROUGHDRAFT_BIND_HOST,
+  ROUGHDRAFT_DEFAULT_PORT,
+  ROUGHDRAFT_LOOPBACK_HOSTS,
+  ROUGHDRAFT_PUBLIC_HOST,
+} from "./network.js";
 import { findAvailablePort } from "./ports.js";
 import {
   type ApiContext,
@@ -218,6 +218,7 @@ interface ParsedCommandOptions {
   sessionId?: string;
   sessionLabel?: string;
   sessionLink?: string;
+  strict: boolean;
   stateDir?: string;
   stateFile?: string;
   timeoutSeconds?: number;
@@ -323,7 +324,8 @@ type FlagGroup =
   | "watch"
   | "session"
   | "pendingAck"
-  | "route";
+  | "route"
+  | "doctor";
 
 const FLAG_GROUPS: Record<string, FlagGroup> = {
   "--all": "all",
@@ -348,6 +350,7 @@ const FLAG_GROUPS: Record<string, FlagGroup> = {
   "--command": "route",
   "--url": "route",
   "--label": "route",
+  "--strict": "doctor",
 };
 
 const VALUE_FLAGS = new Set([
@@ -384,6 +387,7 @@ function parseCommandOptions(
     positionals: [],
     printUrl: false,
     replay: false,
+    strict: false,
     watch: false,
   };
   const allowedGroups = new Set(allowed);
@@ -466,6 +470,9 @@ function parseCommandOptions(
         break;
       case "--ack":
         parsed.ack = true;
+        break;
+      case "--strict":
+        parsed.strict = true;
         break;
       case "--timeout":
         parsed.timeoutSeconds = parsePositiveNumber(value ?? "", flag);
@@ -1140,12 +1147,23 @@ function printCommandHelp(
   if (command === "doctor") {
     log("Usage:");
     log("  roughdraft doctor [path] [--json]");
+    log("  roughdraft doctor <file> --strict [--json]");
     log("");
     log(
       "Diagnoses local Roughdraft setup and server state, or validates one Markdown file.",
     );
+    log(
+      "With a file it prints the comment count, a breakdown (roots, document-level comments,",
+    );
+    log(
+      "replies, suggestions, review block status) and every error and warning with its line",
+    );
+    log(
+      "and column. Exit 0 when the file passes, 1 when it fails, 2 for a bad command or path.",
+    );
     log("");
     log("Flags:");
+    log("  --strict             Fail on warnings too (exit 1)");
     log("  --json               Print machine-readable output");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
@@ -1174,71 +1192,125 @@ function printAgentHelp(log: (message: string) => void) {
   log("");
   for (const line of DONE_LOG_PARAGRAPH) log(line);
   log("");
+  for (const line of REVIEW_FORMAT_PARAGRAPH) log(line);
+  log("");
   log(
     "This command only prints setup text. It does not edit agent instruction files.",
   );
 }
 
+const CRITICMARKUP_HELP = [
+  "CriticMarkup reference:",
+  "  {==text==}          Highlight (the anchor of a comment)",
+  "  {++new text++}      Insertion",
+  "  {--old text--}      Deletion",
+  "  {~~old~>new~~}      Substitution",
+  "  {>>comment<<}       Inline comment (older files only; do not write it)",
+  "",
+  "How Roughdraft stores review feedback:",
+  "  A comment is an anchor in the prose plus an entry in the review block at the end of the file.",
+  "  Comment text never sits in the prose. The prose keeps only the anchor: {==the highlighted words==}{#c1}.",
+  "  Replies live only in the review block, as entries with `re: <parent id>`. Never write a reply in the prose.",
+  "  A file has one review block: a `---` line after a blank line, then `comments:` and `suggestions:` maps keyed by id, to the end of the file.",
+  "  Entry keys: `body`, `by`, `at`, `re`, `status`, `resolved`, `scope`, `lines`, `quote`, `continues`.",
+  "  Write `body`, `resolved` and `at` double-quoted on one line. A line break inside a body is <br>.",
+  "  Ids: `c1`, `c2` for comments, `s1`, `s2` for suggestions, `a1`, `a2` for every entry an agent writes (replies and notes).",
+  "  Set `by` to `AI` for agent entries (`user` is the person reviewing) and `at` to the current ISO timestamp.",
+  "  A comment over several paragraphs repeats its anchor in each one with the same id.",
+  "  A code block comment puts the ref on the opening fence line, after the info string; the entry adds `lines: [start, end]` (1-based, inside the block) and `quote` (those lines joined with a newline).",
+  "  A document-level comment has no anchor: an entry with `body` and `scope: document`, no `re`.",
+  "  Suggestions stay in the text, one marker per paragraph; a later part's entry has `continues: <first id>`.",
+  "",
+  "Comment with a reply:",
+  "  Review {==this sentence==}{#c1}.",
+  "",
+  "  ---",
+  "  comments:",
+  "    c1:",
+  '      body: "Needs a source."',
+  "      by: user",
+  '      at: "2026-04-28T12:00:00.000Z"',
+  "    a1:",
+  '      body: "Added one from the intro.<br>It is in the second paragraph now."',
+  "      by: AI",
+  '      at: "2026-04-28T12:05:00.000Z"',
+  "      re: c1",
+  "",
+  "Comment on a code block:",
+  "  ```ts {#c1}",
+  "  const port = 3000;",
+  "  start({ port });",
+  "  ```",
+  "",
+  "  ---",
+  "  comments:",
+  "    c1:",
+  '      body: "Read the port from the environment."',
+  "      by: user",
+  '      at: "2026-04-28T12:00:00.000Z"',
+  "      lines: [1, 1]",
+  '      quote: "const port = 3000;"',
+  "",
+  "Document-level comments:",
+  "  # Launch plan",
+  "",
+  "  ---",
+  "  comments:",
+  "    c1:",
+  '      body: "Overall this reads well.<br>Shorten the intro."',
+  "      by: user",
+  '      at: "2026-04-28T12:00:00.000Z"',
+  "      scope: document",
+  "    a1:",
+  '      body: "Round 1 done: shortened the intro."',
+  "      by: AI",
+  '      at: "2026-04-28T12:30:00.000Z"',
+  "      scope: document",
+  "",
+  "Suggested changes:",
+  "  Add {++one concrete example++}{#s1}.",
+  "  Replace {~~vague phrasing~>specific wording~~}{#s2}.",
+  "",
+  "  ---",
+  "  suggestions:",
+  "    s1:",
+  "      by: AI",
+  '      at: "2026-04-28T12:10:00.000Z"',
+  "    s2:",
+  "      by: AI",
+  '      at: "2026-04-28T12:11:00.000Z"',
+  "",
+  "Older forms (read, never write):",
+  "  Comment text inline: {==x==}{>>text<<}{#c1} or {>>text<<}{#c1}.",
+  '  Inline attribute blocks: {id="c1" by="user" at="..."}, with `re` and `status="resolved"`.',
+  "  Legacy blocks: {@id:c1; by:AI; at:...@}.",
+  "  Existing files may hold these and Roughdraft still reads them. Write new feedback only in the form above; `roughdraft doctor` warns on the old forms.",
+  "",
+  "Code blocks:",
+  "  Nothing inside a fenced code block is review markup; CriticMarkup there is literal example text.",
+  "  Inline code takes a normal anchor around the backticks: {==`pnpm dev`==}{#c2}.",
+  "",
+  "Check your work:",
+  "  Run `roughdraft doctor <file>` after every write. It prints the comment count and a breakdown",
+  "  (roots, document-level comments, replies, suggestions, review block status). `--strict` fails on warnings too.",
+  "",
+  "Full spec:",
+];
+
+const REVIEW_FORMAT_PARAGRAPH = [
+  "Review format: Comment text never sits in the prose. The prose holds only",
+  "anchors, {==highlighted words==}{#c1}, or a ref such as {#c1} on a code",
+  "block's opening fence line (the entry then has `lines` and `quote`). Every",
+  "comment's text, author, time, status and replies live in the one review block",
+  "at the end of the file; a comment on the whole document is an entry there with",
+  "`scope: document`. Replies live only in the review block: write each one as an",
+  "entry with an `a1`, `a2` id, `by: AI`, a quoted `at` and `re: <comment id>`,",
+  "and write a line break as <br>. Run `roughdraft doctor <file>` afterwards and",
+  "check the count line. `roughdraft help criticmarkup` has copyable examples.",
+];
+
 function printCriticMarkupHelp(log: (message: string) => void) {
-  log("CriticMarkup reference:");
-  log("  {>>comment<<}       Comment");
-  log("  {++new text++}      Insertion");
-  log("  {--old text--}      Deletion");
-  log("  {~~old~>new~~}      Substitution");
-  log("  {==text==}          Highlight");
-  log("");
-  log("Examples:");
-  log("  The intro {~~is vague~>needs a tighter claim~~}.");
-  log("  Add {>>one concrete example here<<} before the conclusion.");
-  log("");
-  log("When adding new review feedback:");
-  log(
-    "  Prefer compact references like {>>Comment<<}{#c1} with metadata in final YAML endmatter.",
-  );
-  log(
-    "  Use `c1`, `c2`, etc. for comment ids and `s1`, `s2`, etc. for suggested-change ids.",
-  );
-  log(
-    "  Set `by` to your agent or author label and `at` to the current ISO timestamp.",
-  );
-  log("");
-  log("Anchored comment with id:");
-  log("  Review {==this sentence==}{>>Needs a source<<}{#c1}.");
-  log("  ---");
-  log("  comments:");
-  log("    c1:");
-  log("      by: AI");
-  log('      at: "2026-04-28T12:00:00.000Z"');
-  log("");
-  log("Suggested changes with ids:");
-  log("  Add {++one concrete example++}{#s1}.");
-  log("  Replace {~~vague phrasing~>specific wording~~}{#s2}.");
-  log("  ---");
-  log("  suggestions:");
-  log("    s1:");
-  log("      by: AI");
-  log('      at: "2026-04-28T12:10:00.000Z"');
-  log("    s2:");
-  log("      by: AI");
-  log('      at: "2026-04-28T12:11:00.000Z"');
-  log("");
-  log("Reply to an existing comment:");
-  log("  Store replies in `comments.<id>.body` with `re: <parent-id>`.");
-  log("");
-  log("Reply guidance:");
-  log(
-    "  Existing inline attribute metadata is still accepted for compatibility.",
-  );
-  log(
-    "  Comment ids are document-local and usually look like `c1`, `c2`, `c3`.",
-  );
-  log("");
-  log("Code blocks:");
-  log(
-    "  Treat CriticMarkup inside fenced code blocks as literal example text.",
-  );
-  log("");
-  log("Full spec:");
+  for (const line of CRITICMARKUP_HELP) log(line);
   log(`  ${ROUGHDRAFT_FLAVORED_MARKDOWN_SPEC_URL}`);
 }
 
@@ -2008,6 +2080,7 @@ async function runMarkdownDoctor(
   deps: CliDependencies,
   targetPath: string,
   json: boolean,
+  strict = false,
 ): Promise<number> {
   if (!isMarkdownPath(targetPath)) {
     throw new CliError(
@@ -2050,30 +2123,45 @@ async function runMarkdownDoctor(
   }
 
   const validation = validateRoughdraftMarkdown(markdown);
-  const payload = {
-    kind: "markdown" as const,
-    path: absolutePath,
-    format: validation.format,
-    version: validation.version,
-    ok: validation.ok,
-    errors: validation.errors,
-    warnings: validation.warnings,
-    summary: validation.summary,
-  };
+  const failedOnWarnings =
+    strict && validation.ok && validation.warnings.length > 0;
+  const passed = validation.ok && !failedOnWarnings;
+  const exitCode = passed ? 0 : 1;
+  const { summary } = validation;
 
   if (json) {
-    const exitCode = validation.ok ? 0 : 1;
     emitJson(deps.log, {
-      ...payload,
-      status: validation.ok ? "ok" : "error",
+      kind: "markdown" as const,
+      path: absolutePath,
+      format: validation.format,
+      version: validation.version,
+      ok: passed,
+      status: passed ? "ok" : "error",
       exitCode,
+      strict,
+      endmatter: summary.endmatter,
+      errors: validation.errors,
+      warnings: validation.warnings,
+      summary,
     });
     return exitCode;
   }
 
   const displayPath = relativeDisplayPath(deps.cwd, absolutePath);
   deps.log(`Roughdraft Markdown doctor: ${displayPath}`);
-  deps.log(`Status: ${validation.ok ? "passed" : "failed"}`);
+  deps.log(
+    failedOnWarnings
+      ? `Status: failed (--strict: ${validation.warnings.length} warning(s))`
+      : `Status: ${passed ? "passed" : "failed"}`,
+  );
+  // The count line and the breakdown come first and always print, so a
+  // caller can check them whether or not the file has diagnostics.
+  deps.log(
+    `Found ${summary.comments} comment(s) and ${summary.suggestions} suggestion(s).`,
+  );
+  deps.log(
+    `Breakdown: roots ${summary.roots}, documentComments ${summary.documentComments}, replies ${summary.replies}, suggestions ${summary.suggestions}, endmatter ${summary.endmatter}`,
+  );
 
   if (validation.errors.length > 0) {
     deps.log("");
@@ -2091,14 +2179,7 @@ async function runMarkdownDoctor(
     }
   }
 
-  if (validation.errors.length === 0 && validation.warnings.length === 0) {
-    deps.log("");
-    deps.log(
-      `Found ${validation.summary.comments} comment(s) and ${validation.summary.suggestions} suggestion(s).`,
-    );
-  }
-
-  return validation.ok ? 0 : 1;
+  return exitCode;
 }
 
 interface CommandContext {
@@ -3376,7 +3457,7 @@ export async function runCli(
       log: [],
       route: ["route", "port"],
       mcp: [],
-      doctor: [],
+      doctor: ["doctor"],
       open: ["open", "port", "watch", "session"],
     };
     const options = parseCommandOptions(rest, groupsByCommand[command] ?? []);
@@ -3566,7 +3647,7 @@ export async function runCli(
 
     if (command === "doctor") {
       if (options.positionals.length > 1) {
-        throw usageError("Usage: roughdraft doctor [path] [--json]");
+        throw usageError("Usage: roughdraft doctor [path] [--strict] [--json]");
       }
 
       if (options.positionals.length === 1) {
@@ -3574,6 +3655,13 @@ export async function runCli(
           deps,
           options.positionals[0] ?? "",
           json,
+          options.strict,
+        );
+      }
+
+      if (options.strict) {
+        throw usageError(
+          "--strict needs a file. Usage: roughdraft doctor <file> --strict [--json]",
         );
       }
 

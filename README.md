@@ -235,6 +235,7 @@ roughdraft route test <harness>
 roughdraft doctor --json
 roughdraft doctor ./draft.md
 roughdraft doctor ./draft.md --json
+roughdraft doctor ./draft.md --strict
 ```
 
 `open` and `watch` return a Done that is already waiting (`--no-pending` waits for the next one only), and acknowledge what they return after printing it (`--no-ack` leaves it pending). `--after <sequence>` sets the cursor. A watcher that loses the server reconnects for `--reconnect` seconds (default 120) before it gives up.
@@ -244,6 +245,7 @@ Exit codes:
 ```text
 0        Done received (status "completed"), or the command succeeded (status "ok")
 1        Unexpected error (code INTERNAL); also `doctor <file>` when the file fails validation
+         (or has warnings, with --strict)
 2        Bad command or path: USAGE, PATH_NOT_FOUND, NOT_MARKDOWN, PATH_UNREADABLE,
          HANDOFF_NOT_FOUND, WAKE_ROUTE_NOT_FOUND
 3        Server problem: SERVER_START_FAILED, SERVER_UNREACHABLE, SERVER_LOST,
@@ -300,42 +302,75 @@ ROUGHDRAFT_DEV_WRAPPER_PATH
 ROUGHDRAFT_DEV_WRAPPER_REPO_ROOT
 ```
 ## Roughdraft-flavored CriticMarkup
-Roughdraft uses [CriticMarkup](https://criticmarkup.com) as the readable review layer inside normal Markdown files. It supports the standard markers for comments, highlights, insertions, deletions, and substitutions:
+Roughdraft uses [CriticMarkup](https://criticmarkup.com) as the readable review layer inside normal Markdown files: `{==highlight==}`, `{++insertion++}`, `{--deletion--}`, `{~~old~>new~~}` and `{>>comment<<}`.
 
 The canonical Roughdraft Flavored Markdown spec is published at [roughdraft.md/spec/roughdraft-flavored-markdown.md](https://roughdraft.md/spec/roughdraft-flavored-markdown.md). The review-index JSON Schema is published at [roughdraft.md/spec/roughdraft-flavored-markdown.schema.json](https://roughdraft.md/spec/roughdraft-flavored-markdown.schema.json).
 
-```markdown
-This is {--deleted--} text.
-This is {++inserted++} text.
-This is {~~old~>new~~} substituted text.
-This is {>>a comment<<} in the margin.
-This is {==highlighted==} text.
-```
+### Comments: an anchor in the prose, an entry at the end
 
-Roughdraft extends those markers with compact id references so review state can round-trip through the file. Root comments and suggestions keep an inline anchor such as `{#c1}` or `{#s1}`, while metadata lives in final YAML endmatter:
+Comment text never sits in the prose. The prose keeps only a highlight around the words the comment is about, with an id ref on it. The comment's text, author, time, status and every reply live in one review block at the end of the file: a `---` line after a blank line, then `comments:` and `suggestions:` maps keyed by id, to the end of the file. A file has one review block.
 
 ```markdown
-Please revisit {==this sentence==}{>>Needs a source<<}{id="c1" by="user" at="2026-06-14T06:38:34.897Z"}{>><<}{id="c6" by="user" at="2026-06-14T06:48:16.819Z" re="c1"}. --- comments: c1: by: user at: "2026-04-28T12:00:00.000Z"
+The creator confirms {==the caption and the link placement==}{#c1} with ops.
+
+---
+comments:
+  c1:
+    body: "Split these checks by owner."
+    by: user
+    at: "2026-10-04T09:00:00.000Z"
+  a1:
+    body: "Done: split into creator and ops checks.<br>Ops owns the link."
+    by: AI
+    at: "2026-10-04T10:00:00.000Z"
+    re: c1
 ```
 
-Supported attributes:
+Replies live only in the review block, as entries with `re: <parent id>`; nothing about a reply is written in the prose. `body`, `resolved` and `at` are double-quoted on one line, and a line break inside a body is written as `<br>`. Entry keys are `body`, `by`, `at`, `re`, `status`, `resolved`, `scope`, `lines`, `quote` and `continues`; unknown keys are kept.
 
-- `id` is the compact inline reference after the comment or suggested change.
-  
-- `by` records the reviewer or agent that created it.
-  
-- `at` records an ISO timestamp.
-  
-- `re` links a reply to another comment or suggestion id.
-  
+Ids: `c1`, `c2` for comments, `s1`, `s2` for suggestions, and `a1`, `a2` for every entry an agent writes (replies and notes). Ids are unique across the file. `by` is `user` for the person reviewing and `AI` for an agent.
 
-Replies are stored in endmatter with a `body` and `re` pointer:
+A comment over several paragraphs repeats its anchor in each paragraph with the same id, and reads as one thread.
+
+### Code blocks
+
+A comment on a code block puts the ref on the opening fence line, after the info string. Its entry records `lines` (1-based, inclusive, counted inside the block) and `quote` (the highlighted lines joined with a newline). Nothing inside the fence is review markup, so CriticMarkup in code stays literal example text. Inline code takes a normal anchor around the backticks: ``{==`pnpm dev`==}{#c2}``.
+
+````markdown
+```ts {#c1}
+const port = 3000;
+start({ port });
+```
+
+---
+comments:
+  c1:
+    body: "Read the port from the environment."
+    by: user
+    at: "2026-10-05T09:00:00.000Z"
+    lines: [1, 1]
+    quote: "const port = 3000;"
+````
+
+### Document-level comments
+
+A comment on the whole document has no anchor: an entry with `body` and `scope: document`, and no `re`. Roughdraft shows these in a section at the top of the comment rail.
 
 ```markdown
-Please revisit {==this sentence==}{>>Needs a source<<}{id="c1" by="user" at="2026-06-14T06:38:34.897Z"}{>><<}{id="c6" by="user" at="2026-06-14T06:48:16.819Z" re="c1"}. --- comments: c1: by: user at: "2026-04-28T12:00:00.000Z" c2: body: I can add one from the intro. by: AI at: "2026-04-28T12:05:00.000Z" re: c1
+# Launch plan
+
+---
+comments:
+  c2:
+    body: "Overall this reads well.<br>Shorten the intro before Friday."
+    by: user
+    at: "2026-10-05T09:05:00.000Z"
+    scope: document
 ```
 
-Suggested changes can also carry ids and discussion:
+### Suggested changes
+
+Suggestions are proposed edits to the text, so they stay inline, one marker per paragraph, with their metadata in the same review block. A suggestion over several paragraphs gets one marker per paragraph, each with its own id, and every later part's entry carries `continues: <first id>`.
 
 ```markdown
 Add {++one concrete example++}{#s1}.
@@ -346,37 +381,29 @@ Use {~~rough~>specific~~}{#s3} wording.
 suggestions:
   s1:
     by: AI
-    at: "2026-04-28T12:10:00.000Z"
+    at: "2026-10-05T12:10:00.000Z"
   s2:
     by: user
-    at: "2026-04-28T12:13:00.000Z"
+    at: "2026-10-05T12:13:00.000Z"
   s3:
     by: AI
-    at: "2026-04-28T12:14:00.000Z"
+    at: "2026-10-05T12:14:00.000Z"
 ```
 
-Older inline metadata such as `{id="c1" by="user" at="..."}` and legacy `{@id:c1; by:user; at:...@}` blocks are still accepted for compatibility.
+### Older forms
 
-CriticMarkup inside inline code and fenced code blocks is treated as literal example text, not live review feedback:
+Files written by earlier versions may hold comment text inline (`{==x==}{>>text<<}{#c1}`, `{>>text<<}{#c1}`), inline attribute blocks (`{id="c1" by="user" at="..."}`, with `re` and `status="resolved"`), or legacy `{@id:c1; by:user; at:...@}` blocks. Roughdraft still reads all of them. Nothing writes them any more, and `roughdraft doctor` warns on them.
 
-````markdown
-Inline code stays literal: `{==not a comment==}`.
+### Checking a file
 
-```text
-{++not a suggestion++}
-```
-````
+`roughdraft doctor <file>` validates one file. It prints the comment count (`Found N comment(s) and M suggestion(s).`, where comments counts anchored roots, document-level comments and replies), a breakdown line (`roots`, `documentComments`, `replies`, `suggestions`, and `endmatter`: the review block's status, one of `absent`, `recognized`, `ignored` or `invalid`), and every error and warning with its line and column. It exits 0 when the file passes and 1 when it fails; `--strict` fails on warnings too. `--json` returns the same fields.
 
 This matters because the main workflow is often:
 
 - The AI writes a doc
-  
 - The user opens it in Roughdraft
-  
 - The user leaves comments and suggested changes
-  
-- The AI reads those comments and responds in the same markdown file
-  
+- The AI reads those comments and answers them in the review block of the same markdown file
 ## Try the demo
 Don't want to install anything? Try the [live demo](https://roughdraft.md) — it runs entirely in your browser using local storage.
 ## License

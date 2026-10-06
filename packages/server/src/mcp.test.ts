@@ -3,6 +3,7 @@ import { createServer as createHttpServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { extractRoughdraftReviewIndex } from "@roughdraft/rfm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "./index";
 import { callTool } from "./mcp";
@@ -338,6 +339,214 @@ describe("mcp", () => {
     )) as Json;
 
     expect(result.status).toBe("completed");
+  });
+
+  describe("review feedback tools", () => {
+    // One canonical-format file with every case the pending filter decides:
+    // a resolved root with a user reply under it, an inline thread with an
+    // agent reply and a user follow-up, a code block comment, two
+    // document-level comments with agent replies (one `aN` id, one `cN` id
+    // written by AI), an agent's own document-level note, and a suggestion.
+    const reviewed = [
+      "# Plan",
+      "",
+      "Keep {==this claim==}{#c1} as written.",
+      "",
+      "The {==retry loop==}{#c3} needs a cap, and {++a timeout++}{#s1} too.",
+      "",
+      "```ts {#c5}",
+      "const a = 1;",
+      "const b = 2;",
+      "```",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      '    body: "Needs a source."',
+      "    by: user",
+      '    at: "2026-10-05T09:00:00.000Z"',
+      "    status: resolved",
+      '    resolved: "Added the citation."',
+      "  c2:",
+      '    body: "Thanks, that works."',
+      "    by: user",
+      '    at: "2026-10-05T09:10:00.000Z"',
+      "    re: c1",
+      "  c3:",
+      '    body: "Cap it at five."',
+      "    by: user",
+      '    at: "2026-10-05T09:01:00.000Z"',
+      "  a1:",
+      '    body: "Capped at five."',
+      "    by: AI",
+      '    at: "2026-10-05T10:00:00.000Z"',
+      "    re: c3",
+      "  c4:",
+      '    body: "Why five?"',
+      "    by: user",
+      '    at: "2026-10-05T10:05:00.000Z"',
+      "    re: a1",
+      "  c5:",
+      '    body: "Use let here."',
+      "    by: user",
+      '    at: "2026-10-05T09:02:00.000Z"',
+      "    lines: [2, 2]",
+      '    quote: "const b = 2;"',
+      "  c6:",
+      '    body: "Overall fine.<br>Ship it after the cap."',
+      "    by: user",
+      '    at: "2026-10-05T09:03:00.000Z"',
+      "    scope: document",
+      "  a2:",
+      '    body: "Will do."',
+      "    by: Claude",
+      '    at: "2026-10-05T10:01:00.000Z"',
+      "    re: c6",
+      "  c7:",
+      '    body: "One more: add a summary."',
+      "    by: user",
+      '    at: "2026-10-05T09:04:00.000Z"',
+      "    scope: document",
+      "  c8:",
+      '    body: "Added a summary."',
+      "    by: AI",
+      '    at: "2026-10-05T10:02:00.000Z"',
+      "    re: c7",
+      "  a3:",
+      '    body: "Round 1 done: three comments answered."',
+      "    by: AI",
+      '    at: "2026-10-05T10:03:00.000Z"',
+      "    scope: document",
+      "suggestions:",
+      "  s1:",
+      "    by: user",
+      '    at: "2026-10-05T09:05:00.000Z"',
+      "",
+    ].join("\n");
+
+    beforeEach(() => {
+      fs.writeFileSync(documentPath, reviewed);
+    });
+
+    it("lists document-level roots first, then the rest in document order", async () => {
+      const result = (await callTool(
+        "roughdraft_get_pending_feedback",
+        { documentPath },
+        env(),
+      )) as Json;
+
+      expect(result.items.map((item: Json) => item.id)).toEqual([
+        "c6",
+        "c7",
+        "c3",
+        "s1",
+        "c5",
+        "c4",
+      ]);
+    });
+
+    it("leaves out resolved items, replies under resolved roots, agent-written replies and agent notes", async () => {
+      const result = (await callTool(
+        "roughdraft_get_pending_feedback",
+        { documentPath },
+        env(),
+      )) as Json;
+      const ids = result.items.map((item: Json) => item.id);
+
+      expect(ids).not.toContain("c1");
+      expect(ids).not.toContain("c2");
+      expect(ids).not.toContain("a1");
+      expect(ids).not.toContain("a2");
+      expect(ids).not.toContain("c8");
+      expect(ids).not.toContain("a3");
+      // A user's reply to an agent reply is still feedback.
+      expect(ids).toContain("c4");
+    });
+
+    it("returns the new item fields and a summary of what is pending", async () => {
+      const result = (await callTool(
+        "roughdraft_get_pending_feedback",
+        { documentPath },
+        env(),
+      )) as Json;
+      const byId = new Map(
+        result.items.map((item: Json) => [item.id, item] as const),
+      );
+
+      expect(byId.get("c6")).toMatchObject({
+        kind: "comment",
+        scope: "document",
+        text: "Overall fine.\nShip it after the cap.",
+        anchors: [],
+        lines: null,
+        quote: null,
+        continues: null,
+        resolved: null,
+        lostAnchor: false,
+      });
+      expect(byId.get("c5")).toMatchObject({
+        kind: "comment",
+        scope: "code",
+        lines: [2, 2],
+        quote: "const b = 2;",
+        anchors: [expect.objectContaining({ kind: "code" })],
+      });
+      expect(byId.get("c3")).toMatchObject({
+        scope: "inline",
+        anchorText: "retry loop",
+        anchors: [expect.objectContaining({ text: "retry loop" })],
+      });
+      expect(byId.get("c4")).toMatchObject({
+        kind: "reply",
+        parentId: "a1",
+        scope: "inline",
+      });
+      expect(byId.get("s1")).toMatchObject({
+        kind: "suggestion",
+        scope: "inline",
+        continues: null,
+      });
+      expect(result.summary).toEqual({
+        items: 6,
+        comments: 5,
+        roots: 2,
+        documentComments: 2,
+        replies: 1,
+        suggestions: 1,
+        endmatter: "recognized",
+        leftOut: {
+          resolved: 1,
+          repliesUnderResolvedRoots: 1,
+          agentReplies: 3,
+          agentNotes: 1,
+        },
+      });
+      // The whole file: c1, c3, c5, c6, c7, a3; replies c2, a1, c4, a2, c8.
+      expect(result.fileSummary).toMatchObject({
+        comments: 6,
+        replies: 5,
+        suggestions: 1,
+      });
+    });
+
+    it("returns the review index unchanged from rfm, agent replies and resolved threads included", async () => {
+      const result = (await callTool(
+        "roughdraft_get_review_index",
+        { documentPath },
+        env(),
+      )) as Json;
+
+      expect(result).toEqual({
+        documentPath,
+        ...extractRoughdraftReviewIndex(reviewed),
+      });
+      expect(result.items.map((item: Json) => item.id)).toEqual(
+        expect.arrayContaining(["c1", "c2", "a1", "a2", "c8", "a3"]),
+      );
+      expect(result.items.find((item: Json) => item.id === "c5")).toMatchObject(
+        { scope: "code", lines: [2, 2], quote: "const b = 2;" },
+      );
+    });
   });
 
   it("does not write a reply when the message contains a CriticMarkup close delimiter", async () => {

@@ -91,7 +91,11 @@ Agents can watch that handoff directly:
 roughdraft open ./path/to/my-essay/draft.md --json
 ```
 
-`roughdraft open` starts or reuses the local server, opens the document, registers a fresh watcher, blocks until the next `review.completed` event, then prints event JSON with the document path, file version, feedback counts, and any optional `overallComment` you submit at handoff. By default there is no watch timeout; pass `--timeout <seconds>` when you want one. Use `--no-watch` when you only want to open the document and return immediately. If no watcher is active when you click **Done Reviewing**, Roughdraft shows a fallback prompt you can copy into the agent. Overall comments are written to Markdown as document-level YAML endmatter comments before the handoff event is emitted, so Markdown remains the durable source of truth.
+`roughdraft open` starts or reuses the local server, arms a watcher, opens the document, blocks until you click **Done Reviewing**, then prints one JSON object with the document path, file version, feedback counts, the handoff record, and any optional `overallComment` you submit at handoff. There is no watch timeout unless you pass `--timeout <seconds>`; the watcher keeps its connection alive past HTTP client limits and reconnects on its own when the server restarts. Use `--no-watch` when you only want to open the document and return immediately.
+
+Every Done is written to the session log (`review-log.json` next to `server.json`) before anything else happens, so a Done that no agent was waiting for is kept. `roughdraft watch <file>` returns it at once, `roughdraft pending <file> --json --ack` lists and acknowledges it without waiting, and `roughdraft log` shows each document with the session that opened it, its wake route, and its latest Done. Overall comments are written to Markdown as document-level YAML endmatter comments before the handoff is recorded, so Markdown remains the durable source of truth.
+
+An agent can register the chat session that opened a file (`roughdraft open <file> --harness claude-code --session-label "..." --session-id <id>`) and a wake route for its harness (`roughdraft route add <harness> --command "<text>"` or `--url <url>`, then `roughdraft route test <harness>`). Done then also fires that route with the file path, the link, and your comment counts.
 
 Experimental MCP clients can start the stdio server with:
 
@@ -99,7 +103,11 @@ Experimental MCP clients can start the stdio server with:
 roughdraft mcp
 ```
 
-The MCP server exposes tools to read the review index, list pending feedback, watch review events, append replies, and mark items resolved. CriticMarkup in the Markdown file remains the durable source of truth.
+The MCP server exposes tools to read the review index, list pending feedback, watch review events, list open documents and handoffs, acknowledge handoffs, register a session, manage wake routes, append replies, and mark items resolved. CriticMarkup in the Markdown file remains the durable source of truth.
+
+### Running Roughdraft on another machine
+
+A Roughdraft link is the address of the Roughdraft running where the file lives, plus the file's path. To review files on a VPS, install and run Roughdraft on the VPS and open its link (for example its Tailscale address) in your browser. To listen beyond loopback, set `ROUGHDRAFT_BIND_HOST` (for example to the Tailscale interface) and `ROUGHDRAFT_TOKEN` to a strong secret; the server then requires `Authorization: Bearer <token>` on every `/api` request, and the CLI and MCP send it whenever `ROUGHDRAFT_TOKEN` is set. The old remote mode (`ROUGHDRAFT_HOST`, which copied a file up to another server) is gone.
 ## Local development
 ```bash
 ./scripts/setup.sh
@@ -180,9 +188,14 @@ Commands:
 ```text
 open <path>        Open one Markdown file and wait for Done Reviewing
 start              Start or reuse the background server
-status             Show server status
+status             Show server status and one line per open document
 stop               Stop the managed background server
+restart            Stop the managed server and start this version
 watch <path>       Wait for a Done Reviewing event
+pending [path]     List Dones no agent has acknowledged yet
+ack <id>...        Acknowledge Dones by handoff id
+log                Show the session log
+route <action>     list | add <harness> | remove <harness> | test <harness>
 mcp                Start the experimental stdio MCP server
 doctor [path]      Diagnose setup or validate Markdown
 help agent         Print the agent setup prompt
@@ -207,16 +220,40 @@ roughdraft open <path> --no-open
 roughdraft open <path> --print-url
 roughdraft open <path> --json
 roughdraft open <path> --no-watch
+roughdraft open <path> --harness <name> --session-label <text> --session-link <url> --session-id <id>
 roughdraft start --port <port>
 roughdraft status --json
 roughdraft stop --all
 roughdraft watch ./draft.md --json
+roughdraft watch ./draft.md --timeout <seconds> --reconnect <seconds>
+roughdraft watch ./draft.md --no-pending | --after <sequence> | --no-ack
+roughdraft pending [./draft.md] [--ack] [--all] --json
+roughdraft ack <handoffId>... --json
+roughdraft log --json
+roughdraft route add <harness> --command "<text>" | --url <url> [--label <text>]
+roughdraft route test <harness>
 roughdraft doctor --json
 roughdraft doctor ./draft.md
 roughdraft doctor ./draft.md --json
 ```
 
-Usage errors return exit code `2`. Runtime failures return exit code `1`. `roughdraft status --json` returns exit code `0` even when the JSON says `"running": false`.
+`open` and `watch` return a Done that is already waiting (`--no-pending` waits for the next one only), and acknowledge what they return after printing it (`--no-ack` leaves it pending). `--after <sequence>` sets the cursor. A watcher that loses the server reconnects for `--reconnect` seconds (default 120) before it gives up.
+
+Exit codes:
+
+```text
+0        Done received (status "completed"), or the command succeeded (status "ok")
+1        Unexpected error (code INTERNAL); also `doctor <file>` when the file fails validation
+2        Bad command or path: USAGE, PATH_NOT_FOUND, NOT_MARKDOWN, PATH_UNREADABLE,
+         HANDOFF_NOT_FOUND, WAKE_ROUTE_NOT_FOUND
+3        Server problem: SERVER_START_FAILED, SERVER_UNREACHABLE, SERVER_LOST,
+         SERVER_VERSION_MISMATCH, SERVER_NOT_MANAGED, SERVER_STOP_FAILED, HTTP_ERROR,
+         WAKE_ROUTE_FAILED
+4        WATCH_TIMEOUT: the --timeout elapsed
+130/143  INTERRUPTED by SIGINT or SIGTERM
+```
+
+With `--json`, every command prints exactly one JSON object on stdout, whatever the outcome: `{ "ok", "status", "exitCode", "path"?, ...command keys, "error"?: { "code", "message", "retryable", "hint"?, "cause"? } }`. `open` and `watch` also write one progress line to stderr in JSON mode. In human mode failures print `roughdraft: <message>` and `hint: <hint>` on stderr; stack traces appear only with `ROUGHDRAFT_DEBUG=1`. `roughdraft status --json` returns exit code `0` even when the JSON says `"running": false` (it then reads `pendingHandoffs` from the log on disk); human `roughdraft status` exits `1` when the server is not running.
 
 Supported environment variables:
 
@@ -234,7 +271,22 @@ ROUGHDRAFT_STATE_FILE
   Exact path to the server state JSON file.
 
 ROUGHDRAFT_STATE_DIR
-  Directory containing server.json.
+  Directory containing server.json, review-log.json and wake-routes.json.
+
+ROUGHDRAFT_TOKEN
+  Bearer token sent on every request. Required when the server binds a
+  non-loopback host.
+
+ROUGHDRAFT_BIND_HOST
+  Comma-separated hosts the server binds (default: loopback). Needs
+  ROUGHDRAFT_TOKEN for anything else.
+
+ROUGHDRAFT_HARNESS, ROUGHDRAFT_SESSION_LABEL, ROUGHDRAFT_SESSION_LINK, ROUGHDRAFT_SESSION_ID
+  Defaults for open's --harness, --session-label, --session-link and
+  --session-id. No session is registered without a harness.
+
+ROUGHDRAFT_DEBUG=1
+  Print stack traces on failure.
 ```
 
 Development-only environment variables:

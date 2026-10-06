@@ -53,6 +53,13 @@ import {
 } from "./document-comments";
 import { cn } from "./lib/utils";
 import type { DocumentSaveState } from "./PageCard";
+import {
+  acknowledgeOpenRequest,
+  buildOpenRequestsUrl,
+  getOrCreateTabId,
+  handleOpenRequestEvent,
+  readSessionStorage,
+} from "./open-requests";
 import { PreviewBackend } from "./preview-backend";
 import { RoughdraftFormatDemo } from "./RoughdraftFormatDemo";
 import {
@@ -1545,27 +1552,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const sourceUrl = new URL("/api/open-requests", window.location.origin);
-    if (requestedPathState.rawPath) {
-      sourceUrl.searchParams.set("path", requestedPathState.rawPath);
-    }
-
-    const source = new EventSource(`${sourceUrl.pathname}${sourceUrl.search}`);
+    const tabId = getOrCreateTabId(readSessionStorage());
+    const source = new EventSource(
+      buildOpenRequestsUrl(requestedPathState.rawPath, tabId),
+    );
     const handleOpenRequest = (event: Event) => {
-      try {
-        const payload = JSON.parse((event as MessageEvent<string>).data) as {
-          url?: unknown;
-        };
-        if (typeof payload.url !== "string" || !payload.url.trim()) return;
-
-        const nextUrl = new URL(payload.url, window.location.origin);
-        window.focus();
-        if (nextUrl.href !== window.location.href) {
-          window.location.assign(nextUrl.href);
-        }
-      } catch (error) {
-        console.error("Failed to handle Roughdraft open request:", error);
-      }
+      handleOpenRequestEvent((event as MessageEvent<string>).data, {
+        currentHref: window.location.href,
+        focus: () => window.focus(),
+        acknowledge: (requestId) => void acknowledgeOpenRequest(requestId),
+        navigate: (href) => window.location.assign(href),
+      });
     };
 
     source.addEventListener("open-request", handleOpenRequest);
@@ -1589,14 +1586,6 @@ export function App() {
         if (cancelled) return;
 
         setBackend(detectedBackend);
-
-        if (detectedBackend.info.kind === "remote") {
-          const documentPath = detectedBackend.info.detail || "remote.md";
-          await loadDocument(detectedBackend, documentPath);
-          if (cancelled) return;
-          setLoading(false);
-          return;
-        }
 
         if (!requestedPathState.rawPath) {
           setActiveDocumentPath(null);

@@ -9,26 +9,31 @@ import {
 import {
   DocumentSaveStatusIndicator,
   DocumentWorkspace,
-  getReviewHandoffButtonLabel,
-  isReviewHandoffDisabled,
   shouldLatchDocumentChangedSinceOpen,
 } from "../src/DocumentWorkspace";
 import type { DocumentSaveState } from "../src/PageCard";
 import type {
+  BackendInfo,
   CompleteReviewOptions,
   CompleteReviewResult,
+  HandoffRecord,
   Page,
+  ReviewWatchStatus,
   StorageBackend,
 } from "../src/storage";
 
 function createBackend({
   watcherCount,
+  kind = "local-storage",
+  status = {},
 }: {
   watcherCount?: number;
+  kind?: BackendInfo["kind"];
+  status?: Partial<ReviewWatchStatus>;
 } = {}): StorageBackend {
   const backend: StorageBackend = {
     info: {
-      kind: "local-storage",
+      kind,
       label: "Test backend",
       detail: "In-memory",
     },
@@ -56,6 +61,7 @@ function createBackend({
     backend.getReviewWatchStatus = async () => ({
       watching: watcherCount > 0,
       watcherCount,
+      ...status,
     });
   }
 
@@ -292,12 +298,14 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     documentContent = "Hello world",
     documentCopyPath = "test.md",
     watcherCount = 0,
+    backendKind = "local-storage",
     onSaveDocument = async () => {},
   }: {
     documentDiskChangeState?: "clean" | "changed" | "conflict" | "paused";
     documentContent?: string;
     documentCopyPath?: string | null;
     watcherCount?: number;
+    backendKind?: BackendInfo["kind"];
     onSaveDocument?: (id: string, content: string) => Promise<void>;
   } = {}) {
     (
@@ -323,7 +331,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
           onKeepEditingWithoutAutosave={() => {}}
           onOverwriteDocumentOnDisk={() => {}}
           onCompleteReview={async () => ({ delivered: false })}
-          backend={createBackend({ watcherCount })}
+          backend={createBackend({ watcherCount, kind: backendKind })}
         />,
       );
       await Promise.resolve();
@@ -368,7 +376,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
   });
 
   it("renders save status in the fixed corner when handoff exists", async () => {
-    await renderWorkspace({ watcherCount: 1 });
+    await renderWorkspace({ watcherCount: 1, backendKind: "local-files" });
 
     const stack = queryByTestId(container, "document-status-stack");
     const header = getByTestId(container, "document-page-header");
@@ -620,61 +628,6 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     ).toBe("Save conflict");
   });
 
-  it.each([
-    ["error", "clean"],
-    ["saved", "conflict"],
-  ] satisfies Array<
-    [DocumentSaveState, "clean" | "changed" | "conflict" | "paused"]
-  >)("keeps handoff disabled for save state %s and disk state %s", (saveState, documentDiskChangeState) => {
-    expect(
-      isReviewHandoffDisabled({
-        saveState,
-        documentDiskChangeState,
-        reviewHandoffState: "idle",
-      }),
-    ).toBe(true);
-  });
-
-  it.each([
-    "saving",
-    "unsaved",
-  ] satisfies DocumentSaveState[])("keeps handoff enabled while a debounced save is pending (save state %s)", (saveState) => {
-    // The button must not dim on every keystroke while autosave debounces; it
-    // stays enabled and flushes the pending save on click instead.
-    expect(
-      isReviewHandoffDisabled({
-        saveState,
-        documentDiskChangeState: "clean",
-        reviewHandoffState: "idle",
-      }),
-    ).toBe(false);
-  });
-
-  it("allows handoff when saved, conflict-free, and idle", () => {
-    expect(
-      isReviewHandoffDisabled({
-        saveState: "saved",
-        documentDiskChangeState: "clean",
-        reviewHandoffState: "idle",
-      }),
-    ).toBe(false);
-  });
-
-  it("uses approve copy until the user has changed the document", () => {
-    expect(
-      getReviewHandoffButtonLabel({
-        reviewHandoffState: "idle",
-        documentChangedSinceOpen: false,
-      }),
-    ).toBe("Approve");
-    expect(
-      getReviewHandoffButtonLabel({
-        reviewHandoffState: "idle",
-        documentChangedSinceOpen: true,
-      }),
-    ).toBe("I'm done");
-  });
-
   it("ignores initial editor dirty signals before user input is possible", () => {
     expect(
       shouldLatchDocumentChangedSinceOpen({
@@ -785,17 +738,23 @@ describe("review handoff watcher affordance", () => {
 
   async function renderWorkspace({
     getWatcherCount,
-    onCompleteReview = async () => ({ delivered: false }),
+    getStatus = () => ({}),
+    onCompleteReview = async () => ({ delivered: false, pending: true }),
+    backendKind = "local-files",
+    documentPage = createPage(),
   }: {
     getWatcherCount: () => number;
+    getStatus?: () => Partial<ReviewWatchStatus>;
     onCompleteReview?: (
       options?: CompleteReviewOptions,
     ) => Promise<CompleteReviewResult>;
+    backendKind?: BackendInfo["kind"];
+    documentPage?: Page;
   }) {
     await act(async () => {
       root.render(
         <DocumentWorkspace
-          documentPage={createPage()}
+          documentPage={documentPage}
           activeDocumentPath="test.md"
           documentFilenameLabel="test.md"
           documentEditorViewMode="rich-text"
@@ -810,55 +769,397 @@ describe("review handoff watcher affordance", () => {
           onKeepEditingWithoutAutosave={() => {}}
           onOverwriteDocumentOnDisk={() => {}}
           onCompleteReview={onCompleteReview}
-          backend={createBackend({ watcherCount: getWatcherCount() })}
+          backend={createBackend({
+            watcherCount: getWatcherCount(),
+            kind: backendKind,
+            status: getStatus(),
+          })}
         />,
       );
       await Promise.resolve();
     });
   }
 
-  it("hides the done reviewing button when no agent is watching", async () => {
+  async function settle() {
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  function handoffRecord(
+    overrides: Partial<HandoffRecord> = {},
+  ): HandoffRecord {
+    return {
+      sequence: 1,
+      handoffId: "server-handoff",
+      createdAt: "2026-10-05T15:42:00.000Z",
+      version: "v2",
+      summary: { comments: 0, replies: 0, suggestions: 0, unresolved: 0 },
+      overallComment: null,
+      state: "pending",
+      deliveredTo: [],
+      ackedAt: null,
+      ackedBy: null,
+      wake: { routeId: null, state: "none", at: null, error: null },
+      ...overrides,
+    };
+  }
+
+  async function openOverallCommentPopover() {
+    await click(getByTestId(container, "review-handoff-comment-trigger"));
+    return getByTestId<HTMLTextAreaElement>(
+      document.body,
+      "review-handoff-overall-comment",
+    );
+  }
+
+  it("does not show the Done button outside a local files document", async () => {
+    await renderWorkspace({
+      getWatcherCount: () => 1,
+      backendKind: "local-storage",
+    });
+
+    expect(queryByTestId(container, "review-handoff-button")).toBeNull();
+  });
+
+  it("shows the Done button with no watcher and says no agent is listening", async () => {
     const onCompleteReview = vi
-      .fn<() => Promise<CompleteReviewResult>>()
-      .mockResolvedValue({ delivered: false });
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockResolvedValue({ delivered: false, pending: true });
 
     await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
 
-    expect(container.textContent).not.toContain("Approve");
-    expect(container.textContent).not.toContain("I'm done");
-    expect(container.textContent).not.toContain("Review ready");
-    expect(container.textContent).not.toContain("Copy prompt");
-    expect(onCompleteReview).not.toHaveBeenCalled();
-  });
-
-  it("shows the done reviewing button only for an active watcher", async () => {
-    const onCompleteReview = vi
-      .fn<() => Promise<CompleteReviewResult>>()
-      .mockResolvedValue({ delivered: true });
-
-    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
-
-    const doneReviewingButton = queryByTestId<HTMLButtonElement>(
+    const doneButton = getByTestId<HTMLButtonElement>(
       container,
       "review-handoff-button",
     );
-    expect(doneReviewingButton).toBeDefined();
-    expect(doneReviewingButton?.textContent).toContain("Approve");
-    expect(container.textContent).not.toContain("Agent waiting");
-    expect(queryByTestId(container, "review-handoff-status")).toBeNull();
+    expect(doneButton.textContent).toContain("Approve");
+    expect(doneButton.disabled).toBe(false);
+    expect(
+      getByTestId(container, "review-handoff-split-button").getAttribute(
+        "data-watcher-state",
+      ),
+    ).toBe("none");
 
-    if (!doneReviewingButton) {
-      throw new Error("I'm done button not found");
-    }
-    await click(doneReviewingButton);
+    await openOverallCommentPopover();
+
+    expect(
+      getByTestId(document.body, "review-handoff-agent-status").textContent,
+    ).toBe(
+      "No agent is listening. Roughdraft keeps your Done until it checks in.",
+    );
+    expect(onCompleteReview).not.toHaveBeenCalled();
+  });
+
+  it("says the agent is waiting and names its session when one is registered", async () => {
+    await renderWorkspace({
+      getWatcherCount: () => 1,
+      getStatus: () => ({
+        session: {
+          harness: "claude-code",
+          label: "Plan review chat",
+          link: null,
+          sessionId: null,
+          routeId: null,
+          registeredAt: "2026-10-05T15:00:00.000Z",
+        },
+      }),
+    });
+    await settle();
+
+    expect(
+      getByTestId(container, "review-handoff-split-button").getAttribute(
+        "data-watcher-state",
+      ),
+    ).toBe("listening");
+
+    await openOverallCommentPopover();
+
+    expect(
+      getByTestId(document.body, "review-handoff-agent-status").textContent,
+    ).toBe("Your agent is waiting");
+    expect(
+      getByTestId(document.body, "review-handoff-session-label").textContent,
+    ).toBe("Opened by Plan review chat");
+  });
+
+  it("sends Done with a client handoff id", async () => {
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockResolvedValue({ delivered: true });
+
+    await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
+    await click(getByTestId(container, "review-handoff-button"));
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
-    expect(onCompleteReview).toHaveBeenCalledWith(undefined);
-    expect(container.textContent).toContain("Sent");
-    expect(queryByTestId(container, "review-handoff-status")).toBeNull();
-    expect(container.textContent).not.toContain("Agent notified");
-    expect(container.textContent).not.toContain("Review ready");
-    expect(container.textContent).not.toContain("Copy prompt");
+    expect(onCompleteReview).toHaveBeenCalledWith({
+      handoffId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    });
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Sent");
+  });
+
+  it("shows the sending copy while Done is in flight", async () => {
+    let resolveReview: (result: CompleteReviewResult) => void = () => {};
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveReview = resolve;
+          }),
+      );
+
+    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    const textarea = await openOverallCommentPopover();
+    await change(textarea, "Tighten the intro.");
+    await click(getByTestId(document.body, "review-handoff-submit-comment"));
+
+    const button = getByTestId<HTMLButtonElement>(
+      container,
+      "review-handoff-button",
+    );
+    expect(button.textContent).toContain("Sending");
+    expect(button.disabled).toBe(true);
+    const status = getByTestId(document.body, "review-handoff-status");
+    expect(status.textContent).toContain("Sending your review");
+    expect(queryByTestId(status, "review-handoff-robots-toy")).toBeNull();
+    expect(status.textContent).not.toContain("Your agent is now working");
+
+    await act(async () => {
+      resolveReview({ delivered: false, pending: true });
+      await Promise.resolve();
+    });
+  });
+
+  it("shows Saved for your agent with a Copy message button when nobody is listening", async () => {
+    const writeText = vi.fn<Clipboard["writeText"]>().mockResolvedValue();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockResolvedValue({
+        delivered: false,
+        pending: true,
+        handoff: handoffRecord(),
+        wake: handoffRecord().wake,
+      });
+
+    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    await click(getByTestId(container, "review-handoff-button"));
+
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Done, waiting");
+    const status = getByTestId(document.body, "review-handoff-status");
+    expect(status.textContent).toContain("Saved for your agent");
+    expect(getByTestId(status, "review-handoff-wake-status").textContent).toBe(
+      "No wake route registered",
+    );
+
+    await click(getByTestId(status, "review-handoff-copy-message"));
+
+    expect(writeText).toHaveBeenCalledWith(
+      "I am done reviewing this file: test.md",
+    );
+  });
+
+  it("moves to Picked up when the status poll reports the handoff acknowledged", async () => {
+    let handoffId = "";
+    let polledHandoff: HandoffRecord | null = null;
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockImplementation(async (options) => {
+        handoffId = options?.handoffId ?? "";
+        const record = handoffRecord({ handoffId });
+        return {
+          delivered: false,
+          pending: true,
+          handoff: record,
+          wake: record.wake,
+        };
+      });
+
+    await renderWorkspace({
+      getWatcherCount: () => 0,
+      getStatus: () => ({ handoff: polledHandoff }),
+      onCompleteReview,
+    });
+    await click(getByTestId(container, "review-handoff-button"));
+
+    polledHandoff = handoffRecord({
+      handoffId,
+      state: "acknowledged",
+      ackedAt: "2026-10-05T15:45:00.000Z",
+    });
+    await renderWorkspace({
+      getWatcherCount: () => 0,
+      getStatus: () => ({ handoff: polledHandoff }),
+      onCompleteReview,
+    });
+    await settle();
+
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Picked up");
+    expect(
+      getByTestId(document.body, "review-handoff-status").textContent,
+    ).toContain("Your agent picked this up at");
+  });
+
+  it("ignores an acknowledged handoff that belongs to another Done", async () => {
+    await renderWorkspace({
+      getWatcherCount: () => 0,
+      getStatus: () => ({
+        handoff: handoffRecord({
+          handoffId: "someone-else",
+          state: "acknowledged",
+          ackedAt: "2026-10-05T15:45:00.000Z",
+        }),
+      }),
+      onCompleteReview: async (options) => ({
+        delivered: false,
+        pending: true,
+        handoff: handoffRecord({ handoffId: options?.handoffId }),
+      }),
+    });
+    await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Done, waiting");
+  });
+
+  it("retries a failed Done with the same handoff id so the overall comment is written once", async () => {
+    // A fake server that records the overall comment once per handoff id,
+    // like the batch 1 server. The first answer is lost after the write.
+    const writtenComments = new Map<string, string>();
+    let calls = 0;
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockImplementation(async (options) => {
+        calls += 1;
+        const id = options?.handoffId ?? "";
+        if (!writtenComments.has(id) && options?.overallComment) {
+          writtenComments.set(id, options.overallComment);
+        }
+        if (calls === 1) throw new Error("connection reset");
+        return { delivered: false, pending: true };
+      });
+
+    await renderWorkspace({ getWatcherCount: () => 0, onCompleteReview });
+    const textarea = await openOverallCommentPopover();
+    await change(textarea, "Tighten the intro.");
+    await click(getByTestId(container, "review-handoff-button"));
+
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Not sent");
+    const errorStatus = getByTestId(document.body, "review-handoff-status");
+    expect(errorStatus.textContent).toContain(
+      "Roughdraft could not record your Done. Your saved edits are on disk.",
+    );
+    expect(
+      queryByTestId(errorStatus, "review-handoff-copy-message"),
+    ).not.toBeNull();
+
+    await click(getByTestId(errorStatus, "review-handoff-retry"));
+
+    expect(onCompleteReview).toHaveBeenCalledTimes(2);
+    const [first, second] = onCompleteReview.mock.calls.map(
+      ([options]) => options,
+    );
+    expect(second?.handoffId).toBe(first?.handoffId);
+    expect(second?.overallComment).toBe("Tighten the intro.");
+    expect([...writtenComments.values()]).toEqual(["Tighten the intro."]);
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Done, waiting");
+  });
+
+  it("clears the overall comment on a 2xx even when nobody received the Done", async () => {
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockResolvedValue({ delivered: false, pending: true });
+    let watcherCount = 0;
+
+    await renderWorkspace({
+      getWatcherCount: () => watcherCount,
+      onCompleteReview,
+    });
+    const textarea = await openOverallCommentPopover();
+    await change(textarea, "Tighten the intro.");
+    await click(getByTestId(document.body, "review-handoff-submit-comment"));
+
+    expect(onCompleteReview).toHaveBeenCalledOnce();
+    expect(onCompleteReview.mock.calls[0]?.[0]).toMatchObject({
+      overallComment: "Tighten the intro.",
+    });
+
+    // A new document version from disk (the agent replied) returns the button
+    // to ready. The field must be empty so a second Done cannot repeat it.
+    watcherCount = 1;
+    await renderWorkspace({
+      getWatcherCount: () => watcherCount,
+      onCompleteReview,
+      documentPage: { ...createPage("Hello again"), version: "v9" },
+    });
+    await settle();
+
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Approve");
+    const reopened = await openOverallCommentPopover();
+    expect(reopened.value).toBe("");
+
+    await click(getByTestId(container, "review-handoff-button"));
+
+    expect(onCompleteReview).toHaveBeenCalledTimes(2);
+    const [first, second] = onCompleteReview.mock.calls.map(
+      ([options]) => options,
+    );
+    expect(second?.overallComment).toBeUndefined();
+    expect(second?.handoffId).not.toBe(first?.handoffId);
+  });
+
+  it("disables Done with a reason while the file is in conflict", async () => {
+    await act(async () => {
+      root.render(
+        <DocumentWorkspace
+          documentPage={createPage()}
+          activeDocumentPath="test.md"
+          documentFilenameLabel="test.md"
+          documentEditorViewMode="rich-text"
+          onDocumentEditorViewModeChange={() => {}}
+          onSaveDocument={async () => {}}
+          onDocumentSaveStateChange={() => {}}
+          onDocumentDirtyStateChange={() => {}}
+          onDocumentLocalContentChange={() => {}}
+          documentDiskChangeState="conflict"
+          documentForceResetKey={null}
+          onReloadDocumentFromDisk={() => {}}
+          onKeepEditingWithoutAutosave={() => {}}
+          onOverwriteDocumentOnDisk={() => {}}
+          onCompleteReview={async () => ({ delivered: false })}
+          backend={createBackend({ watcherCount: 1, kind: "local-files" })}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    const button = getByTestId<HTMLButtonElement>(
+      container,
+      "review-handoff-button",
+    );
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(
+      getByTestId(container, "review-handoff-blocked-reason").textContent,
+    ).toBe("Save conflict. Resolve it before you finish.");
   });
 
   it("fades the whole handoff split button after sending", async () => {
@@ -868,21 +1169,18 @@ describe("review handoff watcher affordance", () => {
 
     await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
 
-    const splitButton = queryByTestId<HTMLDivElement>(
+    const splitButton = getByTestId<HTMLDivElement>(
       container,
       "review-handoff-split-button",
     );
-    const doneReviewingButton = queryByTestId<HTMLButtonElement>(
+    const doneReviewingButton = getByTestId<HTMLButtonElement>(
       container,
       "review-handoff-button",
     );
-    const commentTrigger = queryByTestId<HTMLButtonElement>(
+    const commentTrigger = getByTestId<HTMLButtonElement>(
       container,
       "review-handoff-comment-trigger",
     );
-    if (!splitButton || !doneReviewingButton || !commentTrigger) {
-      throw new Error("Review handoff split button not found");
-    }
 
     await click(doneReviewingButton);
 
@@ -891,26 +1189,19 @@ describe("review handoff watcher affordance", () => {
     expect(commentTrigger.className).toContain("disabled:opacity-100");
   });
 
-  it("shows visible feedback when the watcher disappears before handoff delivery", async () => {
+  it("says no agent received a Done that an older server neither delivered nor kept", async () => {
     const onCompleteReview = vi
       .fn<() => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: false });
 
     await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
-
-    const doneReviewingButton = queryByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-button",
-    );
-    if (!doneReviewingButton) {
-      throw new Error("I'm done button not found");
-    }
-    await click(doneReviewingButton);
+    await click(getByTestId(container, "review-handoff-button"));
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("Not sent");
-    expect(container.textContent).not.toContain("Approve");
-    expect(container.textContent).not.toContain("I'm done");
+    expect(
+      getByTestId(document.body, "review-handoff-status").textContent,
+    ).toContain("No agent received this");
   });
 
   it("submits an overall comment from the handoff popover", async () => {
@@ -920,39 +1211,15 @@ describe("review handoff watcher affordance", () => {
 
     await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
 
-    const commentTrigger = queryByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-comment-trigger",
-    );
-    if (!commentTrigger) {
-      throw new Error("Review handoff comment trigger not found");
-    }
-
-    await click(commentTrigger);
-
-    const textarea = queryByTestId<HTMLTextAreaElement>(
-      document.body,
-      "review-handoff-overall-comment",
-    );
-    if (!textarea) {
-      throw new Error("Overall comment textarea not found");
-    }
+    const textarea = await openOverallCommentPopover();
     expect(textarea.getAttribute("placeholder")).toBe("Overall comment");
-    expect(document.body.textContent).not.toContain("Overall comment");
 
     await change(textarea, "  Please prioritize the CLI contract.  ");
-
-    const submitButton = queryByTestId<HTMLButtonElement>(
-      document.body,
-      "review-handoff-submit-comment",
-    );
-    if (!submitButton) {
-      throw new Error("Submit with comment button not found");
-    }
-    await click(submitButton);
+    await click(getByTestId(document.body, "review-handoff-submit-comment"));
 
     expect(onCompleteReview).toHaveBeenCalledWith({
       overallComment: "Please prioritize the CLI contract.",
+      handoffId: expect.any(String),
     });
     expect(document.body.textContent).not.toContain(
       "Please prioritize the CLI contract.",
@@ -966,37 +1233,13 @@ describe("review handoff watcher affordance", () => {
 
     await renderWorkspace({ getWatcherCount: () => 1, onCompleteReview });
 
-    const commentTrigger = queryByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-comment-trigger",
-    );
-    if (!commentTrigger) {
-      throw new Error("Review handoff comment trigger not found");
-    }
-
-    await click(commentTrigger);
-
-    const textarea = queryByTestId<HTMLTextAreaElement>(
-      document.body,
-      "review-handoff-overall-comment",
-    );
-    if (!textarea) {
-      throw new Error("Overall comment textarea not found");
-    }
-
+    const textarea = await openOverallCommentPopover();
     await change(textarea, "  Please prioritize the CLI contract.  ");
-
-    const doneReviewingButton = queryByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-button",
-    );
-    if (!doneReviewingButton) {
-      throw new Error("I'm done button not found");
-    }
-    await click(doneReviewingButton);
+    await click(getByTestId(container, "review-handoff-button"));
 
     expect(onCompleteReview).toHaveBeenCalledWith({
       overallComment: "Please prioritize the CLI contract.",
+      handoffId: expect.any(String),
     });
   });
 
@@ -1014,15 +1257,7 @@ describe("review handoff watcher affordance", () => {
       onCompleteReview,
     });
 
-    const doneReviewingButton = queryByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-button",
-    );
-    if (!doneReviewingButton) {
-      throw new Error("I'm done button not found");
-    }
-
-    await click(doneReviewingButton);
+    await click(getByTestId(container, "review-handoff-button"));
     await renderWorkspace({
       getWatcherCount: () => watcherCount,
       onCompleteReview,
@@ -1030,7 +1265,6 @@ describe("review handoff watcher affordance", () => {
 
     expect(onCompleteReview).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("Sent");
-    expect(container.textContent).not.toContain("Agent notified");
     expect(container.textContent).not.toContain("Approve");
     expect(container.textContent).not.toContain("I'm done");
   });
@@ -1049,15 +1283,7 @@ describe("review handoff watcher affordance", () => {
       onCompleteReview,
     });
 
-    const doneReviewingButton = queryByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-button",
-    );
-    if (!doneReviewingButton) {
-      throw new Error("I'm done button not found");
-    }
-
-    await click(doneReviewingButton);
+    await click(getByTestId(container, "review-handoff-button"));
     await renderWorkspace({
       getWatcherCount: () => watcherCount,
       onCompleteReview,
@@ -1065,16 +1291,13 @@ describe("review handoff watcher affordance", () => {
 
     expect(container.textContent).toContain("Sent");
     expect(container.textContent).not.toContain("Approve");
-    expect(container.textContent).not.toContain("I'm done");
 
     watcherCount = 1;
     await renderWorkspace({
       getWatcherCount: () => watcherCount,
       onCompleteReview,
     });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await settle();
 
     expect(container.textContent).toContain("Approve");
     expect(container.textContent).not.toContain("Sent");
@@ -1101,11 +1324,7 @@ describe("review handoff watcher affordance", () => {
       onCompleteReview,
     });
 
-    const doneReviewingButton = getByTestId<HTMLButtonElement>(
-      container,
-      "review-handoff-button",
-    );
-    await click(doneReviewingButton);
+    await click(getByTestId(container, "review-handoff-button"));
 
     expect(onCompleteReview).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("Sent");
@@ -1113,15 +1332,11 @@ describe("review handoff watcher affordance", () => {
     expect(document.body.textContent).toContain(
       "Your agent is now working in the background on this, in all likelihood. If our signal didn't make it, just click here to copy a line you can send it to keep going.",
     );
-    expect(queryByTestId(document.body, "review-handoff-status")).toBeDefined();
     expect(
       getByTestId(document.body, "review-handoff-status").querySelector(
         ".h-\\[170px\\]",
       ),
     ).not.toBeNull();
-    expect(
-      queryByTestId(document.body, "review-handoff-robots-toy"),
-    ).toBeDefined();
 
     await act(async () => {
       document.dispatchEvent(
@@ -1141,23 +1356,14 @@ describe("review handoff watcher affordance", () => {
     await click(sentButton);
 
     expect(onCompleteReview).toHaveBeenCalledTimes(1);
-    expect(queryByTestId(document.body, "review-handoff-status")).toBeDefined();
+    getByTestId(document.body, "review-handoff-status");
 
     const toy = getByTestId(document.body, "review-handoff-robots-toy");
     await click(toy);
 
     expect(document.body.textContent).toContain("Great work!");
 
-    const copyLink = queryByTestId<HTMLButtonElement>(
-      document.body,
-      "review-handoff-copy-message",
-    );
-    expect(copyLink).toBeDefined();
-    if (!copyLink) {
-      throw new Error("Review handoff fallback copy link not found");
-    }
-
-    await click(copyLink);
+    await click(getByTestId(document.body, "review-handoff-copy-message"));
 
     expect(writeText).toHaveBeenCalledWith(
       "I am done reviewing this file: test.md",

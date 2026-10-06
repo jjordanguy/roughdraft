@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { DocumentEditorViewMode } from "./app-navigation";
-import { RemoteSessionBanner } from "./components/RemoteSessionBanner";
 import { Button } from "./components/ui/button";
 import {
   Popover,
@@ -46,16 +45,21 @@ import {
   PageCard,
 } from "./PageCard";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
-import type { CompleteReviewOptions, Page, StorageBackend } from "./storage";
+import {
+  createClientId,
+  type DiskChangeState,
+  getReviewHandoffView,
+  type ReviewHandoffPhase,
+} from "./review-handoff";
+import type {
+  CompleteReviewOptions,
+  CompleteReviewResult,
+  HandoffRecord,
+  Page,
+  StorageBackend,
+} from "./storage";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
 
-type DiskChangeState = "clean" | "changed" | "conflict" | "paused";
-type ReviewHandoffState =
-  | "idle"
-  | "notifying"
-  | "notified"
-  | "undelivered"
-  | "error";
 type FileCopyAction = "path" | "filename" | "markdown" | "rich-text";
 const FILE_COPY_PREVIEW_MAX_LENGTH = 34;
 const reviewCompleteTitles = [
@@ -329,44 +333,6 @@ export function DocumentSaveStatusIndicator({
   );
 }
 
-export function isReviewHandoffDisabled({
-  saveState,
-  documentDiskChangeState,
-  reviewHandoffState,
-}: {
-  saveState: DocumentSaveState;
-  documentDiskChangeState: DiskChangeState;
-  reviewHandoffState: ReviewHandoffState;
-}) {
-  // Transient save states ("saving"/"unsaved") intentionally do NOT disable the
-  // button. Disabling on them dims the whole control on every keystroke while
-  // autosave debounces. Instead the button stays enabled and flushes the
-  // pending save on click, so the agent still receives the latest content.
-  return (
-    saveState === "error" ||
-    reviewHandoffState !== "idle" ||
-    documentDiskChangeState !== "clean"
-  );
-}
-
-export function getReviewHandoffButtonLabel({
-  reviewHandoffState,
-  documentChangedSinceOpen,
-}: {
-  reviewHandoffState: ReviewHandoffState;
-  documentChangedSinceOpen: boolean;
-}) {
-  return reviewHandoffState === "notifying"
-    ? "Sending"
-    : reviewHandoffState === "notified"
-      ? "Sent"
-      : reviewHandoffState === "error" || reviewHandoffState === "undelivered"
-        ? "Not sent"
-        : documentChangedSinceOpen
-          ? "I'm done"
-          : "Approve";
-}
-
 export function shouldLatchDocumentChangedSinceOpen({
   isDirty,
   documentChangeTrackingReady,
@@ -395,7 +361,7 @@ interface DocumentWorkspaceProps {
   onOverwriteDocumentOnDisk: () => void | Promise<void>;
   onCompleteReview: (
     options?: CompleteReviewOptions,
-  ) => Promise<{ delivered: boolean }>;
+  ) => Promise<CompleteReviewResult>;
   backend: StorageBackend | null;
 }
 
@@ -421,9 +387,17 @@ export function DocumentWorkspace({
   const [documentInteractionMode, setDocumentInteractionMode] =
     useState<DocumentInteractionMode>("suggesting");
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
-  const [reviewHandoffState, setReviewHandoffState] =
-    useState<ReviewHandoffState>("idle");
+  const [reviewHandoffPhase, setReviewHandoffPhase] =
+    useState<ReviewHandoffPhase>("idle");
+  const [reviewHandoffResult, setReviewHandoffResult] =
+    useState<CompleteReviewResult | null>(null);
+  const [reviewHandoffRecord, setReviewHandoffRecord] =
+    useState<HandoffRecord | null>(null);
+  const [reviewSessionLabel, setReviewSessionLabel] = useState<string | null>(
+    null,
+  );
   const [reviewWatcherCount, setReviewWatcherCount] = useState(0);
+  const [copiedHandoffMessage, setCopiedHandoffMessage] = useState(false);
   const [reviewHandoffPopoverOpen, setReviewHandoffPopoverOpen] =
     useState(false);
   const [reviewCompleteTitle, setReviewCompleteTitle] = useState(() =>
@@ -436,6 +410,19 @@ export function DocumentWorkspace({
   const [documentChangedSinceOpen, setDocumentChangedSinceOpen] =
     useState(false);
   const sawNoWatcherAfterNotifiedRef = useRef(false);
+  const reviewHandoffPhaseRef = useRef<ReviewHandoffPhase>("idle");
+  reviewHandoffPhaseRef.current = reviewHandoffPhase;
+  // Reused by every Done attempt until one gets a 2xx, so a retry after a
+  // lost response cannot make the server write the overall comment twice.
+  const pendingHandoffIdRef = useRef<string | null>(null);
+  // The id of the last Done the server accepted; the status poll only
+  // updates the handoff record when it reports this id.
+  const completedHandoffIdRef = useRef<string | null>(null);
+  // Document versions that belong to the last Done. Any other version from
+  // disk (the agent replied) starts a new round.
+  const completedHandoffVersionsRef = useRef<Set<string>>(new Set());
+  const documentVersionRef = useRef<string | undefined>(documentPage?.version);
+  documentVersionRef.current = documentPage?.version;
   const copiedFileActionTimeoutRef = useRef<number | null>(null);
   const saveControllerRef = useRef<DocumentSaveController | null>(null);
   const documentChangeTrackingReadyRef = useRef(false);
@@ -467,7 +454,12 @@ export function DocumentWorkspace({
     const documentIdentity = `${activeDocumentPath ?? ""}:${documentPage?.id ?? ""}`;
     if (!documentIdentity) return;
     documentChangeTrackingReadyRef.current = false;
-    setReviewHandoffState("idle");
+    setReviewHandoffPhase("idle");
+    setReviewHandoffResult(null);
+    setReviewHandoffRecord(null);
+    pendingHandoffIdRef.current = null;
+    completedHandoffIdRef.current = null;
+    completedHandoffVersionsRef.current = new Set();
     setReviewHandoffPopoverOpen(false);
     setDocumentChangedSinceOpen(false);
     const readyTimer = window.setTimeout(() => {
@@ -486,8 +478,16 @@ export function DocumentWorkspace({
     const refreshWatchStatus = async () => {
       try {
         const status = await backend.getReviewWatchStatus?.(activeDocumentPath);
-        if (!cancelled) {
-          setReviewWatcherCount(status?.watcherCount ?? 0);
+        if (cancelled) return;
+        setReviewWatcherCount(status?.watcherCount ?? 0);
+        setReviewSessionLabel(status?.session?.label ?? null);
+        const polledHandoff = status?.handoff;
+        if (
+          polledHandoff &&
+          polledHandoff.handoffId === completedHandoffIdRef.current
+        ) {
+          completedHandoffVersionsRef.current.add(polledHandoff.version);
+          setReviewHandoffRecord(polledHandoff);
         }
       } catch {
         if (!cancelled) {
@@ -504,13 +504,24 @@ export function DocumentWorkspace({
     };
   }, [activeDocumentPath, backend]);
 
-  useEffect(() => {
-    if (reviewHandoffState === "undelivered" && reviewWatcherCount > 0) {
-      setReviewHandoffState("idle");
-      return;
-    }
+  const reviewHandoffSettledKind =
+    reviewHandoffPhase !== "completed" || !reviewHandoffResult
+      ? null
+      : (reviewHandoffRecord ?? reviewHandoffResult.handoff)?.state ===
+          "acknowledged"
+        ? "picked-up"
+        : reviewHandoffResult.delivered
+          ? "sent"
+          : "kept";
 
-    if (reviewHandoffState !== "notified") {
+  useEffect(() => {
+    // After a Done that reached an agent, a watcher that disconnects and a new
+    // one that connects means the agent is waiting for another round. A Done
+    // kept for later stays put: the next watcher is about to pick it up.
+    if (
+      reviewHandoffSettledKind !== "sent" &&
+      reviewHandoffSettledKind !== "picked-up"
+    ) {
       sawNoWatcherAfterNotifiedRef.current = false;
       return;
     }
@@ -522,17 +533,26 @@ export function DocumentWorkspace({
 
     if (sawNoWatcherAfterNotifiedRef.current) {
       sawNoWatcherAfterNotifiedRef.current = false;
-      setReviewHandoffState("idle");
+      setReviewHandoffPhase("idle");
+      setReviewHandoffPopoverOpen(false);
     }
-  }, [reviewHandoffState, reviewWatcherCount]);
+  }, [reviewHandoffSettledKind, reviewWatcherCount]);
 
   useEffect(() => {
-    if (reviewHandoffState === "notified") {
+    const version = documentPage?.version;
+    if (!version || reviewHandoffPhaseRef.current !== "completed") return;
+    if (completedHandoffVersionsRef.current.has(version)) return;
+    setReviewHandoffPhase("idle");
+    setReviewHandoffPopoverOpen(false);
+  }, [documentPage?.version]);
+
+  useEffect(() => {
+    if (reviewHandoffSettledKind === "sent") {
       setReviewCompleteTitle((currentTitle) =>
         getRandomReviewCompleteTitleExcept(currentTitle),
       );
     }
-  }, [reviewHandoffState]);
+  }, [reviewHandoffSettledKind]);
 
   useEffect(() => {
     return () => {
@@ -568,10 +588,15 @@ export function DocumentWorkspace({
   }, [documentDiskChangeState, documentPage]);
 
   const handleCompleteReview = useCallback(
-    async (options?: CompleteReviewOptions) => {
-      if (!activeDocumentPath || reviewHandoffState === "notifying") return;
+    async (overallCommentText?: string) => {
+      if (!activeDocumentPath || reviewHandoffPhaseRef.current === "sending") {
+        return;
+      }
 
-      setReviewHandoffState("notifying");
+      const handoffId = pendingHandoffIdRef.current ?? createClientId();
+      pendingHandoffIdRef.current = handoffId;
+      reviewHandoffPhaseRef.current = "sending";
+      setReviewHandoffPhase("sending");
       try {
         // The button stays enabled while autosave is still pending, so make
         // sure any debounced edits are persisted before handing off.
@@ -580,24 +605,29 @@ export function DocumentWorkspace({
           throw flushResult.error;
         }
 
-        const result = await onCompleteReview(options);
-        if (result.delivered) {
-          setReviewWatcherCount(0);
-          setReviewHandoffState("notified");
-          setOverallComment("");
-          setReviewHandoffPopoverOpen(true);
-        } else {
-          setReviewWatcherCount(0);
-          setReviewHandoffState("undelivered");
-          setReviewHandoffPopoverOpen(true);
-        }
+        const result = await onCompleteReview({
+          ...(overallCommentText ? { overallComment: overallCommentText } : {}),
+          handoffId,
+        });
+        pendingHandoffIdRef.current = null;
+        completedHandoffIdRef.current = result.handoff?.handoffId ?? handoffId;
+        completedHandoffVersionsRef.current = new Set(
+          [documentVersionRef.current, result.handoff?.version].filter(
+            (version): version is string => !!version,
+          ),
+        );
+        setReviewHandoffResult(result);
+        setReviewHandoffRecord(result.handoff ?? null);
+        setOverallComment("");
+        setReviewHandoffPhase("completed");
+        setReviewHandoffPopoverOpen(true);
       } catch (error) {
         console.error("Failed to complete review:", error);
-        setReviewHandoffState("error");
+        setReviewHandoffPhase("error");
         setReviewHandoffPopoverOpen(true);
       }
     },
-    [activeDocumentPath, onCompleteReview, reviewHandoffState],
+    [activeDocumentPath, onCompleteReview],
   );
 
   const handleDocumentDirtyStateChange = useCallback(
@@ -609,11 +639,26 @@ export function DocumentWorkspace({
         })
       ) {
         setDocumentChangedSinceOpen(true);
+        // An edit after Done starts a new round. A failed Done keeps its
+        // handoff id, so the next attempt still cannot write twice.
+        setReviewHandoffPhase((phase) =>
+          phase === "completed" || phase === "error" ? "idle" : phase,
+        );
       }
       onDocumentDirtyStateChange(isDirty);
     },
     [onDocumentDirtyStateChange],
   );
+
+  const handleCopyHandoffMessage = useCallback(async (message: string) => {
+    try {
+      await writePlainTextToClipboard(message);
+      setCopiedHandoffMessage(true);
+      window.setTimeout(() => setCopiedHandoffMessage(false), 2000);
+    } catch (error) {
+      console.error("Failed to copy handoff message:", error);
+    }
+  }, []);
 
   const handleCopyFileMenuAction = useCallback(
     async (action: FileCopyAction) => {
@@ -673,41 +718,33 @@ export function DocumentWorkspace({
     documentDiskChangeState === "clean"
       ? null
       : conflictNoticeCopy[documentDiskChangeState];
-  const showReviewHandoffButton =
-    !!activeDocumentPath &&
-    (reviewWatcherCount > 0 || reviewHandoffState !== "idle");
-  const reviewHandoffButtonLabel = getReviewHandoffButtonLabel({
-    reviewHandoffState,
+  const reviewHandoffView = getReviewHandoffView({
+    enabled: !!activeDocumentPath && backend?.info.kind === "local-files",
+    watcherCount: reviewWatcherCount,
+    diskState: documentDiskChangeState,
+    saveState,
+    phase: reviewHandoffPhase,
+    result: reviewHandoffResult,
+    handoff: reviewHandoffRecord,
+    sessionLabel: reviewSessionLabel,
     documentChangedSinceOpen,
+    sentTitle: reviewCompleteTitle,
   });
+  const showReviewHandoffButton = reviewHandoffView.kind !== "hidden";
+  const reviewHandoffIsReady =
+    reviewHandoffView.kind === "ready-listening" ||
+    reviewHandoffView.kind === "ready-no-agent";
   const ReviewHandoffButtonIcon =
-    reviewHandoffState === "notifying"
+    reviewHandoffView.icon === "spinner"
       ? Loader2
-      : reviewHandoffState === "error" || reviewHandoffState === "undelivered"
+      : reviewHandoffView.icon === "alert"
         ? AlertTriangle
-        : null;
-  const reviewHandoffStatusTitle =
-    reviewHandoffState === "undelivered"
-      ? "No agent is watching now"
-      : reviewHandoffState === "error"
-        ? "Could not notify agent"
-        : reviewCompleteTitle;
-  const reviewHandoffStatusBody =
-    reviewHandoffState === "undelivered"
-      ? "The handoff was not delivered because the watcher is no longer connected."
-      : reviewHandoffState === "error"
-        ? "Roughdraft could not send the handoff. Check that the local server is still running."
         : null;
   const reviewHandoffCopyMessage = buildReviewHandoffCopyMessage(
     activeDocumentPath ?? documentFilenameLabel,
   );
-  const reviewHandoffDisabled = isReviewHandoffDisabled({
-    saveState,
-    documentDiskChangeState,
-    reviewHandoffState,
-  });
-  const reviewHandoffButtonDisabled =
-    reviewHandoffDisabled && reviewHandoffState !== "notified";
+  const reviewHandoffTooltip =
+    reviewHandoffView.blockedReason ?? reviewHandoffView.agentStatusText;
   const trimmedOverallComment = overallComment.trim();
 
   return (
@@ -717,7 +754,6 @@ export function DocumentWorkspace({
         conflictNotice ? "pt-40 sm:pt-28" : "pt-10",
       )}
     >
-      <RemoteSessionBanner backend={backend} />
       {documentPage ? (
         <div
           className="fixed top-3 left-3 z-[60]"
@@ -743,79 +779,108 @@ export function DocumentWorkspace({
               open={reviewHandoffPopoverOpen}
               onOpenChange={setReviewHandoffPopoverOpen}
             >
-              <div
-                data-testid="review-handoff-split-button"
-                className={cn(
-                  "relative flex items-center overflow-hidden rounded-[7px] shadow-[0_10px_28px_rgba(0,0,0,0.18)] transition-opacity after:pointer-events-none after:absolute after:top-px after:right-8 after:bottom-px after:z-10 after:w-px after:bg-[#4a4038] after:content-[''] dark:after:bg-slate-600",
-                  reviewHandoffDisabled && "opacity-50",
-                )}
-              >
-                <Button
-                  type="button"
-                  data-testid="review-handoff-button"
-                  size="lg"
-                  className="h-9 rounded-r-none rounded-l-[7px] border-0 bg-[#2B2420] px-3 text-sm font-bold text-white hover:bg-[#3a322b] focus-visible:ring-slate-300 disabled:opacity-100 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600"
-                  disabled={reviewHandoffButtonDisabled}
-                  aria-disabled={reviewHandoffButtonDisabled || undefined}
-                  onClick={() => {
-                    if (reviewHandoffState === "notified") {
-                      setReviewHandoffPopoverOpen(true);
-                      return;
-                    }
-
-                    void handleCompleteReview(
-                      trimmedOverallComment
-                        ? { overallComment: trimmedOverallComment }
-                        : undefined,
-                    );
-                  }}
-                >
-                  {ReviewHandoffButtonIcon ? (
-                    <ReviewHandoffButtonIcon
+              <Tooltip disabled={!reviewHandoffTooltip}>
+                <TooltipTrigger
+                  render={
+                    <div
+                      data-testid="review-handoff-split-button"
+                      data-watcher-state={reviewHandoffView.watcherState}
+                      data-handoff-state={reviewHandoffView.kind}
                       className={cn(
-                        "size-4",
-                        reviewHandoffState === "notifying" && "animate-spin",
+                        "relative flex items-center overflow-hidden rounded-[7px] shadow-[0_10px_28px_rgba(0,0,0,0.18)] transition-opacity after:pointer-events-none after:absolute after:top-px after:right-8 after:bottom-px after:z-10 after:w-px after:bg-[#4a4038] after:content-[''] dark:after:bg-slate-600",
+                        reviewHandoffView.dimmed && "opacity-50",
                       )}
                     />
-                  ) : null}
-                  {reviewHandoffButtonLabel}
-                </Button>
-                <PopoverTrigger
-                  render={
-                    <Button
-                      type="button"
-                      data-testid="review-handoff-comment-trigger"
-                      size="icon-lg"
-                      className="h-9 w-8 rounded-l-none rounded-r-[7px] border-0 bg-[#2B2420] text-white hover:bg-[#3a322b] focus-visible:ring-slate-300 disabled:opacity-100 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600"
-                      disabled={reviewHandoffDisabled}
-                      aria-label="Add overall handoff comment"
-                    >
-                      <ChevronDown className="size-4" />
-                    </Button>
                   }
-                />
-              </div>
+                >
+                  <Button
+                    type="button"
+                    data-testid="review-handoff-button"
+                    size="lg"
+                    className="h-9 rounded-r-none rounded-l-[7px] border-0 bg-[#2B2420] px-3 text-sm font-bold text-white hover:bg-[#3a322b] focus-visible:ring-slate-300 disabled:opacity-100 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600"
+                    disabled={reviewHandoffView.buttonDisabled}
+                    focusableWhenDisabled={reviewHandoffView.kind === "blocked"}
+                    aria-disabled={
+                      reviewHandoffView.buttonDisabled || undefined
+                    }
+                    aria-describedby={
+                      reviewHandoffView.blockedReason
+                        ? "review-handoff-blocked-reason"
+                        : undefined
+                    }
+                    onClick={() => {
+                      if (reviewHandoffView.buttonDisabled) return;
+                      if (!reviewHandoffIsReady) {
+                        setReviewHandoffPopoverOpen(true);
+                        return;
+                      }
+
+                      void handleCompleteReview(trimmedOverallComment);
+                    }}
+                  >
+                    {ReviewHandoffButtonIcon ? (
+                      <ReviewHandoffButtonIcon
+                        className={cn(
+                          "size-4",
+                          reviewHandoffView.icon === "spinner" &&
+                            "animate-spin",
+                        )}
+                      />
+                    ) : null}
+                    {reviewHandoffView.buttonLabel}
+                  </Button>
+                  <PopoverTrigger
+                    render={
+                      <Button
+                        type="button"
+                        data-testid="review-handoff-comment-trigger"
+                        size="icon-lg"
+                        className="h-9 w-8 rounded-l-none rounded-r-[7px] border-0 bg-[#2B2420] text-white hover:bg-[#3a322b] focus-visible:ring-slate-300 disabled:opacity-100 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600"
+                        disabled={reviewHandoffView.triggerDisabled}
+                        aria-label="Overall comment options"
+                      >
+                        <ChevronDown className="size-4" />
+                      </Button>
+                    }
+                  />
+                  {reviewHandoffView.blockedReason ? (
+                    <span
+                      id="review-handoff-blocked-reason"
+                      data-testid="review-handoff-blocked-reason"
+                      className="sr-only"
+                    >
+                      {reviewHandoffView.blockedReason}
+                    </span>
+                  ) : null}
+                </TooltipTrigger>
+                {reviewHandoffTooltip ? (
+                  <TooltipContent
+                    side="bottom"
+                    data-testid="review-handoff-tooltip"
+                  >
+                    {reviewHandoffTooltip}
+                  </TooltipContent>
+                ) : null}
+              </Tooltip>
               <PopoverContent
-                className={reviewHandoffState === "idle" ? undefined : "pt-0"}
+                className={reviewHandoffIsReady ? undefined : "pt-0"}
                 aria-label={
-                  reviewHandoffState === "idle"
+                  reviewHandoffIsReady
                     ? "Review handoff comment"
                     : "Review handoff status"
                 }
                 data-testid={
-                  reviewHandoffState === "idle"
+                  reviewHandoffIsReady
                     ? "review-handoff-comment-popover"
                     : "review-handoff-status"
                 }
               >
-                {reviewHandoffState === "idle" ? (
+                {reviewHandoffIsReady ? (
                   <form
                     className="space-y-3"
                     onSubmit={(event) => {
                       event.preventDefault();
-                      void handleCompleteReview({
-                        overallComment: trimmedOverallComment,
-                      });
+                      void handleCompleteReview(trimmedOverallComment);
                     }}
                   >
                     <div>
@@ -833,6 +898,16 @@ export function DocumentWorkspace({
                         className="min-h-24 resize-none"
                       />
                     </div>
+                    <div className="space-y-1 text-xs leading-5 text-stone-500 dark:text-slate-400">
+                      <p data-testid="review-handoff-agent-status">
+                        {reviewHandoffView.agentStatusText}
+                      </p>
+                      {reviewHandoffView.sessionText ? (
+                        <p data-testid="review-handoff-session-label">
+                          {reviewHandoffView.sessionText}
+                        </p>
+                      ) : null}
+                    </div>
                     <Button
                       type="submit"
                       data-testid="review-handoff-submit-comment"
@@ -844,7 +919,7 @@ export function DocumentWorkspace({
                       Submit with comment
                     </Button>
                   </form>
-                ) : (
+                ) : reviewHandoffView.kind === "sent" ? (
                   <div>
                     <div className="mb-3 flex h-[170px] items-center justify-center overflow-hidden">
                       <RobotsHighFiveToy
@@ -855,60 +930,123 @@ export function DocumentWorkspace({
                         }
                       />
                     </div>
+                    <div className="text-xl font-semibold leading-6 text-stone-950 dark:text-slate-50">
+                      {reviewHandoffView.title}
+                    </div>
+                    <div className="mt-1">
+                      <p className="text-sm leading-[1.32rem] text-stone-500 dark:text-slate-400">
+                        Your agent is now working in the background on this, in
+                        all likelihood. If our signal didn't make it, just{" "}
+                        <button
+                          type="button"
+                          data-testid="review-handoff-copy-message"
+                          className="font-normal text-inherit underline decoration-stone-300 underline-offset-4 hover:decoration-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-950/25 dark:decoration-slate-600 dark:hover:decoration-slate-200 dark:focus-visible:ring-slate-50/30"
+                          onClick={() =>
+                            void writePlainTextToClipboard(
+                              reviewHandoffCopyMessage,
+                            )
+                          }
+                        >
+                          click here
+                        </button>{" "}
+                        to copy a line you can send it to keep going.
+                      </p>
+                      <Button
+                        type="button"
+                        data-testid="review-handoff-close-window"
+                        size="lg"
+                        variant="outline"
+                        className="mt-4 w-full rounded-[7px] text-sm font-semibold"
+                        onClick={() => window.close()}
+                      >
+                        Close window
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="pt-3">
                     <div className="flex items-start gap-3">
-                      {reviewHandoffState === "notifying" ||
-                      reviewHandoffState === "error" ||
-                      reviewHandoffState === "undelivered" ? (
-                        <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-black text-white dark:bg-white dark:text-black">
-                          {reviewHandoffState === "notifying" ? (
-                            <Loader2 className="size-4 animate-spin" />
-                          ) : (
-                            <AlertTriangle className="size-4" />
-                          )}
-                        </span>
-                      ) : null}
-                      <div>
-                        <div className="text-xl font-semibold leading-6 text-stone-950 dark:text-slate-50">
-                          {reviewHandoffStatusTitle}
-                        </div>
-                        {reviewHandoffStatusBody ? (
-                          <p className="mt-1 text-sm leading-6 text-stone-600 dark:text-slate-300">
-                            {reviewHandoffStatusBody}
-                          </p>
+                      <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-black text-white dark:bg-white dark:text-black">
+                        {reviewHandoffView.icon === "spinner" ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : reviewHandoffView.icon === "alert" ? (
+                          <AlertTriangle className="size-4" />
                         ) : (
-                          <div className="mt-1">
-                            <p className="text-sm leading-[1.32rem] text-stone-500 dark:text-slate-400">
-                              Your agent is now working in the background on
-                              this, in all likelihood. If our signal didn't make
-                              it, just{" "}
-                              <button
-                                type="button"
-                                data-testid="review-handoff-copy-message"
-                                className="font-normal text-inherit underline decoration-stone-300 underline-offset-4 hover:decoration-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-950/25 dark:decoration-slate-600 dark:hover:decoration-slate-200 dark:focus-visible:ring-slate-50/30"
-                                onClick={() =>
-                                  void writePlainTextToClipboard(
-                                    reviewHandoffCopyMessage,
-                                  )
-                                }
-                              >
-                                click here
-                              </button>{" "}
-                              to copy a line you can send it to keep going.
-                            </p>
-                            <Button
-                              type="button"
-                              data-testid="review-handoff-close-window"
-                              size="lg"
-                              variant="outline"
-                              className="mt-4 w-full rounded-[7px] text-sm font-semibold"
-                              onClick={() => window.close()}
-                            >
-                              Close window
-                            </Button>
-                          </div>
+                          <Check className="size-4" />
                         )}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="text-base font-semibold leading-6 text-stone-950 dark:text-slate-50">
+                          {reviewHandoffView.title}
+                        </div>
+                        {reviewHandoffView.body ? (
+                          <p className="mt-1 text-sm leading-6 text-stone-600 dark:text-slate-300">
+                            {reviewHandoffView.body}
+                          </p>
+                        ) : null}
+                        {reviewHandoffView.wakeLine ? (
+                          <p
+                            data-testid="review-handoff-wake-status"
+                            className="mt-1 text-xs leading-5 text-stone-500 dark:text-slate-400"
+                          >
+                            {reviewHandoffView.wakeLine}
+                          </p>
+                        ) : null}
                       </div>
                     </div>
+                    {reviewHandoffView.showCopyMessage ||
+                    reviewHandoffView.showRetry ? (
+                      <div className="mt-4 flex flex-col gap-2">
+                        {reviewHandoffView.showCopyMessage ? (
+                          <div
+                            data-testid="review-handoff-message-preview"
+                            className="rounded-[7px] border border-stone-200 px-2.5 py-2 text-xs leading-5 break-words text-stone-700 dark:border-slate-700 dark:text-slate-300"
+                          >
+                            {reviewHandoffCopyMessage}
+                          </div>
+                        ) : null}
+                        {reviewHandoffView.showRetry ? (
+                          <Button
+                            type="button"
+                            data-testid="review-handoff-retry"
+                            size="lg"
+                            className="w-full rounded-[7px] bg-black text-sm font-bold text-white hover:bg-black/85 focus-visible:ring-black/25 dark:bg-white dark:text-black dark:hover:bg-white/90"
+                            disabled={reviewHandoffView.retryDisabled}
+                            onClick={() =>
+                              void handleCompleteReview(trimmedOverallComment)
+                            }
+                          >
+                            <RefreshCcw className="size-4" />
+                            Retry
+                          </Button>
+                        ) : null}
+                        {reviewHandoffView.showCopyMessage ? (
+                          <Button
+                            type="button"
+                            data-testid="review-handoff-copy-message"
+                            size="lg"
+                            variant={
+                              reviewHandoffView.showRetry
+                                ? "outline"
+                                : "default"
+                            }
+                            className={cn(
+                              "w-full rounded-[7px] text-sm font-semibold",
+                              !reviewHandoffView.showRetry &&
+                                "bg-black text-white hover:bg-black/85 dark:bg-white dark:text-black dark:hover:bg-white/90",
+                            )}
+                            onClick={() =>
+                              void handleCopyHandoffMessage(
+                                reviewHandoffCopyMessage,
+                              )
+                            }
+                          >
+                            <Copy className="size-4" />
+                            {copiedHandoffMessage ? "Copied" : "Copy message"}
+                          </Button>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                 )}
               </PopoverContent>

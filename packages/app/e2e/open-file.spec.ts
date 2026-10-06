@@ -102,12 +102,41 @@ test.describe("opening local markdown files", () => {
     });
 
     expect(response.ok()).toBe(true);
-    await expect(response.json()).resolves.toEqual({ delivered: true });
+    // The batch 1 server adds `acknowledged` and `tabs`; only `delivered` is
+    // common to both servers.
+    await expect(response.json()).resolves.toMatchObject({ delivered: true });
     await expect(codeEditor(page)).toContainText("Existing window body.");
 
     logE2eEvent("open-file.reused-existing-window", {
       projectDir,
       file: "repeat.md",
+    });
+  });
+
+  test("the open tab acknowledges an open request so no second window opens @batch1-server", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "ack.md",
+      "# Ack Open\n\nExisting window body.\n",
+    );
+
+    await openMarkdownFile(page, filePath, "code");
+    await expect(codeEditor(page)).toContainText("Existing window body.");
+
+    const targetUrl = `/?${new URLSearchParams({
+      path: filePath,
+      editor: "code",
+    }).toString()}`;
+    const response = await page.request.post("/api/open-request", {
+      data: { path: filePath, url: targetUrl },
+    });
+
+    expect(response.ok()).toBe(true);
+    await expect(response.json()).resolves.toMatchObject({
+      delivered: true,
+      acknowledged: true,
     });
   });
 });

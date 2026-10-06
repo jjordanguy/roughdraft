@@ -2,13 +2,52 @@ import {
   type BackendInfo,
   type CompleteReviewOptions,
   type CompleteReviewResult,
+  type HandoffRecord,
+  type HandoffWake,
   type MarkdownFileChangeEvent,
   MarkdownFileConflictError,
   type Page,
   type ReviewWatchStatus,
+  type SessionRecord,
   type StorageBackend,
   type StoredAsset,
 } from "./storage";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseHandoffWake(value: unknown): HandoffWake | null {
+  if (!isRecord(value)) return null;
+  if (
+    value.state !== "none" &&
+    value.state !== "sent" &&
+    value.state !== "failed"
+  ) {
+    return null;
+  }
+  return {
+    routeId: typeof value.routeId === "string" ? value.routeId : null,
+    state: value.state,
+    at: typeof value.at === "string" ? value.at : null,
+    error: typeof value.error === "string" ? value.error : null,
+  };
+}
+
+// The server is the source of truth for these records; the app only checks
+// the fields it reads so a malformed answer degrades to "no record".
+function parseHandoffRecord(value: unknown): HandoffRecord | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.handoffId !== "string" || typeof value.state !== "string") {
+    return null;
+  }
+  return value as unknown as HandoffRecord;
+}
+
+function parseSessionRecord(value: unknown): SessionRecord | null {
+  if (!isRecord(value) || typeof value.label !== "string") return null;
+  return value as unknown as SessionRecord;
+}
 
 export class ApiBackend implements StorageBackend {
   info: BackendInfo;
@@ -125,6 +164,7 @@ export class ApiBackend implements StorageBackend {
           projectPath: this.info.projectPath,
           path: relativePath,
           ...(overallComment ? { overallComment } : {}),
+          ...(options.handoffId ? { handoffId: options.handoffId } : {}),
         }),
       },
     );
@@ -135,8 +175,14 @@ export class ApiBackend implements StorageBackend {
       );
     }
 
-    const payload = (await res.json()) as { delivered?: unknown };
-    return { delivered: payload.delivered === true };
+    const payload = (await res.json()) as Record<string, unknown>;
+    const handoff = parseHandoffRecord(payload.handoff);
+    return {
+      delivered: payload.delivered === true,
+      pending: payload.pending === true,
+      handoff,
+      wake: parseHandoffWake(payload.wake) ?? handoff?.wake ?? null,
+    };
   }
 
   async getReviewWatchStatus(relativePath: string): Promise<ReviewWatchStatus> {
@@ -150,14 +196,14 @@ export class ApiBackend implements StorageBackend {
       );
     }
 
-    const payload = (await res.json()) as {
-      watching?: unknown;
-      watcherCount?: unknown;
-    };
+    const payload = (await res.json()) as Record<string, unknown>;
     return {
       watching: payload.watching === true,
       watcherCount:
         typeof payload.watcherCount === "number" ? payload.watcherCount : 0,
+      tabs: typeof payload.tabs === "number" ? payload.tabs : undefined,
+      handoff: parseHandoffRecord(payload.handoff),
+      session: parseSessionRecord(payload.session),
     };
   }
 

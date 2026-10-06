@@ -123,14 +123,16 @@ suggestions:
 | Document | Disk changed | Open local file, modify file externally while browser content is clean | `file-conflict-notice`, `file-conflict-action-reload`, `file-conflict-action-overwrite` | Banner title: `File changed on disk`. |
 | Document | Save conflict | Edit in browser, then modify file externally before autosave resolves | `file-conflict-notice`, `file-conflict-action-keep-editing` | Banner title: `Save conflict`; autosave pauses. |
 | Document | Autosave paused | Keep editing after conflict | `file-conflict-notice`, `file-conflict-action-overwrite` | Banner title: `Autosave paused`; no keep-editing action. |
-| Document | Review handoff idle | Open a local file while a watcher is connected | `review-handoff-button` | Header text: `Agent watching`. |
-| Document | Review handoff comment popover | Open a local file while a watcher is connected, then click the handoff dropdown trigger | `review-handoff-comment-trigger`, `review-handoff-comment-popover`, `review-handoff-overall-comment` | Capture the split handoff control and textarea with `Overall comment` placeholder before submission. |
-| Document | Review handoff sending | Click handoff button while watcher is connected | `review-handoff-button` | Button label: `Sending`. |
-| Document | Review handoff sent | Successful handoff | `review-handoff-status`, `review-handoff-robots-toy`, `review-handoff-close-window`, `review-handoff-copy-message` | Capture the random completion title, robot toy, primary close button, and fallback copy hint below it. |
-| Document | Review handoff undelivered | Watcher disconnects before handoff | `review-handoff-status` | Popover title: `No agent is watching now`. |
-| Document | Review handoff error | Force handoff API error | `review-handoff-status` | Popover title: `Could not notify agent`. |
-| Remote | Connected banner | Open with `?session=<id>&token=<token>` and remote capability enabled | `role=status`, `aria-label="Remote session connected"` | Requires remote backend support in `/api/status`. |
-| Remote | Disconnected banner | Drop remote session connection | `role=alert`, `aria-label="Remote session disconnected"` | Best captured with backend mocking. |
+| Document | Review handoff ready, agent listening | Open a local file while a watcher is connected | `review-handoff-split-button` (`data-watcher-state="listening"`, `data-handoff-state="ready-listening"`), `review-handoff-button`, `review-handoff-tooltip` | Label `Approve`, or `I'm done` after an edit. Hover tooltip: `Your agent is waiting`. There is no header text for this state. |
+| Document | Review handoff ready, no agent | Open a local file with no watcher | `review-handoff-split-button` (`data-watcher-state="none"`, `data-handoff-state="ready-no-agent"`), `review-handoff-button` | The button shows whenever a local file is loaded. Tooltip: `No agent is listening. Roughdraft keeps your Done until it checks in.` |
+| Document | Review handoff comment popover | From either ready state, click the handoff dropdown trigger | `review-handoff-comment-trigger`, `review-handoff-comment-popover`, `review-handoff-overall-comment`, `review-handoff-agent-status`, `review-handoff-session-label`, `review-handoff-submit-comment` | Capture the textarea with `Overall comment` placeholder, the agent status line, and `Opened by <label>` when the agent registered a session. Trigger accessible name: `Overall comment options`. |
+| Document | Review handoff blocked | Open a local file, then cause a save conflict, a disk change, paused autosave, or a save error | `review-handoff-button`, `review-handoff-blocked-reason`, `review-handoff-tooltip` | Dimmed and disabled. The tooltip and the screen reader text name the reason, for example `Save conflict. Resolve it before you finish.` |
+| Document | Review handoff sending | Submit from the comment popover with a slow server | `review-handoff-button`, `review-handoff-status` | Button label `Sending` with a spinner; popover reads `Sending your review` with no robots. Transient; easiest with a delayed route. |
+| Document | Review handoff sent | Done while a watcher is connected | `review-handoff-status`, `review-handoff-robots-toy`, `review-handoff-close-window`, `review-handoff-copy-message` | Button `Sent`. Capture the random completion title, robot toy, primary close button, and fallback copy hint below it. |
+| Document | Review handoff saved for agent | Done with no watcher (batch 1 server) | `review-handoff-status`, `review-handoff-wake-status`, `review-handoff-message-preview`, `review-handoff-copy-message` | Button `Done, waiting`. Title `Saved for your agent`. Wake line is one of `No wake route registered`, `Waking <session>`, `Sent to <session>`, `Wake failed: <error>`. Copy button reads `Copy message`, then `Copied`. |
+| Document | Review handoff picked up | After a saved or sent Done, acknowledge it (`roughdraft pending --ack` or `POST /api/review-events/ack`) | `review-handoff-button`, `review-handoff-status` | Button `Picked up`; popover `Your agent picked this up at <time>.` Appears within one status poll (1.5 s). |
+| Document | Review handoff not received | Done against a server without the handoff log (pre-batch-1) | `review-handoff-status`, `review-handoff-copy-message` | Button `Not sent`; title `No agent received this`. Only reachable with an older server. |
+| Document | Review handoff error | Force a handoff API error (route the POST to a 500) | `review-handoff-status`, `review-handoff-retry`, `review-handoff-copy-message`, `review-handoff-message-preview` | Button `Not sent`. Title `Done not recorded`; body `Roughdraft could not record your Done. Your saved edits are on disk.` Retry reuses the same handoff id. |
 | Editor | Selection menu | Select text in rich editor | `selection-menu` | Capture formatting buttons and comment/suggestion actions. |
 | Editor | Selection menu on suggestion | Select existing suggestion text | `selection-menu-action-accept-suggestion`, `selection-menu-action-reject-suggestion` | Requires review fixture. |
 | Editor | Link popover | Click a link or choose Link from selection menu | `link-popover`, `link-url-input`, `link-action-open`, `link-action-delete` | Use the plain fixture link. |
@@ -174,14 +176,12 @@ These are real product states, but they are awkward to capture deterministically
   
 - Disk conflict and autosave paused
   
-- Review handoff undelivered/error
-  
-- Remote connected/disconnected banners
+- Review handoff sending, blocked, picked up, not received, and error
   
 - Update notice
   
 
-The most reliable long-term solution is a dedicated screenshot harness route or Playwright component harness that renders `DocumentWorkspace` with controlled backend, disk, remote, watcher, and save states. Keep the production-route screenshots for broad layout coverage and use the harness for rare operational states.
+The most reliable long-term solution is a dedicated screenshot harness route or Playwright component harness that renders `DocumentWorkspace` with controlled backend, disk, watcher, handoff, and save states. Keep the production-route screenshots for broad layout coverage and use the harness for rare operational states.
 ## Maintenance Checklist
 - Add a row when a new route, dialog, popover, banner, editor mode, or empty/error state ships.
   

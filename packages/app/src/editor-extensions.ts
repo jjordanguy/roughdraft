@@ -47,6 +47,12 @@ export interface CriticChangeAttrs {
   authorType?: "user" | "ai";
   authorId?: string | null;
   createdAt: string;
+  /**
+   * A later part of a suggestion over several blocks: the part's own id in
+   * the file (`{--...--}{#s3}` with `continues: s2`). The mark's `changeId`
+   * is the first part's id, so the editor treats the parts as one suggestion.
+   */
+  partId?: string | null;
 }
 
 export const SUGGESTED_PARAGRAPH_SENTINEL = "\u2060";
@@ -118,8 +124,10 @@ const CommentRef = Mark.create({
           }
         },
         renderHTML: (attributes) =>
-          attributes.commentIds?.length
-            ? { "data-comment-ids": JSON.stringify(attributes.commentIds) }
+          attributes.commentIds?.length || attributes.sourceTail
+            ? {
+                "data-comment-ids": JSON.stringify(attributes.commentIds ?? []),
+              }
             : {},
       },
       // Ids this anchor carried as a bare `{#id}` ref in the file (a
@@ -132,6 +140,16 @@ const CommentRef = Mark.create({
         renderHTML: (attributes) =>
           attributes.refOnlyIds?.length
             ? { "data-comment-ref-only": JSON.stringify(attributes.refOnlyIds) }
+            : {},
+      },
+      // The review markup this anchor carried in an older-format file, so a
+      // save writes it back byte for byte while its threads are unchanged.
+      sourceTail: {
+        default: null,
+        parseHTML: (element) => element.getAttribute("data-comment-source"),
+        renderHTML: (attributes) =>
+          attributes.sourceTail
+            ? { "data-comment-source": attributes.sourceTail }
             : {},
       },
     };
@@ -196,6 +214,7 @@ const CommentRef = Mark.create({
                 from,
                 to,
                 markType.create({
+                  ...mark.attrs,
                   commentIds: nextIds,
                   refOnlyIds: nextRefOnlyIds,
                 }),
@@ -244,6 +263,7 @@ function readCriticChangeAttrs(element: HTMLElement): CriticChangeAttrs | null {
     authorType,
     authorId: authorType === "ai" ? null : rawBy,
     createdAt,
+    partId: element.getAttribute("data-critic-change-part") || null,
   };
 }
 
@@ -379,6 +399,15 @@ const CriticChange = Mark.create({
         renderHTML: (attributes) =>
           attributes.createdAt
             ? { "data-critic-change-at": attributes.createdAt }
+            : {},
+      },
+      partId: {
+        default: null,
+        parseHTML: (element) =>
+          readCriticChangeAttrs(element as HTMLElement)?.partId ?? null,
+        renderHTML: (attributes) =>
+          attributes.partId
+            ? { "data-critic-change-part": attributes.partId }
             : {},
       },
     };

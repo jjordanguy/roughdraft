@@ -1,9 +1,12 @@
 import type { JSONContent } from "@tiptap/core";
-import type { Mark as ProseMirrorMark } from "@tiptap/pm/model";
+import type {
+  Mark as ProseMirrorMark,
+  Node as ProseMirrorNode,
+} from "@tiptap/pm/model";
 import { TextSelection } from "@tiptap/pm/state";
 import type { Editor } from "@tiptap/react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
-import { AlertTriangle, RefreshCcw } from "lucide-react";
+import { AlertTriangle, Info, RefreshCcw } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -27,7 +30,10 @@ import {
   editorStateToCriticMarkdown,
   getCommentDescendantIds,
   getReviewBlockError,
+  getReviewFormat,
   getThreadComments,
+  REVIEW_FORMAT_NOTICE,
+  type ReviewFormat,
 } from "./critic-markup";
 import {
   type CommentThreadHandlers,
@@ -47,6 +53,7 @@ import {
   commentHighlightPluginKey,
   createEditorExtensions,
   criticChangeHighlightPluginKey,
+  parseCodeCommentAnchors,
   SUGGESTED_PARAGRAPH_SENTINEL,
 } from "./editor-extensions";
 import { cn } from "./lib/utils";
@@ -364,6 +371,7 @@ function addCommentIdToSelection(editor: Editor, commentId: string) {
       start,
       end,
       markType.create({
+        ...mark?.attrs,
         commentIds: [...new Set([...commentIds, commentId])],
         refOnlyIds,
       }),
@@ -374,10 +382,17 @@ function addCommentIdToSelection(editor: Editor, commentId: string) {
   editor.commands.focus();
 }
 
+// Ids the loaded file uses (entries the editor does not show included),
+// per editor, so new suggestion ids never reuse one.
+const reservedIdsByEditor = new WeakMap<Editor, readonly string[]>();
+
 function getDocumentCriticChanges(
   editor: Editor,
 ): Array<Pick<CriticChangeAttrs, "changeId">> {
   const changes = new Map<string, Pick<CriticChangeAttrs, "changeId">>();
+  for (const id of reservedIdsByEditor.get(editor) ?? []) {
+    changes.set(id, { changeId: id });
+  }
 
   editor.state.doc.descendants((node) => {
     if (!node.isText) return;
@@ -387,6 +402,10 @@ function getDocumentCriticChanges(
       if (typeof mark.attrs.changeId !== "string") continue;
 
       changes.set(mark.attrs.changeId, { changeId: mark.attrs.changeId });
+      // A later part of a suggestion over several blocks has its own id.
+      if (typeof mark.attrs.partId === "string" && mark.attrs.partId) {
+        changes.set(mark.attrs.partId, { changeId: mark.attrs.partId });
+      }
     }
   });
 
@@ -576,55 +595,111 @@ function getCriticChangeRange(editor: Editor | null, changeId: string) {
   return { from, to };
 }
 
-function addCommentIdsToCriticChange(
-  editor: Editor | null,
-  changeId: string,
-  commentIdsToAdd: string[],
-) {
-  if (!editor) return false;
+// The first fenced code block a selection reaches into: its position and the
+// selected lines (1-based, inclusive, counted inside the block) with their
+// text. Code takes no marks; a comment on code is a ref on the fence line
+// plus `lines` and `quote` in the comment's entry.
+function findCodeBlockSelection(editor: Editor): {
+  pos: number;
+  lines: [number, number];
+  quote: string;
+} | null {
+  const { from, to } = editor.state.selection;
+  let found: { pos: number; lines: [number, number]; quote: string } | null =
+    null;
 
-  const commentMarkType = editor.state.schema.marks.commentRef;
-  if (!commentMarkType) return false;
+  editor.state.doc.nodesBetween(from, to, (node, pos) => {
+    if (found) return false;
+    if (node.type.name !== "codeBlock") return undefined;
 
-  let found = false;
-  const tr = editor.state.tr;
+    const start = pos + 1;
+    const end = start + node.content.size;
+    const selectedFrom = Math.max(from, start) - start;
+    const selectedTo = Math.min(to, end) - start;
+    if (selectedTo <= selectedFrom) return false;
 
-  editor.state.doc.descendants((node, pos) => {
-    if (!node.isText) return;
-
-    const hasChange = node.marks.some(
-      (mark) =>
-        mark.type.name === "criticChange" && mark.attrs.changeId === changeId,
+    const text = node.textContent;
+    const lineOf = (offset: number) => text.slice(0, offset).split("\n").length;
+    const first = lineOf(selectedFrom);
+    const last = Math.max(
+      first,
+      lineOf(Math.max(selectedFrom, selectedTo - 1)),
     );
-    if (!hasChange) return;
-
-    found = true;
-    const existingMark = node.marks.find(
-      (mark) => mark.type === commentMarkType,
-    );
-    const existingCommentIds = Array.isArray(existingMark?.attrs.commentIds)
-      ? existingMark.attrs.commentIds
-      : [];
-    const nextCommentIds = [
-      ...new Set([...existingCommentIds, ...commentIdsToAdd]),
-    ];
-    const from = pos;
-    const to = pos + node.nodeSize;
-
-    if (existingMark) {
-      tr.removeMark(from, to, commentMarkType);
-    }
-    tr.addMark(
-      from,
-      to,
-      commentMarkType.create({ commentIds: nextCommentIds }),
-    );
+    found = {
+      pos,
+      lines: [first, last],
+      quote: text
+        .split("\n")
+        .slice(first - 1, last)
+        .join("\n"),
+    };
+    return false;
   });
 
-  if (!found) return false;
+  return found;
+}
 
-  editor.view.dispatch(tr);
+function codeBlockAnchorsOf(node: ProseMirrorNode) {
+  return parseCodeCommentAnchors(
+    typeof node.attrs.codeAnchors === "string" ? node.attrs.codeAnchors : null,
+  );
+}
+
+// Puts a comment's ref on a code block's fence line (```ts {#c3}) and
+// highlights its lines.
+function addCodeCommentAnchor(
+  editor: Editor,
+  pos: number,
+  commentId: string,
+  lines: [number, number],
+) {
+  const node = editor.state.doc.nodeAt(pos);
+  if (!node || node.type.name !== "codeBlock") return false;
+
+  const base =
+    (typeof node.attrs.info === "string" && node.attrs.info) ||
+    (typeof node.attrs.language === "string" && node.attrs.language) ||
+    "";
+  const anchors = codeBlockAnchorsOf(node).filter(
+    (anchor) => anchor.id !== commentId,
+  );
+  editor.view.dispatch(
+    editor.state.tr.setNodeMarkup(pos, undefined, {
+      ...node.attrs,
+      info: `${base} {#${commentId}}`,
+      codeAnchors: JSON.stringify([...anchors, { id: commentId, lines }]),
+    }),
+  );
   return true;
+}
+
+// Takes a deleted comment's ref off every fence line that carried it.
+function removeCodeCommentAnchors(editor: Editor, commentIds: string[]) {
+  const ids = new Set(commentIds);
+  const tr = editor.state.tr;
+  let changed = false;
+
+  editor.state.doc.descendants((node, pos) => {
+    if (node.type.name !== "codeBlock") return undefined;
+    const anchors = codeBlockAnchorsOf(node);
+    if (!anchors.some((anchor) => ids.has(anchor.id))) return false;
+
+    let info = typeof node.attrs.info === "string" ? node.attrs.info : "";
+    for (const id of ids) {
+      info = info.replace(new RegExp(`[ \\t]*\\{#${id}\\}`), "");
+    }
+    const remaining = anchors.filter((anchor) => !ids.has(anchor.id));
+    tr.setNodeMarkup(pos, undefined, {
+      ...node.attrs,
+      info: info || null,
+      codeAnchors: remaining.length > 0 ? JSON.stringify(remaining) : null,
+    });
+    changed = true;
+    return false;
+  });
+
+  if (changed) editor.view.dispatch(tr);
+  return changed;
 }
 
 function documentSourceOf(
@@ -637,7 +712,24 @@ function documentSourceOf(
     looseHeadings: parsed.looseHeadings,
     legacyListSpacing: parsed.legacyListSpacing,
     reviewError: parsed.reviewError,
+    // Which writer the file gets (D11), fixed for this load.
+    reviewFormat: parsed.reviewFormat,
+    // Every id the file uses: new comments and suggestions avoid them.
+    reservedIds: parsed.reservedIds,
   };
+}
+
+// New ids are allocated over the union of every id in the file (anchors,
+// entries the editor does not show, suggestions) and every comment made
+// since, so an orphan entry's id is never reused.
+function reviewIdsInUse(
+  comments: ReadonlyMap<string, CriticComment>,
+  reservedIds: readonly string[],
+): Array<Pick<CriticComment, "id">> {
+  return [
+    ...comments.keys(),
+    ...reservedIds.filter((id) => !comments.has(id)),
+  ].map((id) => ({ id }));
 }
 
 // Comments the rail can show (markup the editor keeps literal does not count).
@@ -695,6 +787,8 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     string | null
   >(null);
   const [newCommentDraftIds, setNewCommentDraftIds] = useState<string[]>([]);
+  // A comment on code was asked for on an older-format file.
+  const [codeCommentRefused, setCodeCommentRefused] = useState(false);
 
   const resolveFileUrl = useCallback(
     (path: string) => backend.resolveFileUrl(path),
@@ -1356,6 +1450,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     if (!editor) return;
 
     sourceRef.current = documentSourceOf(parsedContent);
+    reservedIdsByEditor.set(editor, parsedContent.reservedIds);
     commentsRef.current = parsedContent.comments;
     setComments(parsedContent.comments);
     setSelectedCommentId(null);
@@ -1423,6 +1518,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       }
 
       sourceRef.current = documentSourceOf(parsed);
+      reservedIdsByEditor.set(currentEditor, parsed.reservedIds);
       commentsRef.current = parsed.comments;
       setComments(parsed.comments);
 
@@ -1634,9 +1730,30 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     const currentEditor = editorRef.current;
     if (!currentEditor || currentEditor.state.selection.empty) return;
 
-    const comment = createCriticComment(undefined, {
-      existingComments: commentsRef.current.values(),
-    });
+    // A selection reaching into a code block anchors the comment on the
+    // block's fence line with the selected lines (canonical files only: an
+    // older-format file has no shape for it, so the code part is skipped).
+    const codeSelection = findCodeBlockSelection(currentEditor);
+    const canAnchorCode =
+      codeSelection !== null && sourceRef.current.reviewFormat === "canonical";
+    setCodeCommentRefused(
+      codeSelection !== null && sourceRef.current.reviewFormat === "legacy",
+    );
+
+    const comment = createCriticComment(
+      canAnchorCode
+        ? {
+            codeLines: codeSelection.lines,
+            quote: codeSelection.quote,
+          }
+        : undefined,
+      {
+        existingComments: reviewIdsInUse(
+          commentsRef.current,
+          sourceRef.current.reservedIds,
+        ),
+      },
+    );
     const nextComments = new Map(commentsRef.current);
     nextComments.set(comment.id, comment);
     commentsRef.current = nextComments;
@@ -1649,12 +1766,21 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     // Keep the ids each piece of the selection already carries and add the
     // new one (a selection over two comments keeps both).
     addCommentIdToSelection(currentEditor, comment.id);
+    if (canAnchorCode) {
+      addCodeCommentAnchor(
+        currentEditor,
+        codeSelection.pos,
+        comment.id,
+        codeSelection.lines,
+      );
+    }
     if (suppressNextMarkdownUpdateRef.current) {
       suppressNextMarkdownUpdateRef.current = false;
     }
 
-    // Nothing in the selection could take a comment (code takes no marks).
-    if (!documentHasCommentMark(currentEditor, comment.id)) {
+    const hasProseAnchor = documentHasCommentMark(currentEditor, comment.id);
+    // Nothing in the selection could take a comment.
+    if (!hasProseAnchor && !canAnchorCode) {
       const withoutDraft = new Map(commentsRef.current);
       withoutDraft.delete(comment.id);
       commentsRef.current = withoutDraft;
@@ -1663,6 +1789,12 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         current.filter((commentId) => commentId !== comment.id),
       );
       return;
+    }
+    if (canAnchorCode && !hasProseAnchor) {
+      const codeOnly = new Map(commentsRef.current);
+      codeOnly.set(comment.id, { ...comment, scope: "code" });
+      commentsRef.current = codeOnly;
+      setComments(codeOnly);
     }
 
     setSelectedCommentId(comment.id);
@@ -1821,7 +1953,10 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
           parentCommentId: commentId,
         },
         {
-          existingComments: commentsRef.current.values(),
+          existingComments: reviewIdsInUse(
+            commentsRef.current,
+            sourceRef.current.reservedIds,
+          ),
         },
       );
 
@@ -1921,26 +2056,21 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       const currentEditor = editorRef.current;
       if (!currentEditor) return;
 
+      if (!getCriticChangeRange(currentEditor, changeId)) return;
+
+      // A reply lives in the comment map and the review block, never on the
+      // suggestion's marks.
       const comment = createCriticComment(
         {
           parentCommentId: changeId,
         },
         {
-          existingComments: commentsRef.current.values(),
+          existingComments: reviewIdsInUse(
+            commentsRef.current,
+            sourceRef.current.reservedIds,
+          ),
         },
       );
-      suppressNextMarkdownUpdateRef.current = true;
-      const didAddCommentId = addCommentIdsToCriticChange(
-        currentEditor,
-        changeId,
-        [comment.id],
-      );
-      if (suppressNextMarkdownUpdateRef.current) {
-        suppressNextMarkdownUpdateRef.current = false;
-      }
-      if (!didAddCommentId) {
-        return;
-      }
 
       const nextComments = new Map(commentsRef.current);
       nextComments.set(comment.id, comment);
@@ -1981,6 +2111,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         chain.removeCommentId(id);
       }
       chain.run();
+      removeCodeCommentAnchors(currentEditor, commentIdsToDelete);
       setSelectedCommentId((current) =>
         current && deletedIds.has(current) ? null : current,
       );
@@ -2140,6 +2271,16 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       >
         <div className={documentMainClass}>
           {notice}
+          {codeCommentRefused ? (
+            <div
+              data-testid="review-format-code-comment-message"
+              role="alert"
+              className="mb-4 rounded-[8px] border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm leading-5 text-amber-950 sm:px-4 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
+            >
+              Comments on code need the current review format. Run roughdraft
+              doctor --fix to convert this file.
+            </div>
+          ) : null}
           {hasFallbackThreads ? (
             <div className={fallbackClass}>
               <GlobalCommentsSection
@@ -2688,11 +2829,19 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     }
     acceptMarkdown(page.content);
   }, [acceptMarkdown, page.content, sync]);
+  // D11: an older-format file is never converted on save; the notice names
+  // the command that converts it.
+  const reviewFormat = useMemo<ReviewFormat>(
+    () => getReviewFormat(markdown),
+    [markdown],
+  );
   const reviewBlockNotice = reviewBlockError ? (
     <ReviewBlockErrorNotice
       message={reviewBlockError}
       onReload={reloadAfterReviewBlockError}
     />
+  ) : reviewFormat === "legacy" ? (
+    <ReviewFormatNotice />
   ) : null;
 
   useEffect(() => {
@@ -2742,6 +2891,24 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
     />
   );
 });
+
+// One line on a file in an older review format (D11). Saving keeps its
+// review markup as it is; the command converts it.
+function ReviewFormatNotice() {
+  return (
+    <div
+      data-testid="review-format-notice"
+      role="status"
+      className="mb-4 flex w-full items-start gap-2.5 rounded-[8px] border border-amber-200 bg-amber-50 px-3 py-2.5 text-amber-950 sm:px-4 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
+    >
+      <Info
+        className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400"
+        aria-hidden="true"
+      />
+      <div className="min-w-0 text-sm leading-5">{REVIEW_FORMAT_NOTICE}</div>
+    </div>
+  );
+}
 
 // Blocking: the editor shows the text above the review block read-only, the
 // block itself stays out of the editor, and nothing is saved until the block

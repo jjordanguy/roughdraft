@@ -20,6 +20,8 @@ import {
   buildCommentThreads,
   type CriticComment,
   type CriticCommentThread,
+  describeReviewDelimiter,
+  findReviewDelimiter,
 } from "./critic-markup";
 import { cn } from "./lib/utils";
 
@@ -112,6 +114,8 @@ export function CommentEditorList({
 }: CommentEditorListProps) {
   const textareaRefs = useRef(new Map<string, HTMLTextAreaElement>());
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // Why a draft could not be saved (a review-markup close delimiter).
+  const [draftErrors, setDraftErrors] = useState<Record<string, string>>({});
   const [editingCommentIds, setEditingCommentIds] = useState<string[]>([]);
   const threads = useMemo(() => buildCommentThreads(comments), [comments]);
   const commentMap = useMemo(
@@ -226,6 +230,17 @@ export function CommentEditorList({
       return;
     }
 
+    // Line breaks are kept (stored as `<br>`); a close delimiter such as
+    // `<<}` would end review markup early, so the comment is refused.
+    const delimiter = findReviewDelimiter(nextContent);
+    if (delimiter) {
+      setDraftErrors((current) => ({
+        ...current,
+        [commentId]: describeReviewDelimiter(delimiter),
+      }));
+      return;
+    }
+
     if (nextContent !== comment.content) {
       onUpdateComment(commentId, nextContent);
     }
@@ -235,7 +250,17 @@ export function CommentEditorList({
       delete nextDrafts[commentId];
       return nextDrafts;
     });
+    clearDraftError(commentId);
     stopEditingComment(commentId);
+  };
+
+  const clearDraftError = (commentId: string) => {
+    setDraftErrors((current) => {
+      if (!(commentId in current)) return current;
+      const nextErrors = { ...current };
+      delete nextErrors[commentId];
+      return nextErrors;
+    });
   };
 
   const cancelEditingComment = (commentId: string) => {
@@ -247,6 +272,7 @@ export function CommentEditorList({
       delete nextDrafts[commentId];
       return nextDrafts;
     });
+    clearDraftError(commentId);
 
     if (comment.content.trim().length === 0) {
       onDeleteComment(commentId);
@@ -284,6 +310,7 @@ export function CommentEditorList({
           variant={variant}
           interactive={interactive}
           drafts={drafts}
+          draftErrors={draftErrors}
           newCommentDraftIds={newCommentDraftIds}
           editingCommentIds={editingCommentIds}
           pendingFocusCommentId={pendingFocusCommentId}
@@ -306,6 +333,7 @@ export function CommentEditorList({
               ...current,
               [commentId]: nextContent,
             }));
+            if (!findReviewDelimiter(nextContent)) clearDraftError(commentId);
           }}
         />
       ))}
@@ -322,6 +350,7 @@ interface CommentThreadNodeProps {
   variant: "banner" | "rail";
   interactive: boolean;
   drafts: Record<string, string>;
+  draftErrors: Record<string, string>;
   newCommentDraftIds: string[];
   editingCommentIds: string[];
   pendingFocusCommentId: string | null;
@@ -416,6 +445,7 @@ function CommentThreadNode({
   variant,
   interactive,
   drafts,
+  draftErrors,
   newCommentDraftIds,
   editingCommentIds,
   pendingFocusCommentId,
@@ -753,6 +783,15 @@ function CommentThreadNode({
                   }}
                 />
               ) : null}
+              {isEditing && draftErrors[comment.id] ? (
+                <div
+                  data-testid={`comment-${variant}-${comment.id}-error`}
+                  role="alert"
+                  className="mt-1.5 text-xs leading-5 text-rose-700 dark:text-rose-400"
+                >
+                  {draftErrors[comment.id]}
+                </div>
+              ) : null}
               <div className="mt-2 flex flex-wrap items-center gap-1">
                 {actions.map((action) => (
                   <CommentActionButton
@@ -784,6 +823,7 @@ function CommentThreadNode({
               variant={variant}
               interactive={interactive}
               drafts={drafts}
+              draftErrors={draftErrors}
               newCommentDraftIds={newCommentDraftIds}
               editingCommentIds={editingCommentIds}
               pendingFocusCommentId={pendingFocusCommentId}

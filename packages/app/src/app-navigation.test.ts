@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  PREVIEW_PATH,
-  ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   buildLocationForLinkedMarkdownDocument,
   getRequestedPathState,
+  PREVIEW_PATH,
+  ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   syncRequestedPathInUrl,
 } from "./app-navigation";
 

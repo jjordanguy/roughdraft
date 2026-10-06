@@ -46,7 +46,6 @@ import {
   DialogTrigger,
 } from "./components/ui/dialog";
 import { DocumentWorkspace, getSyncStatus } from "./DocumentWorkspace";
-import { DocumentSync } from "./document-sync";
 import { detectBackend } from "./detect-backend";
 import {
   getCommentAnchorMeasurements,
@@ -54,8 +53,8 @@ import {
   normalizeCommentMeasurement,
   resolveAnchoredRailLayouts,
 } from "./document-comments";
+import { DocumentSync } from "./document-sync";
 import { cn } from "./lib/utils";
-import type { DocumentSaveState } from "./PageCard";
 import {
   acknowledgeOpenRequest,
   buildOpenRequestsUrl,
@@ -63,6 +62,7 @@ import {
   handleOpenRequestEvent,
   readSessionStorage,
 } from "./open-requests";
+import type { DocumentSaveState } from "./PageCard";
 import { PreviewBackend } from "./preview-backend";
 import { RoughdraftFormatDemo } from "./RoughdraftFormatDemo";
 import type { DiskChangeState } from "./review-handoff";

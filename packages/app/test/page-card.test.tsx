@@ -947,7 +947,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-suggesting-1",
       expect.stringMatching(
-        /^Start \{\+\+now\+\+\}\{id="s1" by="user" at="[^"]+"\}\n$/,
+        /^Start \{\+\+now\+\+\}\{#s1\}\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -982,7 +982,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-suggesting-grouped-insertion-1",
       expect.stringMatching(
-        /^Start-\{\+\+now\+\+\}\{id="s1" by="user" at="[^"]+"\}\n$/,
+        /^Start-\{\+\+now\+\+\}\{#s1\}\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -1017,7 +1017,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-suggesting-2",
       expect.stringMatching(
-        /^Use \{~~old~>new~~\}\{id="s1" by="user" at="[^"]+"\} text\n$/,
+        /^Use \{~~old~>new~~\}\{#s1\} text\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -1046,7 +1046,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-suggesting-grouped-replacement-1",
       expect.stringMatching(
-        /^Use \{~~old~>new~~\}\{id="s1" by="user" at="[^"]+"\} text\n$/,
+        /^Use \{~~old~>new~~\}\{#s1\} text\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -1084,7 +1084,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-suggesting-repeated-delete-1",
       expect.stringMatching(
-        /^S\{--tar--\}\{id="s1" by="user" at="[^"]+"\}t\n$/,
+        /^S\{--tar--\}\{#s1\}t\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -1122,7 +1122,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-suggesting-enter-paragraph-1",
       expect.stringMatching(
-        /^Start\n\n\{\+\+\u2060\+\+\}\{id="s1" by="user" at="[^"]+"\}\n$/,
+        /^Start\n\n\{\+\+\u2060\+\+\}\{#s1\}\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -1439,7 +1439,7 @@ describe("PageCard editor integration", () => {
 
     const savedMarkdown = rendered.onSave.mock.calls[0]?.[1];
     expect(savedMarkdown).toMatch(
-      /^Plain \{\+\+now\+\+\}\{id="s1" by="user" at="[^"]+"\}\n$/,
+      /^Plain \{\+\+now\+\+\}\{#s1\}\n\n---\nsuggestions:\n {2}s1:\n {4}by: user\n {4}at: "[^"]+"\n$/,
     );
     expect(savedMarkdown).not.toContain("---\ncomments:");
     expect(savedMarkdown).not.toContain("Needs a source.");
@@ -1624,7 +1624,7 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).toHaveBeenCalledWith(
       "doc-comment-empty-draft-1",
       expect.stringMatching(
-        /\{==target==\}\{>>Draft comment<<\}\{id="c1" by="user" at="[^"]+"\}/,
+        /^Comment \{==target==\}\{#c1\} text\n\n---\ncomments:\n {2}c1:\n {4}body: "Draft comment"\n {4}by: user\n {4}at: "[^"]+"\n$/,
       ),
     );
   });
@@ -1876,10 +1876,11 @@ describe("PageCard editor integration", () => {
     });
 
     const savedMarkdown = rendered.onSave.mock.calls[0]?.[1];
-    expect(savedMarkdown).toContain("{++clearer wording++}{#s1}");
+    // The reply goes to the review block only, never onto the suggestion.
+    expect(savedMarkdown).toContain("{++clearer wording++}{#s1}.");
     expect(savedMarkdown).toContain("comments:");
     expect(savedMarkdown).toContain("c1:");
-    expect(savedMarkdown).toContain("body: Looks good.");
+    expect(savedMarkdown).toContain('body: "Looks good."');
     expect(savedMarkdown).toContain("re: s1");
     expect(savedMarkdown).toContain("suggestions:");
     expect(savedMarkdown).toContain("s1:");

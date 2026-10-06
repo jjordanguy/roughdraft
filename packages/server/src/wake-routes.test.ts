@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,9 +10,9 @@ import {
   runWakeRoute,
   shellQuote,
   testPayload,
+  WAKE_ROUTES_FILE,
   type WakePayload,
   type WakeRoute,
-  WAKE_ROUTES_FILE,
   WakeRouteStore,
 } from "./wake-routes";
 
@@ -193,8 +193,170 @@ describe("wake routes", () => {
     fs.writeFileSync(path.join(dir, WAKE_ROUTES_FILE), "[]");
     const fresh = new WakeRouteStore({ stateDir: dir });
 
-    expect(fresh.list()).toEqual([]);
+    // Nothing stored: only the built-in claude-code route is left.
+    expect(fresh.list()).toEqual([
+      expect.objectContaining({
+        harness: "claude-code",
+        kind: "claude-session",
+      }),
+    ]);
     expect(fresh.warnings[0]).toContain("Moved it to");
+  });
+
+  it("ships a built-in claude-code route that a stored route replaces and remove restores", () => {
+    const store = new WakeRouteStore({ stateDir: dir });
+    expect(store.get("claude-code")).toMatchObject({ kind: "claude-session" });
+    expect(store.get("openclaw")).toBeNull();
+
+    store.put(route({ command: "notify {message}" }));
+    expect(store.get("claude-code")).toMatchObject({ kind: "command" });
+    expect(store.remove("claude-code")).toBe(true);
+    expect(store.get("claude-code")).toMatchObject({ kind: "claude-session" });
+    expect(store.remove("openclaw")).toBe(false);
+
+    // An outcome on the built-in route is remembered across restarts.
+    store.recordOutcome(
+      "claude-code",
+      { sent: true, error: null, durationMs: 3 },
+      { at: "2026-10-06T10:00:00.000Z", by: "test" },
+    );
+    expect(
+      new WakeRouteStore({ stateDir: dir }).get("claude-code"),
+    ).toMatchObject({
+      kind: "claude-session",
+      verifiedAt: "2026-10-06T10:00:00.000Z",
+      verifiedBy: "test",
+    });
+  });
+
+  describe("claude-session routes", () => {
+    // A fake Claude Code session: its record and key under <config>/sessions
+    // and a socket that records the lines it receives.
+    async function fakeSession(sessionId: string, token: string | null) {
+      const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "rd-cc-"));
+      fs.mkdirSync(path.join(configDir, "sessions"));
+      const socketPath = path.join(configDir, "s.sock");
+      const lines: string[] = [];
+      const server = net.createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString();
+        });
+        socket.on("end", () => {
+          lines.push(...buffer.split("\n").filter(Boolean));
+          socket.end();
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      fs.writeFileSync(
+        path.join(configDir, "sessions", `${process.pid}.json`),
+        JSON.stringify({
+          pid: process.pid,
+          sessionId,
+          hostSessionId: "local_abc",
+          name: "Plan session",
+          messagingSocketPath: socketPath,
+          updatedAt: 5,
+        }),
+      );
+      if (token) {
+        fs.writeFileSync(
+          path.join(configDir, "sessions", `${process.pid}.deadbeef.key`),
+          JSON.stringify({ peerToken: token }),
+        );
+      }
+      return {
+        configDir,
+        lines,
+        close: () =>
+          new Promise<void>((resolve) => {
+            server.close(() => {
+              fs.rmSync(configDir, { recursive: true, force: true });
+              resolve();
+            });
+          }),
+      };
+    }
+
+    it("posts the Done as a user turn after the auth line", async () => {
+      const session = await fakeSession("s-9", "tok-1");
+      try {
+        const outcome = await runWakeRoute(
+          route({ kind: "claude-session" }),
+          donePayload,
+          { claudeConfigDir: session.configDir },
+        );
+        expect(outcome).toMatchObject({ sent: true, error: null });
+        expect(session.lines.map((line) => JSON.parse(line))).toEqual([
+          { type: "auth", token: "tok-1" },
+          {
+            type: "user",
+            message: {
+              role: "user",
+              content:
+                "I'm done reviewing it's plan.md. Please check my comments.\n\nFile: /docs/it's plan.md\nLink: http://localhost:7373/?path=%2Fdocs%2Fplan.md\nNext: roughdraft round '/docs/it'\\''s plan.md'",
+            },
+          },
+        ]);
+      } finally {
+        await session.close();
+      }
+    });
+
+    it("finds the session by the desktop app's id and sends without auth when there is no key", async () => {
+      const session = await fakeSession("s-9", null);
+      try {
+        const outcome = await runWakeRoute(
+          route({ kind: "claude-session" }),
+          testPayload("claude-code", "local_abc"),
+          { claudeConfigDir: session.configDir },
+        );
+        expect(outcome.sent).toBe(true);
+        expect(session.lines).toHaveLength(1);
+        expect(JSON.parse(session.lines[0]).message.content).toContain(
+          "Roughdraft wake route test for claude-code. It reached this session",
+        );
+      } finally {
+        await session.close();
+      }
+    });
+
+    it("fails with a reason when the session id is missing or not running", async () => {
+      const session = await fakeSession("s-9", "tok-1");
+      try {
+        const missing = await runWakeRoute(
+          route({ kind: "claude-session" }),
+          testPayload("claude-code"),
+          { claudeConfigDir: session.configDir },
+        );
+        expect(missing.sent).toBe(false);
+        expect(missing.error).toContain("no Claude Code session id");
+
+        const unknown = await runWakeRoute(
+          route({ kind: "claude-session" }),
+          testPayload("claude-code", "s-other"),
+          { claudeConfigDir: session.configDir },
+        );
+        expect(unknown.sent).toBe(false);
+        expect(unknown.error).toContain(
+          "No running Claude Code session has the id s-other",
+        );
+        expect(session.lines).toEqual([]);
+      } finally {
+        await session.close();
+      }
+    });
+
+    it("accepts the route kind without a target", () => {
+      expect(
+        parseWakeRouteBody("claude-code", { kind: "claude-session" }),
+      ).toEqual({
+        route: route({ kind: "claude-session" }),
+      });
+      expect(parseWakeRouteBody("x", { kind: "other" })).toEqual({
+        error: 'kind must be "command", "url" or "claude-session"',
+      });
+    });
   });
 
   it("validates route bodies", () => {

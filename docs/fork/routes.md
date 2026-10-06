@@ -1,10 +1,10 @@
 # Wake routes
 
-A wake route tells Roughdraft how to reach one harness (Claude Code, OpenClaw, a script) when Jordan clicks Done Reviewing. There is one route per harness. The agent owns its route: at the start of a session it tests the route for its harness, and if there is none, adding and testing one is its first job (decision D14). This file has no horizontal rule and keeps markup examples in code, so it is safe to open in Roughdraft.
+A wake route tells Roughdraft how to reach one harness (Claude Code, OpenClaw, a script) when Jordan clicks Done Reviewing. There is one route per harness. The agent owns its route: at the start of a session it tests the route for its harness, and if there is none, adding and testing one is its first job (decision D14). Claude Code needs no setup: its route is built in and posts the Done straight into the session that opened the file. This file has no horizontal rule and keeps markup examples in code, so it is safe to open in Roughdraft.
 
 ## How Done uses a route
 
-1. An agent opens a file and registers its session: `roughdraft open "/abs/path.md" --no-watch --harness claude-code --session-label "..." --session-id <id>` (or the `roughdraft_register_session` MCP tool). The session log records the harness, label, link and session id against that file.
+1. An agent opens a file and registers its session: `roughdraft open "/abs/path.md" --no-watch --session-label "..."` (or the `roughdraft_register_session` MCP tool). Inside Claude Code the CLI fills in the harness (`claude-code`), the session id and, when no label is given, the session's title, from the environment Claude Code gives its shell. Other harnesses pass `--harness <name>` and `--session-id <id>`. The session log records the harness, label, link and session id against that file.
 2. Jordan clicks Done. Roughdraft writes the Done to the session log first, then delivers it to any agent waiting with `watch`, then, when the file's session names a harness that has a route, runs that route with the file path, the link, the comment counts and the global comment.
 3. The result goes into the log: `wake.state` is `sent` or `failed` (with the error), or `none` when the file has no session or its harness has no route. `roughdraft log` shows it per document. A Done whose wake failed is still in the log until an agent acknowledges it (`roughdraft pending`).
 
@@ -16,7 +16,8 @@ A watching agent that also has a route gets the Done twice, once from each. Ackn
 roughdraft route list [--json]
 roughdraft route add <harness> --command "<shell command>" [--label "<text>"]
 roughdraft route add <harness> --url <http or https URL> [--label "<text>"]
-roughdraft route test <harness> [--json]
+roughdraft route add <harness> --claude-session [--label "<text>"]
+roughdraft route test <harness> [--session-id <id>] [--json]
 roughdraft route remove <harness> [--json]
 ```
 
@@ -25,7 +26,15 @@ roughdraft route remove <harness> [--json]
 - `route test` sends a test wake (`event` is `test`) and records when the route was last verified and by whom. It exits 0 when the wake was sent, 3 (`WAKE_ROUTE_FAILED`, with the error) when it was not, and 2 (`WAKE_ROUTE_NOT_FOUND`) when the harness has no route.
 - The MCP tool `roughdraft_wake_routes` does the same with `action` set to `list`, `add`, `remove` or `test`.
 
-Routes live in `wake-routes.json` in the state directory (`~/.roughdraft` by default).
+Routes live in `wake-routes.json` in the state directory (`~/.roughdraft` by default). The `claude-code` route is built in (kind `claude-session`, below) and is not in the file until it has a result to remember; `route add claude-code ...` replaces it and `route remove claude-code` brings the built-in one back.
+
+## Claude session routes
+
+A `claude-session` route delivers the Done into the Claude Code session that opened the file, as a user turn: the session starts a turn on it when it is idle and reads it at its next tool round when it is busy. The message is the wake message (below), then a blank line, `File: <path>`, `Link: <the file's link>` and `Next: roughdraft round '<path>'`.
+
+How it finds the session: every Claude Code process keeps a record under `~/.claude/sessions/` (or `$CLAUDE_CONFIG_DIR/sessions/`) with the path of the socket it listens on for messages from other sessions, and a key file next to it with the token a sender presents. Roughdraft matches the session id the file was registered with (the conversation id, or the desktop app's `local_...` id) against the live records, reads the token, and writes two lines of JSON to the socket. Nothing is stored in Roughdraft but the id. The delivery fails, with the reason in the log, when the file's session has no id, when no running session has that id (the session was closed or the machine restarted), or when the socket does not answer.
+
+`route test claude-code` needs a session to deliver the test into. Run it from inside a Claude Code session (its shell carries the session id) or pass `--session-id <id>` for a session that is running; the test message says it is a test and asks for nothing.
 
 ## Command routes
 
@@ -73,7 +82,7 @@ A test sends `type: "roughdraft.test"` with `documentPath`, `link` and `handoffI
 ## The two harnesses today
 
 - **OpenClaw (Mike)**: a URL route to its existing webhook, `roughdraft route add openclaw --url <webhook URL> --label "Mike's webhook"`.
-- **Claude Code on the Mac**: the desktop app has no documented way to deliver a message into a running session. The route verified in batch 1 only brings the app forward (`roughdraft route add claude-code --command 'open "claude://claude.ai/epitaxy/{sessionId}"'`); whether it lands in the right session is not verified. Until the app offers a way in, the session log is what covers a Claude Code session: Jordan says "done" in chat and the agent runs `roughdraft round`, which picks up the waiting Done.
+- **Claude Code (Mac and VPS)**: the built-in `claude-session` route. Nothing to add; `roughdraft route test claude-code` from inside a session confirms it. The session log still covers the cases the route cannot: a session that was closed before Done, or a Done nobody was registered for. Then Jordan says "done" in chat and the agent runs `roughdraft round`, which picks up the waiting Done.
 
 ## HTTP routes behind the commands
 

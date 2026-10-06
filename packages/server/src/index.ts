@@ -143,6 +143,8 @@ interface CreateAppOptions {
   openRequestAckMs?: number;
   deliveryWaitMs?: number;
   wakeTimeoutMs?: number;
+  /** Where Claude Code keeps its session records, for claude-session wake routes (default: CLAUDE_CONFIG_DIR, else ~/.claude). */
+  claudeConfigDir?: string;
   /** Document watcher stat poll (default 1 s). */
   watchPollMs?: number;
   /** Document watcher rehash while subscribed (default 10 s). */
@@ -620,6 +622,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const wakeRunOptions = (): RunWakeOptions => ({
     timeoutMs: options.wakeTimeoutMs,
     fetchImpl,
+    claudeConfigDir: options.claudeConfigDir,
   });
 
   const sweeper = setInterval(

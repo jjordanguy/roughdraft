@@ -8,6 +8,7 @@ import {
   type RfmDiagnostic,
   validateRoughdraftMarkdown,
 } from "@roughdraft/rfm";
+import { currentClaudeSessionId, findClaudeSession } from "./claude-session.js";
 import {
   CliError,
   EXIT_SERVER,
@@ -16,13 +17,13 @@ import {
   toCliError,
   usageError,
 } from "./errors.js";
+import { runGuardHook } from "./guard.js";
 import {
   ROUGHDRAFT_BIND_HOST,
   ROUGHDRAFT_DEFAULT_PORT,
   ROUGHDRAFT_LOOPBACK_HOSTS,
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
-import { runGuardHook } from "./guard.js";
 import { findAvailablePort } from "./ports.js";
 import {
   type ReviewCliOptions,
@@ -257,6 +258,7 @@ interface ParsedCommandOptions {
   fix: boolean;
   report?: string;
   claudeHook: boolean;
+  claudeSession: boolean;
 }
 
 const currentServerRoot = path.resolve(
@@ -384,10 +386,11 @@ const FLAG_GROUPS: Record<string, FlagGroup | FlagGroup[]> = {
   "--harness": "session",
   "--session-label": "session",
   "--session-link": "session",
-  "--session-id": "session",
+  "--session-id": ["session", "route"],
   "--ack": "pendingAck",
   "--command": "route",
   "--url": "route",
+  "--claude-session": "route",
   "--label": "route",
   "--strict": "doctor",
   "--author": "author",
@@ -450,6 +453,7 @@ function parseCommandOptions(
     skipFailed: false,
     fix: false,
     claudeHook: false,
+    claudeSession: false,
   };
   const allowedGroups = new Set(allowed);
 
@@ -620,6 +624,9 @@ function parseCommandOptions(
         break;
       case "--claude-hook":
         parsed.claudeHook = true;
+        break;
+      case "--claude-session":
+        parsed.claudeSession = true;
         break;
     }
   }
@@ -1124,7 +1131,10 @@ function printCommandHelp(
     log("  --no-watch                Open the file without waiting");
     for (const line of WATCH_FLAG_HELP) log(line);
     log(
-      "  --harness <name>          Register the session that opened the file (ROUGHDRAFT_HARNESS)",
+      "  --harness <name>          Register the session that opened the file (ROUGHDRAFT_HARNESS).",
+    );
+    log(
+      "                            Inside Claude Code the session is registered without flags.",
     );
     log(
       "  --session-label <text>    Session label shown in the app (ROUGHDRAFT_SESSION_LABEL)",
@@ -1263,9 +1273,9 @@ function printCommandHelp(
     log("Usage:");
     log("  roughdraft route list");
     log(
-      '  roughdraft route add <harness> --command "<text>" | --url <url> [--label <text>]',
+      '  roughdraft route add <harness> --command "<text>" | --url <url> | --claude-session [--label <text>]',
     );
-    log("  roughdraft route test <harness>");
+    log("  roughdraft route test <harness> [--session-id <id>]");
     log("  roughdraft route remove <harness>");
     log("");
     log(
@@ -1277,6 +1287,16 @@ function printCommandHelp(
     log(
       "replaced, and ROUGHDRAFT_* variables set. A url receives a JSON POST.",
     );
+    log(
+      "A claude-session route posts the Done into the Claude Code session that",
+    );
+    log(
+      "opened the file; claude-code has one built in. `route test` of it needs a",
+    );
+    log(
+      "session: run it inside Claude Code or pass --session-id. `route remove`",
+    );
+    log("of a built-in route restores it.");
     log(
       "`route test` exits 0 when the test wake was sent and 3 when it failed.",
     );
@@ -2561,7 +2581,12 @@ function describeWake(handoff: HandoffRecord): string {
 
 function describeRoute(route: WakeRoute | null | undefined): string {
   if (!route) return "none registered";
-  const target = route.kind === "url" ? route.url : route.command;
+  const target =
+    route.kind === "url"
+      ? route.url
+      : route.kind === "command"
+        ? route.command
+        : "the Claude Code session that opened the file";
   const state = route.lastError
     ? `last test failed: ${route.lastError}`
     : route.verifiedAt
@@ -3049,7 +3074,7 @@ async function runRoute(
 ): Promise<number> {
   const [action, harness, ...extra] = options.positionals;
   const usage =
-    "Usage: roughdraft route list | add <harness> --command <text> | --url <url> [--label <text>] | remove <harness> | test <harness>";
+    "Usage: roughdraft route list | add <harness> --command <text> | --url <url> | --claude-session [--label <text>] | remove <harness> | test <harness> [--session-id <id>]";
   if (!action || extra.length > 0) throw usageError(usage);
 
   if (action === "list") {
@@ -3076,14 +3101,22 @@ async function runRoute(
 
   if (!["add", "remove", "test"].includes(action)) throw usageError(usage);
   if (!harness) throw usageError(usage);
-  if (action !== "add" && (options.command || options.url || options.label)) {
+  if (
+    action !== "add" &&
+    (options.command || options.url || options.claudeSession || options.label)
+  ) {
     throw usageError(usage);
   }
+  if (action !== "test" && options.sessionId) throw usageError(usage);
 
   if (action === "add") {
-    if ((options.command ? 1 : 0) + (options.url ? 1 : 0) !== 1) {
+    const targets =
+      (options.command ? 1 : 0) +
+      (options.url ? 1 : 0) +
+      (options.claudeSession ? 1 : 0);
+    if (targets !== 1) {
       throw usageError(
-        "route add needs exactly one of --command <text> or --url <url>.",
+        "route add needs exactly one of --command <text>, --url <url> or --claude-session.",
       );
     }
   }
@@ -3093,7 +3126,11 @@ async function runRoute(
 
   if (action === "add") {
     const route = await putWakeRoute(api, harness, {
-      kind: options.command ? "command" : "url",
+      kind: options.claudeSession
+        ? "claude-session"
+        : options.command
+          ? "command"
+          : "url",
       ...(options.command ? { command: options.command } : {}),
       ...(options.url ? { url: options.url } : {}),
       label: options.label ?? null,
@@ -3126,13 +3163,24 @@ async function runRoute(
     return 0;
   }
 
-  const tested = await testWakeRoute(api, harness, "roughdraft-cli route test");
+  // A claude-session route needs a session to deliver the test into: the one
+  // named on the command line, else the one this command runs under.
+  const tested = await testWakeRoute(
+    api,
+    harness,
+    "roughdraft-cli route test",
+    options.sessionId ?? currentClaudeSessionId(deps.env),
+  );
   if (!tested.sent) {
     throw new CliError(
       "WAKE_ROUTE_FAILED",
       `The wake route for ${harness} failed: ${tested.error ?? "unknown error"}`,
       {
-        hint: `Fix it with \`roughdraft route add ${quoteArg(harness)} ...\` and test again.`,
+        hint:
+          tested.error?.includes("session id") ||
+          tested.error?.includes("No running Claude Code session")
+            ? "Run the test from inside a Claude Code session, or pass --session-id <id> for a session that is running."
+            : `Fix it with \`roughdraft route add ${quoteArg(harness)} ...\` and test again.`,
         details: {
           harness,
           sent: false,
@@ -3375,7 +3423,9 @@ interface SessionOptions {
 /**
  * The session to register on `open`: flags first, then ROUGHDRAFT_HARNESS,
  * ROUGHDRAFT_SESSION_LABEL, ROUGHDRAFT_SESSION_LINK, ROUGHDRAFT_SESSION_ID.
- * Nothing is registered without a harness.
+ * Inside Claude Code (its shell sets CLAUDE_CODE_SESSION_ID or the messaging
+ * socket) the harness is claude-code, the id is that session's, and the label
+ * defaults to the session's title. Nothing is registered without a harness.
  */
 function resolveSessionOptions(
   options: ParsedCommandOptions,
@@ -3385,7 +3435,10 @@ function resolveSessionOptions(
     const value = flag ?? env[envName];
     return typeof value === "string" && value.trim() ? value.trim() : null;
   };
-  const harness = pick(options.harness, "ROUGHDRAFT_HARNESS");
+  const claudeSessionId = currentClaudeSessionId(env);
+  const harness =
+    pick(options.harness, "ROUGHDRAFT_HARNESS") ??
+    (claudeSessionId ? "claude-code" : null);
   if (!harness) {
     if (options.sessionLabel || options.sessionLink || options.sessionId) {
       throw usageError(
@@ -3394,11 +3447,21 @@ function resolveSessionOptions(
     }
     return null;
   }
+  const sessionId =
+    pick(options.sessionId, "ROUGHDRAFT_SESSION_ID") ??
+    (harness === "claude-code" ? claudeSessionId : null);
+  const sessionTitle =
+    harness === "claude-code" && sessionId
+      ? (findClaudeSession(sessionId, { env })?.name ?? null)
+      : null;
   return {
     harness,
-    label: pick(options.sessionLabel, "ROUGHDRAFT_SESSION_LABEL") ?? harness,
+    label:
+      pick(options.sessionLabel, "ROUGHDRAFT_SESSION_LABEL") ??
+      sessionTitle ??
+      harness,
     link: pick(options.sessionLink, "ROUGHDRAFT_SESSION_LINK"),
-    sessionId: pick(options.sessionId, "ROUGHDRAFT_SESSION_ID"),
+    sessionId,
   };
 }
 

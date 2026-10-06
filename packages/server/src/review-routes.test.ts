@@ -736,7 +736,7 @@ describe("review event routes on a real listener", () => {
           label: "Plan review",
           link: null,
           sessionId: "s-1",
-          routeId: null,
+          routeId: "claude-code",
         },
       });
       expect(status.body.session).toEqual(registered.body.session);
@@ -917,6 +917,10 @@ describe("review event routes on a real listener", () => {
           harness: "bad",
           verifiedAt: null,
           lastError: "Command exited with 1",
+        }),
+        expect.objectContaining({
+          harness: "claude-code",
+          kind: "claude-session",
         }),
         expect.objectContaining({
           harness: "ok",

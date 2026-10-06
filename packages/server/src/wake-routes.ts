@@ -1,16 +1,19 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import express, { type Request, type Response, type Router } from "express";
+import { wakeClaudeSession } from "./claude-session.js";
 import {
   errorMessage,
   type HandoffSummary,
   readJsonState,
   writeJsonAtomic,
 } from "./handoff-log.js";
+import { builtInRoute, withBuiltInRoutes } from "./wake-route-defaults.js";
 
 export interface WakeRoute {
   harness: string;
-  kind: "command" | "url";
+  /** command: a shell command; url: a JSON POST; claude-session: a user turn in the Claude Code session that opened the file. */
+  kind: "command" | "url" | "claude-session";
   command?: string;
   url?: string;
   label: string | null;
@@ -39,6 +42,8 @@ export interface RunWakeOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
   env?: NodeJS.ProcessEnv;
+  /** Where Claude Code keeps its session records (default: CLAUDE_CONFIG_DIR, else ~/.claude). */
+  claudeConfigDir?: string;
 }
 
 interface RoutesFile {
@@ -76,14 +81,13 @@ export class WakeRouteStore {
     }
   }
 
+  /** Stored routes plus the built-in ones nothing replaced. */
   list(): WakeRoute[] {
-    return [...this.routes.values()].sort((a, b) =>
-      a.harness.localeCompare(b.harness),
-    );
+    return withBuiltInRoutes([...this.routes.values()]);
   }
 
   get(harness: string): WakeRoute | null {
-    return this.routes.get(harness) ?? null;
+    return this.routes.get(harness) ?? builtInRoute(harness);
   }
 
   put(route: WakeRoute): WakeRoute {
@@ -92,10 +96,11 @@ export class WakeRouteStore {
     return route;
   }
 
+  /** Drops a stored route. A built-in route cannot be removed; removing its replacement restores it. */
   remove(harness: string): boolean {
     const removed = this.routes.delete(harness);
     if (removed) this.save();
-    return removed;
+    return removed || builtInRoute(harness) !== null;
   }
 
   recordOutcome(
@@ -103,8 +108,14 @@ export class WakeRouteStore {
     outcome: WakeOutcome,
     verification?: { at: string; by: string | null },
   ): void {
-    const route = this.routes.get(harness);
-    if (!route) return;
+    let route = this.routes.get(harness);
+    if (!route) {
+      // A built-in route gets stored once it has an outcome to remember.
+      const builtIn = builtInRoute(harness);
+      if (!builtIn) return;
+      route = builtIn;
+      this.routes.set(harness, route);
+    }
     route.lastError = outcome.error;
     if (outcome.sent && verification) {
       route.verifiedAt = verification.at;
@@ -162,7 +173,10 @@ export function parseWakeRouteBody(
     if (!isHttpUrl(url)) return { error: "url must be an http or https URL" };
     return { route: { ...base, kind: "url", url } };
   }
-  return { error: 'kind must be "command" or "url"' };
+  if (input.kind === "claude-session") {
+    return { route: { ...base, kind: "claude-session" } };
+  }
+  return { error: 'kind must be "command", "url" or "claude-session"' };
 }
 
 export function doneMessage(
@@ -174,7 +188,10 @@ export function doneMessage(
   return overallComment ? `${line}\n${overallComment}` : line;
 }
 
-export function testPayload(harness: string): WakePayload {
+export function testPayload(
+  harness: string,
+  sessionId: string | null = null,
+): WakePayload {
   return {
     event: "test",
     message: `Roughdraft wake route test for ${harness}.`,
@@ -182,8 +199,28 @@ export function testPayload(harness: string): WakePayload {
     link: null,
     counts: { comments: 0, suggestions: 0, unresolved: 0 },
     handoffId: null,
-    session: { harness, label: null, sessionId: null },
+    session: { harness, label: null, sessionId },
   };
+}
+
+/**
+ * What a claude-session route posts into the session: the Done message, then
+ * the file and the command that picks the round up. A test says it is one.
+ */
+export function sessionMessage(payload: WakePayload): string {
+  if (payload.event === "test") {
+    return `${payload.message} It reached this session over its messaging socket, so a Done will too. Nothing to do.`;
+  }
+  const lines = [payload.message];
+  if (payload.documentPath) {
+    lines.push(
+      "",
+      `File: ${payload.documentPath}`,
+      ...(payload.link ? [`Link: ${payload.link}`] : []),
+      `Next: roughdraft round ${shellQuote(payload.documentPath)}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 export async function runWakeRoute(
@@ -197,7 +234,24 @@ export async function runWakeRoute(
     const error =
       route.kind === "command"
         ? await runCommand(route.command ?? "", payload, timeoutMs, options.env)
-        : await postUrl(route.url ?? "", payload, timeoutMs, options.fetchImpl);
+        : route.kind === "url"
+          ? await postUrl(
+              route.url ?? "",
+              payload,
+              timeoutMs,
+              options.fetchImpl,
+            )
+          : await wakeClaudeSession(
+              payload.session.sessionId,
+              sessionMessage(payload),
+              {
+                timeoutMs,
+                ...(options.claudeConfigDir
+                  ? { configDir: options.claudeConfigDir }
+                  : {}),
+                ...(options.env ? { env: options.env } : {}),
+              },
+            );
     return { sent: error === null, error, durationMs: Date.now() - startedAt };
   } catch (error) {
     return {
@@ -406,9 +460,13 @@ export function wakeRouteRouter(deps: {
       });
       return;
     }
+    const sessionId =
+      typeof req.body?.sessionId === "string" && req.body.sessionId.trim()
+        ? req.body.sessionId.trim()
+        : null;
     const outcome = await runWakeRoute(
       route,
-      testPayload(route.harness),
+      testPayload(route.harness, sessionId),
       deps.runOptions(),
     );
     const by = typeof req.body?.by === "string" ? req.body.by : null;

@@ -16,16 +16,15 @@ Roughdraft opens a local Markdown file with tools on top of it, so Jordan can re
 
 ## Procedure
 
-1. At the start of a session that will hand Jordan a file, run `roughdraft route test claude-code` once. If it fails or there is no route, say so: his Done will then reach you only through the session log, so he should tell you in chat when he is done.
+1. At the start of a session that will hand Jordan a file, run `roughdraft route test claude-code` once. The test arrives in this session as a message a moment later. If the command fails, say so: his Done will then reach you only through the session log, so he should tell you in chat when he is done.
 2. Hand him the file:
 
    ```bash
-   roughdraft open "/abs/path.md" --no-watch --harness claude-code \
-     --session-label "<what this session is doing>" --session-id <this session's id>
+   roughdraft open "/abs/path.md" --no-watch --session-label "<what this session is doing>"
    ```
 
-   It prints the link and opens the window. Do not hold a live wait.
-3. When his Done wakes you, or he says in chat that he is done, run `roughdraft round "/abs/path.md"`. It acknowledges the Done and prints the round folder with `round.json`, `clean.md` and `response.json`. If it reports `tabDirty` or `tabConflict`, ask him before going on.
+   It prints the link, opens the window and records this session by itself. Do not hold a live wait.
+3. When his Done arrives as a message in this session, or he says in chat that he is done, run `roughdraft round "/abs/path.md"`. It acknowledges the Done and prints the round folder with `round.json`, `clean.md` and `response.json`. If it reports `tabDirty` or `tabConflict`, ask him before going on.
 4. Read `round.json` (one entry per thread, with the highlighted text, the section and the paragraphs around it) and `clean.md` (the document with no markup).
 5. Make the prose changes he asked for in `clean.md` with the Edit tool.
 6. Fill in `response.json`: a plain-text `reply` for every thread with `needsAnswer`, `resolve` where he signed off, `skip` with a reason for anything you leave, `decision` on a suggestion only when he asked for it, and `note` with a one-line summary of the round.
@@ -49,14 +48,14 @@ Each prints the new entry's id and the doctor breakdown.
 
 | Command | Use |
 | --- | --- |
-| `roughdraft open <file> --no-watch --harness claude-code --session-label "..." --session-id <id>` | Hand a file over and record this session |
+| `roughdraft open <file> --no-watch --session-label "..."` | Hand a file over and record this session |
 | `roughdraft round <file>` | Start a round after Done |
 | `roughdraft apply <response.json>` | Land the round in one checked write (`--dry-run` to check first) |
 | `roughdraft reply`, `resolve`, `accept`, `reject`, `note` | One answer outside a round |
 | `roughdraft feedback <file> --json` | Read every thread without starting a round |
 | `roughdraft pending <file> --json --ack` | Dones waiting in the session log, acknowledged as listed |
 | `roughdraft status`, `roughdraft log` | Open documents and their links; sessions, wake routes and latest Dones |
-| `roughdraft route list`, `route add <harness> --command "..."` or `--url <url>`, `route test <harness>` | Wake routes |
+| `roughdraft route list`, `route add <harness> --command "..."`, `--url <url>` or `--claude-session`, `route test <harness>` | Wake routes (claude-code is built in) |
 | `roughdraft doctor <file> --strict` | Validate a file before handing it back |
 | `roughdraft doctor --fix <file> --dry-run`, then without `--dry-run` | Convert an older-format file, only with Jordan's yes |
 | `roughdraft help`, `roughdraft help <command>` | Flags and exit codes |

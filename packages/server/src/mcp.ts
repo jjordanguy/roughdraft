@@ -7,6 +7,7 @@ import {
   type RfmReviewItem,
   validateRoughdraftMarkdown,
 } from "@roughdraft/rfm";
+import { currentClaudeSessionId } from "./claude-session.js";
 import {
   createCliDependencies,
   findReusableServer,
@@ -17,8 +18,8 @@ import { CliError, errorEnvelope, toCliError, usageError } from "./errors.js";
 import { ROUGHDRAFT_BIND_HOST, ROUGHDRAFT_LOOPBACK_HOSTS } from "./network.js";
 import {
   applyRound,
-  readFeedback,
   type ReviewDeps,
+  readFeedback,
   runThreadCommand,
   startRound,
   type ThreadCommandResult,
@@ -97,10 +98,10 @@ interface ToolDefinition {
  * word (a test keeps the two equal).
  */
 export const AGENT_PROCEDURE =
-  '**Roughdraft (markdown review app, all projects).** "rd" means Roughdraft, Jordan\'s local Markdown review app, run as `roughdraft` (never create an alias or command named rd). At the start of a session that will hand Jordan a file, run `roughdraft route test claude-code` once; if it fails, say so. Hand him a file with `roughdraft open "/abs/path.md" --no-watch --harness claude-code --session-label "<what this session is doing>" --session-id <this session\'s id>`. When his Done wakes you, or when he says in chat that he is done, run `roughdraft round "/abs/path.md"`. If it reports `tabDirty` or `tabConflict`, ask him before going on. Read the round.json and clean.md it names. Make the prose changes he asked for in clean.md with the Edit tool, never in the reviewed file. Fill in response.json: a plain-text `reply` for every thread with `needsAnswer`, `resolve` where he signed off, `skip` with a reason for anything you leave, `decision` on a suggestion only when he asked for it, and `note` with a one-line summary of the round. Then run `roughdraft apply "<response.json>"`. Exit 1 means nothing was written: fix what it lists and run it again. If the report lists `newThreads` or `remaining`, run `roughdraft round` again. For a single answer outside a round use `roughdraft reply "/abs/path.md" <id> - <<\'EOF\'` (text on the next lines, then `EOF`), or `resolve`, `accept`, `reject` or `note`. Never type CriticMarkup, `{#id}` refs or review YAML, and never rewrite a reviewed file with Write. If a command says the file uses an older review format, tell Jordan and offer `roughdraft doctor --fix "/abs/path.md"` (after `--dry-run`); do not convert it without his yes. Reopen the file with the open command when the round is applied.';
+  '**Roughdraft (markdown review app, all projects).** "rd" means Roughdraft, Jordan\'s local Markdown review app, run as `roughdraft` (never create an alias or command named rd). At the start of a session that will hand Jordan a file, run `roughdraft route test claude-code` once; the test arrives in this session as a message a moment later, and if the command fails, say so. Hand him a file with `roughdraft open "/abs/path.md" --no-watch --session-label "<what this session is doing>"` (it records this session by itself). When his Done arrives as a message in this session, or when he says in chat that he is done, run `roughdraft round "/abs/path.md"`. If it reports `tabDirty` or `tabConflict`, ask him before going on. Read the round.json and clean.md it names. Make the prose changes he asked for in clean.md with the Edit tool, never in the reviewed file. Fill in response.json: a plain-text `reply` for every thread with `needsAnswer`, `resolve` where he signed off, `skip` with a reason for anything you leave, `decision` on a suggestion only when he asked for it, and `note` with a one-line summary of the round. Then run `roughdraft apply "<response.json>"`. Exit 1 means nothing was written: fix what it lists and run it again. If the report lists `newThreads` or `remaining`, run `roughdraft round` again. For a single answer outside a round use `roughdraft reply "/abs/path.md" <id> - <<\'EOF\'` (text on the next lines, then `EOF`), or `resolve`, `accept`, `reject` or `note`. Never type CriticMarkup, `{#id}` refs or review YAML, and never rewrite a reviewed file with Write. If a command says the file uses an older review format, tell Jordan and offer `roughdraft doctor --fix "/abs/path.md"` (after `--dry-run`); do not convert it without his yes. Reopen the file with the open command when the round is applied.';
 
 const TOOLS_PARAGRAPH = [
-  "The same steps as tools: `roughdraft_wake_routes` with action test at the start of a session; `roughdraft_register_session` after opening a file without the CLI's --harness flag; `roughdraft_get_handoffs` (non-blocking) when Jordan says in chat that he is done, and `roughdraft_ack_handoff` once you have acted on a Done; `roughdraft_start_round` returns the round and cleanText, and `roughdraft_apply_round` takes the filled-in response with your edited cleanText; `roughdraft_reply_to_comment`, `roughdraft_mark_resolved` and `roughdraft_add_document_comment` for single answers, with the expectedVersion you read.",
+  "The same steps as tools: `roughdraft_wake_routes` with action test at the start of a session; `roughdraft_register_session` after opening a file some other way than the CLI (the CLI registers the session itself); `roughdraft_get_handoffs` (non-blocking) when Jordan says in chat that he is done, and `roughdraft_ack_handoff` once you have acted on a Done; `roughdraft_start_round` returns the round and cleanText, and `roughdraft_apply_round` takes the filled-in response with your edited cleanText; `roughdraft_reply_to_comment`, `roughdraft_mark_resolved` and `roughdraft_add_document_comment` for single answers, with the expectedVersion you read.",
   "Every documentPath is an absolute path to a .md file. A failed call is an isError result whose text is the CLI error envelope: read error.code, error.message and error.hint; when status is refused, nothing was written.",
   "`roughdraft_watch_review_events` holds your turn until Done; prefer the wake route plus `roughdraft_get_handoffs`, and give it a timeoutSeconds when you do wait.",
 ].join(" ");
@@ -411,13 +412,13 @@ export const TOOLS: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["documentPath", "harness", "label"],
+      required: ["documentPath", "label"],
       properties: {
         documentPath,
         harness: {
           type: "string",
           description:
-            "Harness name, for example claude-code or openclaw. It picks the wake route.",
+            "Harness name, for example claude-code or openclaw. It picks the wake route. Default: claude-code when this MCP server runs inside Claude Code.",
         },
         label: {
           type: "string",
@@ -432,7 +433,7 @@ export const TOOLS: ToolDefinition[] = [
         sessionId: {
           type: "string",
           description:
-            "The harness's id for this session, passed to the wake route as {sessionId}.",
+            "The harness's id for this session, passed to the wake route as {sessionId}. Default: the Claude Code session this MCP server runs inside.",
         },
       },
     },
@@ -441,7 +442,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "roughdraft_wake_routes",
     description:
-      "List, add, remove or test the wake route for a harness. A command route runs through the shell with {message}, {file}, {link} and {sessionId} replaced; a url route receives a JSON POST. Test your harness's route at the start of a session.",
+      "List, add, remove or test the wake route for a harness. A command route runs through the shell with {message}, {file}, {link} and {sessionId} replaced; a url route receives a JSON POST; a claude-session route posts the Done into the Claude Code session that opened the file (claude-code has one built in). Test your harness's route at the start of a session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -460,9 +461,14 @@ export const TOOLS: ToolDefinition[] = [
         },
         kind: {
           type: "string",
-          enum: ["command", "url"],
+          enum: ["command", "url", "claude-session"],
           description:
-            "command or url. Default: url when url is given, else command.",
+            "command, url or claude-session. Default: url when url is given, command when command is given, else claude-session.",
+        },
+        sessionId: {
+          type: "string",
+          description:
+            "For test of a claude-session route: the Claude Code session to deliver the test into. Default: the session this MCP server runs inside.",
         },
         command: {
           type: "string",
@@ -1322,7 +1328,10 @@ export async function callTool(
 
   if (name === "roughdraft_register_session") {
     const documentPath = requireDocumentPath(args);
-    const harness = requireString(args, "harness");
+    const claudeSessionId = currentClaudeSessionId(env);
+    const harness =
+      optionalArg(args, "harness") ??
+      (claudeSessionId ? "claude-code" : requireString(args, "harness"));
     const label = requireString(args, "label");
     const server = await requireServer(
       env,
@@ -1336,7 +1345,9 @@ export async function callTool(
       harness,
       label,
       link: typeof args.link === "string" ? args.link : null,
-      sessionId: typeof args.sessionId === "string" ? args.sessionId : null,
+      sessionId:
+        optionalArg(args, "sessionId") ??
+        (harness === "claude-code" ? claudeSessionId : null),
     });
     return { ok: true, session };
   }
@@ -1356,11 +1367,15 @@ export async function callTool(
     }
     if (action === "add") {
       const kind =
-        args.kind === "url" || args.kind === "command"
+        args.kind === "url" ||
+        args.kind === "command" ||
+        args.kind === "claude-session"
           ? args.kind
           : typeof args.url === "string"
             ? "url"
-            : "command";
+            : typeof args.command === "string"
+              ? "command"
+              : "claude-session";
       const route = await putWakeRoute(ctx, harness, {
         kind,
         ...(typeof args.command === "string" ? { command: args.command } : {}),
@@ -1372,7 +1387,12 @@ export async function callTool(
     if (action === "remove") {
       return { ok: true, removed: await removeWakeRoute(ctx, harness) };
     }
-    const tested = await testWakeRoute(ctx, harness, "roughdraft-mcp");
+    const tested = await testWakeRoute(
+      ctx,
+      harness,
+      "roughdraft-mcp",
+      optionalArg(args, "sessionId") ?? currentClaudeSessionId(env),
+    );
     return { ok: tested.sent, ...tested };
   }
 

@@ -22,12 +22,18 @@ import {
   ROUGHDRAFT_LOOPBACK_HOSTS,
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
-import { documentKey, type DocumentView } from "./registry.js";
+import { type DocumentView, documentKey } from "./registry.js";
 import type { ReviewCompletedEvent } from "./review-events.js";
+import { withBuiltInRoutes } from "./wake-route-defaults.js";
 import type { WakeRoute } from "./wake-routes.js";
 
-export type { DocumentRecord, DocumentView, HandoffRecord, SessionRecord };
-export type { WakeRoute };
+export type {
+  DocumentRecord,
+  DocumentView,
+  HandoffRecord,
+  SessionRecord,
+  WakeRoute,
+};
 
 const REVIEW_LOG_FILE = "review-log.json";
 const WAKE_ROUTES_FILE = "wake-routes.json";
@@ -427,7 +433,7 @@ export async function putWakeRoute(
   ctx: ApiContext,
   harness: string,
   route: {
-    kind: "command" | "url";
+    kind: "command" | "url" | "claude-session";
     command?: string;
     url?: string;
     label?: string | null;
@@ -478,20 +484,25 @@ export async function testWakeRoute(
   ctx: ApiContext,
   harness: string,
   by: string,
+  /** For a claude-session route: the session the test is delivered into. */
+  sessionId: string | null = null,
 ): Promise<WakeTestResult> {
   const response = await apiRequest(
     ctx,
     "POST",
     `/api/wake-routes/${encodeURIComponent(harness)}/test`,
     // The server runs the route with a 10 s limit before it answers.
-    { body: { by }, timeoutMs: 30_000 },
+    {
+      body: { by, ...(sessionId ? { sessionId } : {}) },
+      timeoutMs: 30_000,
+    },
   );
   if (response.status === 404) {
     throw new CliError(
       "WAKE_ROUTE_NOT_FOUND",
       `No wake route for ${harness}.`,
       {
-        hint: `Add one with \`roughdraft route add ${harness} --command "<text>"\` or \`--url <url>\`.`,
+        hint: `Add one with \`roughdraft route add ${harness} --command "<text>"\`, \`--url <url>\` or \`--claude-session\`.`,
       },
     );
   }
@@ -545,11 +556,13 @@ export function readWakeRoutesFromDisk(stateDir: string): WakeRoute[] {
     const parsed = JSON.parse(
       fs.readFileSync(path.join(stateDir, WAKE_ROUTES_FILE), "utf8"),
     ) as { routes?: unknown };
-    return parsed.routes && typeof parsed.routes === "object"
-      ? Object.values(parsed.routes as Record<string, WakeRoute>)
-      : [];
+    return withBuiltInRoutes(
+      parsed.routes && typeof parsed.routes === "object"
+        ? Object.values(parsed.routes as Record<string, WakeRoute>)
+        : [],
+    );
   } catch {
-    return [];
+    return withBuiltInRoutes([]);
   }
 }
 

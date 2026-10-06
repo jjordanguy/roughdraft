@@ -207,7 +207,8 @@ describe("DocumentWatcher", () => {
 
     fs.writeFileSync(filePath, "# B\n\nvia fs.watch\n");
 
-    const change = await until(() => changes[0], 3_000);
+    // FSEvents delivery can lag by seconds while the whole suite runs.
+    const change = await until(() => changes[0], 15_000);
     expect(change.contentHash).toBe(sha256("# B\n\nvia fs.watch\n"));
   });
 

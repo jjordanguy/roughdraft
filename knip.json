@@ -4,7 +4,8 @@
   "ignore": [
     ".codex/**",
     "packages/rfm/legacy/**",
-    "packages/server/defaults.d.mts"
+    "packages/server/defaults.d.mts",
+    "scripts/check-drive-rename.mjs"
   ],
   "ignoreDependencies": ["express", "ws", "yaml", "@roughdraft/rfm"],
   "ignoreIssues": {

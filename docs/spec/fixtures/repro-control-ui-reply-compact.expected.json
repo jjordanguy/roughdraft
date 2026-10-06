@@ -1,0 +1,34 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Needs a source.",
+      "status": null,
+      "anchors": [
+        "Alpha paragraph says the launch moves to May and nothing else changes."
+      ]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reply typed in the browser.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

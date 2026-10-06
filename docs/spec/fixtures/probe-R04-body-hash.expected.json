@@ -1,0 +1,35 @@
+{
+  "status": "recognized",
+  "ok": false,
+  "diagnostics": [
+    "warning legacy-inline-body",
+    "error endmatter-body-truncated"
+  ],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "standalone",
+      "parent": null,
+      "text": "Root",
+      "status": null,
+      "anchors": [""]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "standalone",
+      "parent": "c1",
+      "text": "See issue",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

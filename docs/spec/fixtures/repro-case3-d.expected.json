@@ -1,0 +1,39 @@
+{
+  "status": "absent",
+  "ok": false,
+  "diagnostics": [
+    "warning legacy-inline-body",
+    "error missing-endmatter-entry",
+    "warning replicated-comment"
+  ],
+  "summary": {
+    "comments": 2,
+    "roots": 2,
+    "documentComments": 0,
+    "replies": 0,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "The handoff between these two sentences is abrupt.",
+      "status": null,
+      "anchors": [
+        "a closing clause that runs on.",
+        "Second paragraph starts with a lead phrase"
+      ]
+    },
+    {
+      "id": "c2",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Reconciled both sections with the timeline doc and moved the date to June.",
+      "status": null,
+      "anchors": ["a closing clause that runs on."]
+    }
+  ]
+}

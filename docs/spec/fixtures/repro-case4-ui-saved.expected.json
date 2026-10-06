@@ -1,0 +1,26 @@
+{
+  "status": "absent",
+  "ok": false,
+  "diagnostics": [
+    "error inline-comment-blank-line",
+    "warning legacy-inline-body"
+  ],
+  "summary": {
+    "comments": 1,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 0,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "First point about scope.\n\nSecond point about timing.",
+      "status": null,
+      "anchors": ["two week pilot with three customers"]
+    }
+  ]
+}

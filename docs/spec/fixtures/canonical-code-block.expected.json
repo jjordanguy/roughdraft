@@ -1,0 +1,50 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": [],
+  "summary": {
+    "comments": 4,
+    "roots": 3,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c2",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Use the dev wrapper here.",
+      "status": null,
+      "anchors": ["`pnpm dev`"]
+    },
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "code",
+      "parent": null,
+      "text": "Read the port from the environment instead.",
+      "status": null,
+      "anchors": ["const port = 3000;\nstart({ port });"]
+    },
+    {
+      "id": "c3",
+      "kind": "comment",
+      "scope": "code",
+      "parent": null,
+      "text": "Name the module after what it does.",
+      "status": null,
+      "anchors": ["import { start } from \"./server\";"]
+    },
+    {
+      "id": "a1",
+      "kind": "reply",
+      "scope": "code",
+      "parent": "c1",
+      "text": "Changed both.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

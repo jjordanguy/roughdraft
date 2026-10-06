@@ -1,0 +1,59 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 4,
+    "roots": 1,
+    "documentComments": 1,
+    "replies": 2,
+    "suggestions": 1
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "standalone",
+      "parent": null,
+      "text": "Needs proof",
+      "status": null,
+      "anchors": [""]
+    },
+    {
+      "id": "s1",
+      "kind": "suggestion",
+      "scope": "inline",
+      "parent": null,
+      "text": "one example",
+      "status": null,
+      "anchors": ["one example"]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "standalone",
+      "parent": "c1",
+      "text": "Added a citation in the next paragraph.",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "c3",
+      "kind": "comment",
+      "scope": "document",
+      "parent": null,
+      "text": "Overall the plan is fine.",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "c4",
+      "kind": "reply",
+      "scope": "document",
+      "parent": "c3",
+      "text": "Thanks, I will keep it short.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

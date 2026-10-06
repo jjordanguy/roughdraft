@@ -1,0 +1,41 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 3,
+    "roots": 2,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Say how small: number of customers.",
+      "status": null,
+      "anchors": ["why the pilot is small"]
+    },
+    {
+      "id": "c2",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Name the person, not the team.",
+      "status": null,
+      "anchors": ["who signs off"]
+    },
+    {
+      "id": "c3",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reconciled both sections with the timeline doc and moved the date to June.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": [
+    "warning legacy-inline-body",
+    "warning orphan-endmatter-entry"
+  ],
+  "summary": {
+    "comments": 1,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 0,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "standalone",
+      "parent": null,
+      "text": "Root",
+      "status": null,
+      "anchors": [""]
+    }
+  ]
+}

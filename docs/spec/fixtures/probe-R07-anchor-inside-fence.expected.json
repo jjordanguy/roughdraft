@@ -1,0 +1,13 @@
+{
+  "status": "absent",
+  "ok": true,
+  "diagnostics": ["warning review-markup-in-code"],
+  "summary": {
+    "comments": 0,
+    "roots": 0,
+    "documentComments": 0,
+    "replies": 0,
+    "suggestions": 0
+  },
+  "items": []
+}

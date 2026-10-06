@@ -26,6 +26,7 @@ import {
   createCriticChange,
   createCriticComment,
   criticMarkdownHasReviewRail,
+  findReviewDelimiter,
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
   getCommentDescendantIds,
@@ -41,6 +42,7 @@ import {
   DocumentReviewRail,
   GlobalCommentsSection,
   getGlobalThreadRoots,
+  isGlobalSectionRoot,
 } from "./DocumentReviewRail";
 import {
   getPreferredCommentId,
@@ -84,6 +86,13 @@ export interface DocumentSaveController {
   flushSave: () => Promise<ManualSaveResult>;
 }
 
+// What the workspace asks of the review rail: Done saves an open global
+// comment draft first. False when a draft could not be saved (its text has
+// a review-markup delimiter); the composer stays open and says why.
+export interface DocumentReviewController {
+  saveOpenGlobalDrafts: () => boolean;
+}
+
 type EditorViewMode = "rich-text" | "code";
 export type DocumentInteractionMode = "viewing" | "suggesting" | "editing";
 
@@ -108,9 +117,24 @@ interface PageCardProps {
   // When set, the controller owns saving, the draft and disk updates; `page`
   // only gives the id and the content at mount.
   sync?: DocumentSync | null;
+  // A request from the Global comment button: the rich-text surface opens
+  // a draft at the top of the global section, then reports it handled.
+  globalCommentRequest?: number | null;
+  onGlobalCommentRequestHandled?: () => void;
+  onReviewControllerChange?: (
+    controller: DocumentReviewController | null,
+  ) => void;
 }
 
-interface PageCardEditorSurfaceProps {
+interface GlobalCommentProps {
+  globalCommentRequest?: number | null;
+  onGlobalCommentRequestHandled?: () => void;
+  onReviewControllerChange?: (
+    controller: DocumentReviewController | null,
+  ) => void;
+}
+
+interface PageCardEditorSurfaceProps extends GlobalCommentProps {
   page: Page;
   activeDocumentPath: string | null;
   selected: boolean;
@@ -137,7 +161,7 @@ interface RestoreSelectionRequest {
   to: number;
 }
 
-interface RichTextEditorSurfaceProps {
+interface RichTextEditorSurfaceProps extends GlobalCommentProps {
   page: Page;
   activeDocumentPath: string | null;
   selected: boolean;
@@ -763,6 +787,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   externalApplyRef,
   restoreSelection = null,
   notice = null,
+  globalCommentRequest = null,
+  onGlobalCommentRequestHandled,
+  onReviewControllerChange,
 }: RichTextEditorSurfaceProps) {
   const editorRef = useRef<Editor | null>(null);
   const criticChangeFrameRef = useRef<number | null>(null);
@@ -789,6 +816,11 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
   const [newCommentDraftIds, setNewCommentDraftIds] = useState<string[]>([]);
   // A comment on code was asked for on an older-format file.
   const [codeCommentRefused, setCodeCommentRefused] = useState(false);
+  // A global comment was asked for on an older-format file with no review
+  // block (nothing converts on save, so there is nowhere to put it).
+  const [globalCommentRefused, setGlobalCommentRefused] = useState(false);
+  // The text typed in each open composer (Done saves an open global draft).
+  const draftTextsRef = useRef(new Map<string, string>());
 
   const resolveFileUrl = useCallback(
     (path: string) => backend.resolveFileUrl(path),
@@ -1804,6 +1836,54 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     });
   }, [measureLayout]);
 
+  // The Global comment button: a draft card at the top of the global
+  // section. It has no anchor and is written only once it has text.
+  const addGlobalComment = useCallback(() => {
+    if (sourceRef.current.reviewError) return;
+    if (
+      sourceRef.current.reviewFormat === "legacy" &&
+      !sourceRef.current.endmatter
+    ) {
+      setGlobalCommentRefused(true);
+      return;
+    }
+    setGlobalCommentRefused(false);
+
+    const openDraft = [...commentsRef.current.values()].find(
+      (comment) =>
+        comment.scope === "document" &&
+        !comment.parentCommentId &&
+        !comment.source &&
+        comment.content.trim() === "",
+    );
+    const draft =
+      openDraft ??
+      createCriticComment(
+        { scope: "document" },
+        {
+          existingComments: reviewIdsInUse(
+            commentsRef.current,
+            sourceRef.current.reservedIds,
+          ),
+        },
+      );
+    if (!openDraft) {
+      const nextComments = new Map(commentsRef.current);
+      nextComments.set(draft.id, draft);
+      commentsRef.current = nextComments;
+      setComments(nextComments);
+    }
+    setNewCommentDraftIds((current) =>
+      current.includes(draft.id) ? current : [draft.id, ...current],
+    );
+    setSelectedChangeId(null);
+    setSelectedCommentId(draft.id);
+    setPendingFocusCommentId(draft.id);
+    requestAnimationFrame(() => {
+      measureLayout();
+    });
+  }, [measureLayout]);
+
   const handleSuggestDeletion = useCallback(() => {
     const currentEditor = editorRef.current;
     if (!currentEditor || currentEditor.state.selection.empty) return;
@@ -1934,6 +2014,11 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       setNewCommentDraftIds((current) =>
         current.filter((currentCommentId) => currentCommentId !== commentId),
       );
+      draftTextsRef.current.delete(commentId);
+      // A saved composer is done; it must not reopen for a pending focus.
+      setPendingFocusCommentId((current) =>
+        current === commentId ? null : current,
+      );
       emitMarkdownChange(undefined, nextComments);
     },
     [emitMarkdownChange],
@@ -1984,7 +2069,9 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         status: resolved ? "resolved" : null,
         resolved: resolved ? (current.resolved ?? null) : null,
       }));
-      if (!resolved) setSelectedCommentId(rootId);
+      // A resolved thread folds away into its section's "N resolved" row; a
+      // reopened one is selected where it comes back.
+      setSelectedCommentId(resolved ? null : rootId);
     },
     [updateComment],
   );
@@ -2158,9 +2245,15 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       return;
     }
 
-    if (!findCommentAnchorElement(currentEditor, commentId)) return;
+    const anchor = findCommentAnchorElement(currentEditor, commentId);
+    if (!anchor) return;
 
     currentEditor.commands.focus(undefined, { scrollIntoView: false });
+    // A code comment's card sits in the global section, away from its
+    // lines: bring the highlighted range into view.
+    if (commentsRef.current.get(commentId)?.scope === "code") {
+      anchor.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    }
   }, []);
 
   const focusSuggestion = useCallback((changeId: string) => {
@@ -2181,6 +2274,56 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     );
   }, []);
 
+  const rememberDraftText = useCallback((commentId: string, text: string) => {
+    draftTextsRef.current.set(commentId, text);
+  }, []);
+
+  // Done saves an open global comment draft first, as if Save were pressed:
+  // typed text is written, an empty draft is dropped.
+  const saveOpenGlobalDrafts = useCallback((): boolean => {
+    let saved = true;
+    for (const comment of [...commentsRef.current.values()]) {
+      if (comment.scope !== "document" || comment.parentCommentId) continue;
+      if (comment.source || comment.content.trim() !== "") continue;
+      const text = (draftTextsRef.current.get(comment.id) ?? "").trim();
+      if (!text) {
+        const withoutDraft = new Map(commentsRef.current);
+        withoutDraft.delete(comment.id);
+        commentsRef.current = withoutDraft;
+        setComments(withoutDraft);
+        setNewCommentDraftIds((current) =>
+          current.filter((commentId) => commentId !== comment.id),
+        );
+        continue;
+      }
+      if (findReviewDelimiter(text)) {
+        saved = false;
+        setSelectedCommentId(comment.id);
+        continue;
+      }
+      updateComment(comment.id, (current) => ({ ...current, content: text }));
+    }
+    return saved;
+  }, [updateComment]);
+
+  useEffect(() => {
+    onReviewControllerChange?.({ saveOpenGlobalDrafts });
+    return () => onReviewControllerChange?.(null);
+  }, [onReviewControllerChange, saveOpenGlobalDrafts]);
+
+  useEffect(() => {
+    if (!editor || globalCommentRequest === null) return;
+    if (interactionMode === "viewing") return;
+    onGlobalCommentRequestHandled?.();
+    addGlobalComment();
+  }, [
+    addGlobalComment,
+    editor,
+    globalCommentRequest,
+    interactionMode,
+    onGlobalCommentRequestHandled,
+  ]);
+
   const hasReviewRail =
     hasVisibleComments(comments) || criticChanges.length > 0;
   const documentShellRef =
@@ -2199,8 +2342,13 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
           getRootThreadIdForCommentId(commentId, comments) ?? commentId,
       ),
     ),
-  ].flatMap((rootId) => getThreadComments(rootId, comments));
-  const globalThreadRoots = getGlobalThreadRoots(comments);
+  ]
+    .filter((rootId) => {
+      const root = comments.get(rootId);
+      return !root || !isGlobalSectionRoot(root, comments);
+    })
+    .flatMap((rootId) => getThreadComments(rootId, comments));
+  const globalThreadRoots = getGlobalThreadRoots(comments, newCommentDraftIds);
   const hasFallbackThreads =
     activeThreadComments.length > 0 ||
     globalThreadRoots.open.length > 0 ||
@@ -2228,6 +2376,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         current === commentId ? null : current,
       );
     },
+    onDraftChange: rememberDraftText,
   };
   const contentCardClass =
     "rounded-[0.75rem] border border-[#E9E9E8] dark:border-slate-800 bg-white dark:bg-card shadow-[0_18px_44px_rgba(57,47,38,0.08)] dark:shadow-[0_18px_44px_rgba(0,0,0,0.35)]";
@@ -2281,6 +2430,16 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
               doctor --fix to convert this file.
             </div>
           ) : null}
+          {globalCommentRefused ? (
+            <div
+              data-testid="review-format-global-comment-message"
+              role="alert"
+              className="mb-4 rounded-[8px] border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm leading-5 text-amber-950 sm:px-4 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
+            >
+              Global comments need the current review format. Run roughdraft
+              doctor --fix to convert this file.
+            </div>
+          ) : null}
           {hasFallbackThreads ? (
             <div className={fallbackClass}>
               <GlobalCommentsSection
@@ -2288,7 +2447,8 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
                 handlers={fallbackThreadHandlers}
                 activeRootThreadId={activeRootThreadId}
                 variant="banner"
-                testId="document-comment-fallback-global"
+                testId="global-comments-fallback"
+                resolvedToggleTestId="global-comments-fallback-resolved-toggle"
               />
               {activeThreadComments.length > 0 ? (
                 <CommentEditorList
@@ -2390,6 +2550,7 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
               current === commentId ? null : current,
             );
           }}
+          onDraftChange={rememberDraftText}
           draftSuggestion={draftSuggestion}
           onDraftSuggestionTextChange={(text) => {
             setDraftSuggestion((current) =>
@@ -2496,6 +2657,9 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
   saveBlocked = false,
   forceResetKey = null,
   sync = null,
+  globalCommentRequest = null,
+  onGlobalCommentRequestHandled,
+  onReviewControllerChange,
 }: PageCardEditorSurfaceProps) {
   const initialContent = sync ? sync.draft : page.content;
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2888,6 +3052,9 @@ const PageCardEditorSurface = memo(function PageCardEditorSurface({
       onEditorReady={handleEditorReady}
       externalApplyRef={richTextApplyRef}
       restoreSelection={restoreSelection}
+      globalCommentRequest={globalCommentRequest}
+      onGlobalCommentRequestHandled={onGlobalCommentRequestHandled}
+      onReviewControllerChange={onReviewControllerChange}
     />
   );
 });
@@ -2980,6 +3147,9 @@ export function PageCard({
   saveBlocked,
   forceResetKey,
   sync,
+  globalCommentRequest,
+  onGlobalCommentRequestHandled,
+  onReviewControllerChange,
 }: PageCardProps) {
   const [saveState, setSaveState] = useState<DocumentSaveState>("saved");
 
@@ -3008,6 +3178,9 @@ export function PageCard({
         saveBlocked={saveBlocked}
         forceResetKey={forceResetKey}
         sync={sync}
+        globalCommentRequest={globalCommentRequest}
+        onGlobalCommentRequestHandled={onGlobalCommentRequestHandled}
+        onReviewControllerChange={onReviewControllerChange}
       />
     </div>
   );

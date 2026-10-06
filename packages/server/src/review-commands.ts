@@ -494,21 +494,30 @@ export async function runThreadCommand(
   const expectedHash = input.expectedVersion
     ? hashOfVersion(input.expectedVersion)
     : null;
-  const outcome = await transact(
-    link,
-    target,
-    async (current) => ({
-      result: applyReviewResponse({
-        base: current.content,
-        current: current.content,
-        response,
-        author,
-        agentLabels: agentLabelsFor(author),
-        now: nowIso(deps),
+  // The tab shows "AI editing..." for the second or two the write takes.
+  const quickRoundId = await openQuickRound(link, target, command);
+  let outcome: TransactionOutcome;
+  try {
+    outcome = await transact(
+      link,
+      target,
+      async (current) => ({
+        result: applyReviewResponse({
+          base: current.content,
+          current: current.content,
+          response,
+          author,
+          agentLabels: agentLabelsFor(author),
+          now: nowIso(deps),
+        }),
       }),
-    }),
-    { expectedHash },
-  );
+      { expectedHash },
+    );
+  } finally {
+    if (quickRoundId) {
+      await setRoundFlag(link, target, quickRoundId, "closed");
+    }
+  }
   const { report } = outcome.result;
   const id =
     command === "reply"
@@ -745,6 +754,34 @@ async function setRoundFlag(
   } catch {
     return "failed";
   }
+}
+
+/**
+ * Opens the round flag for one quick command (reply, resolve, accept,
+ * reject, note) and returns its round id, or null when there is no server or
+ * a real round already holds the flag: a quick command never replaces the
+ * flag of a `roughdraft round` that is open or stalled on the document.
+ */
+async function openQuickRound(
+  link: ServerLink | null,
+  target: DocTarget,
+  command: string,
+): Promise<string | null> {
+  if (!link) return null;
+  try {
+    const view = await apiRequest(link.api, "GET", "/api/documents/one", {
+      query: { projectPath: target.projectPath, path: target.relativePath },
+    });
+    const state = view.body?.round?.state;
+    if (view.status === 200 && (state === "open" || state === "stalled")) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const roundId = `quick-${command}-${crypto.randomBytes(4).toString("hex")}`;
+  const flag = await setRoundFlag(link, target, roundId, "open");
+  return flag === "open" ? roundId : null;
 }
 
 export async function startRound(

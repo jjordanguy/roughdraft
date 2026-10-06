@@ -376,8 +376,11 @@ test.describe("browser writer @batch3b", () => {
     await expect(page.getByTestId("comment-code-anchor-c1")).toHaveText(
       "const port = 3000;\nstart({ port });",
     );
+    // A code comment's card lives in the global section (batch 4).
     await expect(
-      page.getByTestId("document-review-rail").getByTestId("comment-thread-c1"),
+      page
+        .getByTestId("global-comments-section")
+        .getByTestId("global-comment-thread-c1"),
     ).toHaveCount(1);
   });
 

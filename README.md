@@ -85,6 +85,9 @@ That makes an agent-friendly workflow possible:
 5. You click **Done Reviewing** in Roughdraft, and the AI can respond to your comments or revise the document.
   
 
+To say something about the whole document, press **Global comment** next to Done. The comment opens at the top of the right rail (above the document on screens narrower than 1100px) and is stored like every other comment, as an entry with `scope: document` and no anchor. It works like any thread: the agent's reply shows under it, and you can reply, edit, resolve, reopen or delete it. Global comments are listed newest first, and resolved ones fold into one "N resolved" row at the bottom, the same as resolved inline comments. Comments on code blocks live in this section too, with the quoted lines. Done has no comment box of its own; if a global comment draft is open when you click Done, it is saved first. At the end of each round the agent leaves one global comment of its own (`roughdraft note`), shown as an AI card you can reply to or resolve. While an agent round is open (from `roughdraft round` until `apply`, or for the second a quick command such as `roughdraft reply` takes), the document shows an **AI editing...** badge with the elapsed time; after 30 minutes without `apply` it reads **AI round stalled** and can be dismissed. The document stays editable throughout.
+
+
 Agents can watch that handoff directly:
 
 ```bash

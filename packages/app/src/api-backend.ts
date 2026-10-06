@@ -3,6 +3,7 @@ import {
   type CompleteReviewOptions,
   type CompleteReviewResult,
   type HandoffRecord,
+  type RoundFlag,
   type HandoffWake,
   MarkdownFileConflictError,
   MarkdownFileNotFoundError,
@@ -49,6 +50,25 @@ function parseHandoffRecord(value: unknown): HandoffRecord | null {
     return null;
   }
   return value as unknown as HandoffRecord;
+}
+
+export function parseRoundFlag(value: unknown): RoundFlag | null {
+  if (!isRecord(value) || typeof value.roundId !== "string") return null;
+  if (
+    value.state !== "open" &&
+    value.state !== "stalled" &&
+    value.state !== "closed"
+  ) {
+    return null;
+  }
+  return {
+    roundId: value.roundId,
+    state: value.state,
+    openedAt: optionalString(value.openedAt) ?? "",
+    updatedAt: optionalString(value.updatedAt),
+    stalledAt: optionalString(value.stalledAt),
+    closedAt: optionalString(value.closedAt),
+  };
 }
 
 function parseSessionRecord(value: unknown): SessionRecord | null {
@@ -99,6 +119,7 @@ export function parseTabServerMessage(value: unknown): TabServerMessage | null {
         session: parseSessionRecord(value.session),
         handoff: parseHandoffRecord(value.handoff),
         latestSequence: optionalNumber(value.latestSequence),
+        round: parseRoundFlag(value.round),
       };
     }
     case "change": {
@@ -127,6 +148,10 @@ export function parseTabServerMessage(value: unknown): TabServerMessage | null {
     case "handoff": {
       const handoff = parseHandoffRecord(value.handoff);
       return handoff ? { type: "handoff", handoff } : null;
+    }
+    case "round": {
+      const round = parseRoundFlag(value.round);
+      return round ? { type: "round", round } : null;
     }
     case "open-request": {
       if (typeof value.url !== "string") return null;

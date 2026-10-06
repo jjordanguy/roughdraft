@@ -1,4 +1,3 @@
-import { appendRoughdraftDocumentComment } from "@roughdraft/rfm";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +21,7 @@ import {
   type HandoffRecord,
   MarkdownFileConflictError,
   type Page,
+  type RoundFlag,
   type SessionRecord,
   type StorageBackend,
   type TabChannelHandlers,
@@ -124,10 +124,12 @@ class TestServer {
     watchers = 0,
     session = null,
     handoff = null,
+    round = null,
   }: {
     watchers?: number;
     session?: SessionRecord | null;
     handoff?: HandoffRecord | null;
+    round?: RoundFlag | null;
   } = {}) {
     const channel = this.channels.at(-1);
     if (!channel) throw new Error("the tab never opened its channel");
@@ -148,6 +150,7 @@ class TestServer {
         session,
         handoff,
         latestSequence: null,
+        round,
       });
       await Promise.resolve();
     });
@@ -962,12 +965,9 @@ describe("review handoff watcher affordance", () => {
     };
   }
 
-  async function openOverallCommentPopover() {
-    await click(getByTestId(container, "review-handoff-comment-trigger"));
-    return getByTestId<HTMLTextAreaElement>(
-      document.body,
-      "review-handoff-overall-comment",
-    );
+  async function openStatusPopover() {
+    await click(getByTestId(container, "review-handoff-status-trigger"));
+    return getByTestId(document.body, "review-handoff-status");
   }
 
   function splitButton() {
@@ -1018,7 +1018,7 @@ describe("review handoff watcher affordance", () => {
     expect(doneButton.disabled).toBe(false);
     expect(splitButton().getAttribute("data-watcher-state")).toBe("none");
 
-    await openOverallCommentPopover();
+    await openStatusPopover();
 
     expect(
       getByTestId(document.body, "review-handoff-agent-status").textContent,
@@ -1044,7 +1044,7 @@ describe("review handoff watcher affordance", () => {
 
     expect(splitButton().getAttribute("data-watcher-state")).toBe("listening");
 
-    await openOverallCommentPopover();
+    await openStatusPopover();
 
     expect(
       getByTestId(document.body, "review-handoff-agent-status").textContent,
@@ -1108,9 +1108,7 @@ describe("review handoff watcher affordance", () => {
       );
 
     await renderWorkspace({ watchers: 0, onCompleteReview });
-    const textarea = await openOverallCommentPopover();
-    await change(textarea, "Tighten the intro.");
-    await click(getByTestId(document.body, "review-handoff-submit-comment"));
+    await click(getByTestId(container, "review-handoff-button"));
 
     const button = getByTestId<HTMLButtonElement>(
       container,
@@ -1226,26 +1224,17 @@ describe("review handoff watcher affordance", () => {
     ).toContain("Done, waiting");
   });
 
-  it("retries a failed Done with the same handoff id so the overall comment is written once", async () => {
-    // A fake server that records the overall comment once per handoff id,
-    // like the batch 1 server. The first answer is lost after the write.
-    const writtenComments = new Map<string, string>();
+  it("retries a failed Done with the same handoff id", async () => {
     let calls = 0;
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
-      .mockImplementation(async (options) => {
+      .mockImplementation(async () => {
         calls += 1;
-        const id = options?.handoffId ?? "";
-        if (!writtenComments.has(id) && options?.overallComment) {
-          writtenComments.set(id, options.overallComment);
-        }
         if (calls === 1) throw new Error("connection reset");
         return { delivered: false, pending: true };
       });
 
     await renderWorkspace({ watchers: 0, onCompleteReview });
-    const textarea = await openOverallCommentPopover();
-    await change(textarea, "Tighten the intro.");
     await click(getByTestId(container, "review-handoff-button"));
     await settle();
 
@@ -1268,8 +1257,7 @@ describe("review handoff watcher affordance", () => {
       ([options]) => options,
     );
     expect(second?.handoffId).toBe(first?.handoffId);
-    expect(second?.overallComment).toBe("Tighten the intro.");
-    expect([...writtenComments.values()]).toEqual(["Tighten the intro."]);
+    expect(second?.overallComment).toBeUndefined();
     expect(
       getByTestId(container, "review-handoff-button").textContent,
     ).toContain("Done, waiting");
@@ -1323,55 +1311,33 @@ describe("review handoff watcher affordance", () => {
     ).toBe(false);
   });
 
-  it("clears the overall comment on a 2xx even when nobody received the Done", async () => {
+  it("has no comment box in the Done dropdown, only the status", async () => {
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
       .mockResolvedValue({ delivered: false, pending: true });
+    await renderWorkspace({ watchers: 1, onCompleteReview });
 
-    const { server } = await renderWorkspace({
-      watchers: 0,
-      onCompleteReview,
-    });
-    const textarea = await openOverallCommentPopover();
-    await change(textarea, "Tighten the intro.");
-    await click(getByTestId(document.body, "review-handoff-submit-comment"));
-    await settle();
-
-    expect(onCompleteReview).toHaveBeenCalledOnce();
-    expect(onCompleteReview.mock.calls[0]?.[0]).toMatchObject({
-      overallComment: "Tighten the intro.",
-    });
-
-    // A new document version from disk (the agent replied) returns the button
-    // to ready. The field must be empty so a second Done cannot repeat it.
-    server.write("Hello again");
-    await server.send({
-      type: "change",
-      seq: server.version,
-      exists: true,
-      available: true,
-      version: `v${server.version}`,
-      contentHash: localContentHash(server.content),
-      origin: "outside",
-    });
-    await server.send({ type: "watchers", count: 1 });
-    await settle();
-
+    const status = await openStatusPopover();
+    expect(status.textContent).not.toContain("Submit with comment");
     expect(
-      getByTestId(container, "review-handoff-button").textContent,
-    ).toContain("Approve");
-    const reopened = await openOverallCommentPopover();
-    expect(reopened.value).toBe("");
+      queryByTestId(document.body, "review-handoff-overall-comment"),
+    ).toBeNull();
+    expect(
+      queryByTestId(document.body, "review-handoff-submit-comment"),
+    ).toBeNull();
+    expect(getByTestId(status, "review-handoff-agent-status").textContent).toBe(
+      "Your agent is waiting",
+    );
+    expect(
+      getByTestId(container, "review-handoff-status-trigger").getAttribute(
+        "aria-label",
+      ),
+    ).toBe("Review status");
 
     await click(getByTestId(container, "review-handoff-button"));
     await settle();
-
-    expect(onCompleteReview).toHaveBeenCalledTimes(2);
-    const [first, second] = onCompleteReview.mock.calls.map(
-      ([options]) => options,
-    );
-    expect(second?.overallComment).toBeUndefined();
-    expect(second?.handoffId).not.toBe(first?.handoffId);
+    expect(onCompleteReview).toHaveBeenCalledOnce();
+    expect(onCompleteReview.mock.calls[0]?.[0]?.overallComment).toBeUndefined();
   });
 
   it("disables Done with a reason while the file is in conflict", async () => {
@@ -1401,7 +1367,7 @@ describe("review handoff watcher affordance", () => {
     );
     const commentTrigger = getByTestId<HTMLButtonElement>(
       container,
-      "review-handoff-comment-trigger",
+      "review-handoff-status-trigger",
     );
 
     await click(doneReviewingButton);
@@ -1428,69 +1394,64 @@ describe("review handoff watcher affordance", () => {
     ).toContain("No agent received this");
   });
 
-  it("submits an overall comment from the handoff popover and shows it in the global section", async () => {
+  it("Done saves an open global comment draft first and it stays in the global section", async () => {
+    let contentAtDone: string | null = null;
     let server: TestServer | null = null;
-    // The server writes the overall comment into the file as a document
-    // comment (rfm's writer, as the real Done route does).
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
-      .mockImplementation(async (options) => {
-        if (server && options?.overallComment) {
-          server.write(
-            appendRoughdraftDocumentComment(server.content, {
-              message: options.overallComment,
-              author: "user",
-              at: "2026-10-05T15:42:00.000Z",
-            }),
-          );
-        }
+      .mockImplementation(async () => {
+        contentAtDone = server?.content ?? null;
         return { delivered: true };
       });
-
     const rendered = await renderWorkspace({ watchers: 1, onCompleteReview });
     server = rendered.server;
 
-    const textarea = await openOverallCommentPopover();
-    expect(textarea.getAttribute("placeholder")).toBe("Overall comment");
-
-    await change(textarea, "  Please prioritize the CLI contract.  ");
-    await click(getByTestId(document.body, "review-handoff-submit-comment"));
+    await click(getByTestId(container, "global-comment-add"));
     await settle();
-
-    expect(onCompleteReview).toHaveBeenCalledWith(
-      expect.objectContaining({
-        overallComment: "Please prioritize the CLI contract.",
-        handoffId: expect.any(String),
-      }),
+    const editor = getByTestId<HTMLTextAreaElement>(
+      container,
+      "comment-rail-c1-editor",
     );
+    expect(editor.getAttribute("placeholder")).toBe(
+      "Comment on the whole document",
+    );
+    await change(editor, "  Please prioritize the CLI contract.  ");
 
-    // The comment reaches the tab as an outside change and stays visible.
+    // The pointer leaves the draft for the Done button, as a click does.
     await act(async () => {
-      await rendered.sync.resync();
+      getByTestId(container, "review-handoff-button").dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true }),
+      );
     });
-    await settle();
-    const thread = getByTestId(container, "document-comment-thread-c1");
-    expect(thread.textContent).toContain("Please prioritize the CLI contract.");
-  });
-
-  it("includes an overall comment when finishing from the primary handoff button", async () => {
-    const onCompleteReview = vi
-      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
-      .mockResolvedValue({ delivered: true });
-
-    await renderWorkspace({ watchers: 1, onCompleteReview });
-
-    const textarea = await openOverallCommentPopover();
-    await change(textarea, "  Please prioritize the CLI contract.  ");
     await click(getByTestId(container, "review-handoff-button"));
     await settle();
 
-    expect(onCompleteReview).toHaveBeenCalledWith(
-      expect.objectContaining({
-        overallComment: "Please prioritize the CLI contract.",
-        handoffId: expect.any(String),
-      }),
+    expect(onCompleteReview).toHaveBeenCalledOnce();
+    expect(onCompleteReview.mock.calls[0]?.[0]?.overallComment).toBeUndefined();
+    // The draft reached disk before the Done was sent.
+    expect(contentAtDone).toMatch(
+      / {2}c1:\n {4}body: "Please prioritize the CLI contract\."\n {4}by: user\n {4}at: "[^"\n]+"\n {4}scope: document\n/,
     );
+    const thread = getByTestId(container, "global-comment-thread-c1");
+    expect(thread.textContent).toContain("Please prioritize the CLI contract.");
+    expect(queryByTestId(container, "comment-rail-c1-editor")).toBeNull();
+  });
+
+  it("Done drops an empty global comment draft and writes nothing for it", async () => {
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockResolvedValue({ delivered: true });
+    const { server } = await renderWorkspace({ watchers: 1, onCompleteReview });
+
+    await click(getByTestId(container, "global-comment-add"));
+    await settle();
+    expect(queryByTestId(container, "global-comment-thread-c1")).not.toBeNull();
+    await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+
+    expect(onCompleteReview).toHaveBeenCalledOnce();
+    expect(server.content).toBe("Hello world");
+    expect(queryByTestId(container, "global-comment-thread-c1")).toBeNull();
   });
 
   it("keeps visible sent feedback after the watcher receives the event", async () => {
@@ -1595,5 +1556,236 @@ describe("review handoff watcher affordance", () => {
     await click(getByTestId(document.body, "review-handoff-close-window"));
 
     expect(closeWindow).toHaveBeenCalled();
+  });
+  describe("Global comment button", () => {
+    it("shows one Global comment button next to Done for a local document", async () => {
+      await renderWorkspace({ watchers: 0 });
+
+      const button = getByTestId(container, "global-comment-add");
+      expect(button.textContent).toBe("Global comment");
+      // It sits in the fixed stack, before the Done split button.
+      const stack = getByTestId(container, "document-status-stack");
+      const order = [
+        ...stack.querySelectorAll<HTMLElement>("[data-testid]"),
+      ].map((element) => element.dataset.testid);
+      expect(order.indexOf("global-comment-add")).toBeLessThan(
+        order.indexOf("review-handoff-split-button"),
+      );
+    });
+
+    it("is not shown outside a local files document", async () => {
+      await renderWorkspace({ watchers: 0, backendKind: "local-storage" });
+      expect(queryByTestId(container, "global-comment-add")).toBeNull();
+    });
+
+    it("opens a draft at the top of the global section, newest first, and Save writes a document entry", async () => {
+      const { server } = await renderWorkspace({
+        watchers: 0,
+        content: [
+          "Body text.",
+          "",
+          "---",
+          "comments:",
+          "  c1:",
+          '    body: "Older note."',
+          "    by: user",
+          '    at: "2026-10-05T09:00:00.000Z"',
+          "",
+        ].join("\n"),
+      });
+
+      await click(getByTestId(container, "global-comment-add"));
+      await settle();
+      const section = getByTestId(container, "global-comments-section");
+      const cards = [
+        ...section.querySelectorAll<HTMLElement>(
+          '[data-testid^="global-comment-thread-"]',
+        ),
+      ].map((card) => card.dataset.testid);
+      expect(cards).toEqual([
+        "global-comment-thread-c2",
+        "global-comment-thread-c1",
+      ]);
+
+      const editor = getByTestId<HTMLTextAreaElement>(
+        section,
+        "comment-rail-c2-editor",
+      );
+      await change(editor, "Tighten the intro.");
+      vi.useFakeTimers();
+      await click(getByTestId(section, "comment-rail-c2-action-save"));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(600);
+      });
+
+      expect(server.content.split("\n---\n")[0]).toBe("Body text.\n");
+      expect(server.content).toMatch(
+        / {2}c2:\n {4}body: "Tighten the intro\."\n {4}by: user\n {4}at: "[^"\n]+"\n {4}scope: document\n/,
+      );
+      for (const view of [
+        getByTestId(container, "global-comments-section"),
+        getByTestId(container, "global-comments-fallback"),
+      ]) {
+        const card = getByTestId(view, "global-comment-thread-c2");
+        expect(card.textContent).toContain("Tighten the intro.");
+        expect(queryByTestId(card, "comment-rail-c2-editor")).toBeNull();
+        expect(queryByTestId(card, "comment-banner-c2-editor")).toBeNull();
+      }
+    });
+
+    it("discards an empty draft on Escape and never writes it", async () => {
+      const { server } = await renderWorkspace({ watchers: 0 });
+
+      await click(getByTestId(container, "global-comment-add"));
+      await settle();
+      const editor = getByTestId<HTMLTextAreaElement>(
+        container,
+        "comment-rail-c1-editor",
+      );
+      await act(async () => {
+        editor.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+        await Promise.resolve();
+      });
+      await settle();
+
+      expect(queryByTestId(container, "global-comment-thread-c1")).toBeNull();
+      expect(server.saves).toEqual([]);
+      expect(server.content).toBe("Hello world");
+    });
+
+    it("reuses the open draft when pressed twice", async () => {
+      await renderWorkspace({ watchers: 0 });
+
+      await click(getByTestId(container, "global-comment-add"));
+      await settle();
+      await click(getByTestId(container, "global-comment-add"));
+      await settle();
+
+      const section = getByTestId(container, "global-comments-section");
+      expect(getByTestId(section, "global-comment-thread-c1")).not.toBeNull();
+      expect(queryByTestId(section, "global-comment-thread-c2")).toBeNull();
+    });
+
+    it("switches code view to rich text and opens the draft", async () => {
+      const server = new TestServer({ kind: "local-files" });
+      const sync = createSync(server);
+      const modes: DocumentEditorViewMode[] = [];
+      const render = async (mode: DocumentEditorViewMode) => {
+        await act(async () => {
+          root.render(
+            <DocumentWorkspace
+              sync={sync}
+              activeDocumentPath="test.md"
+              documentCopyPath="test.md"
+              documentFilenameLabel="test.md"
+              documentEditorViewMode={mode}
+              onDocumentEditorViewModeChange={(next) => {
+                modes.push(next);
+              }}
+              backend={server.backend()}
+            />,
+          );
+          await Promise.resolve();
+        });
+      };
+      await render("code");
+      await server.hello({ watchers: 0 });
+
+      await click(getByTestId(container, "global-comment-add"));
+      expect(modes).toEqual(["rich-text"]);
+      await render("rich-text");
+      await settle();
+
+      expect(
+        getByTestId<HTMLTextAreaElement>(container, "comment-rail-c1-editor")
+          .placeholder,
+      ).toBe("Comment on the whole document");
+    });
+  });
+
+  describe("AI editing badge", () => {
+    function round(overrides: Partial<RoundFlag> = {}): RoundFlag {
+      return {
+        roundId: "r-1",
+        state: "open",
+        openedAt: new Date(Date.now() - 65_000).toISOString(),
+        updatedAt: null,
+        stalledAt: null,
+        closedAt: null,
+        ...overrides,
+      };
+    }
+
+    it("shows nothing with no round", async () => {
+      await renderWorkspace({ watchers: 0 });
+      expect(queryByTestId(container, "ai-round-badge")).toBeNull();
+    });
+
+    it("says AI editing with the elapsed time while the round is open, and the editor stays editable", async () => {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+      vi.setSystemTime(new Date("2026-10-06T10:00:00.000Z"));
+      const { server } = await renderWorkspace();
+      await server.hello({
+        watchers: 1,
+        round: round({ openedAt: "2026-10-06T09:58:55.000Z" }),
+      });
+
+      const badge = getByTestId(container, "ai-round-badge");
+      expect(badge.dataset.roundState).toBe("open");
+      expect(badge.textContent).toContain("AI editing...");
+      expect(getByTestId(badge, "ai-round-elapsed").textContent).toBe("1:05");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(getByTestId(badge, "ai-round-elapsed").textContent).toBe("1:15");
+      // A badge, never a lock.
+      expect(
+        container
+          .querySelector('[data-testid="rich-text-editor"] .ProseMirror')
+          ?.getAttribute("contenteditable"),
+      ).toBe("true");
+    });
+
+    it("turns into a dismissable stalled badge, and disappears when the round closes", async () => {
+      const { server } = await renderWorkspace({ watchers: 0 });
+      await server.send({ type: "round", round: round() });
+      expect(getByTestId(container, "ai-round-badge").dataset.roundState).toBe(
+        "open",
+      );
+
+      await server.send({
+        type: "round",
+        round: round({
+          state: "stalled",
+          stalledAt: new Date().toISOString(),
+        }),
+      });
+      const stalled = getByTestId(container, "ai-round-badge");
+      expect(stalled.dataset.roundState).toBe("stalled");
+      expect(stalled.textContent).toContain("AI round stalled");
+      await click(getByTestId(stalled, "ai-round-badge-dismiss"));
+      expect(queryByTestId(container, "ai-round-badge")).toBeNull();
+
+      // A new round shows again.
+      await server.send({
+        type: "round",
+        round: round({ roundId: "r-2", openedAt: new Date().toISOString() }),
+      });
+      expect(getByTestId(container, "ai-round-badge").dataset.roundState).toBe(
+        "open",
+      );
+      await server.send({
+        type: "round",
+        round: round({
+          roundId: "r-2",
+          state: "closed",
+          closedAt: new Date().toISOString(),
+        }),
+      });
+      expect(queryByTestId(container, "ai-round-badge")).toBeNull();
+    });
   });
 });

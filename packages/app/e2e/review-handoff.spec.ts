@@ -27,7 +27,7 @@ test.describe("review handoff", () => {
     removeMarkdownProject(projectDir);
   });
 
-  test("persists an overall handoff comment from the primary done button to YAML endmatter @smoke", async ({
+  test("a global comment typed before Done reaches the file and the watcher @smoke", async ({
     page,
     request,
   }) => {
@@ -37,7 +37,7 @@ test.describe("review handoff", () => {
       ["# Handoff Comment", "", "Review this document.", ""].join("\n"),
     );
     const relativePath = "handoff-comment.md";
-    const overallComment = "Please prioritize the CLI contract.";
+    const globalComment = "Please prioritize the CLI contract.";
 
     pendingWatch = request.post("/api/review-events/watch", {
       data: {
@@ -50,10 +50,13 @@ test.describe("review handoff", () => {
     await openMarkdownFile(page, filePath);
     await expect(page.getByTestId("review-handoff-button")).toBeVisible();
 
-    await page.getByTestId("review-handoff-comment-trigger").click();
+    // The Done button has no comment box any more (batch 4): the comment is
+    // a global comment, and Done saves an open draft before it hands off.
+    await page.getByTestId("global-comment-add").click();
     await page
-      .getByTestId("review-handoff-overall-comment")
-      .fill(overallComment);
+      .getByTestId("global-comments-section")
+      .getByTestId("comment-rail-c1-editor")
+      .fill(globalComment);
     await page.getByTestId("review-handoff-button").click();
 
     // A legacy long-poll watcher acknowledges the Done as soon as it returns,
@@ -65,7 +68,7 @@ test.describe("review handoff", () => {
     await expect
       .poll(() => readProjectFile(projectDir, relativePath))
       .toMatch(
-        // The server writes it with rfm's canonical writer (batch 3b).
+        // The browser writes it with rfm's canonical writer.
         /---\ncomments:\n {2}c1:\n {4}body: "Please prioritize the CLI contract\."\n {4}by: user\n {4}at: "[^"\n]+"\n {4}scope: document\n$/,
       );
 
@@ -74,11 +77,11 @@ test.describe("review handoff", () => {
     expect(payload.events).toHaveLength(1);
     expect(payload.events[0]).toMatchObject({
       type: "review.completed",
-      overallComment,
       summary: {
         comments: 1,
       },
     });
+    expect(payload.events[0].overallComment ?? null).toBeNull();
   });
 
   test("reopens the sent handoff status from the muted primary button", async ({
@@ -293,7 +296,7 @@ test.describe("review handoff", () => {
     );
   });
 
-  test("Done with an overall comment and no watcher, then a second Done, leaves one comment in the file @batch2-server", async ({
+  test("Done with a global comment and no watcher, then a second Done, leaves one comment in the file @batch2-server", async ({
     page,
   }) => {
     const filePath = writeProjectFile(
@@ -302,13 +305,15 @@ test.describe("review handoff", () => {
       ["# One Comment", "", "Review this document.", ""].join("\n"),
     );
     const relativePath = "one-comment.md";
-    const overallComment = "Please tighten the intro.";
+    const globalComment = "Please tighten the intro.";
 
+    // From code view the button switches to rich text and opens the draft.
     await openMarkdownFile(page, filePath, "code");
-    await page.getByTestId("review-handoff-comment-trigger").click();
+    await page.getByTestId("global-comment-add").click();
     await page
-      .getByTestId("review-handoff-overall-comment")
-      .fill(overallComment);
+      .getByTestId("global-comments-section")
+      .getByTestId("comment-rail-c1-editor")
+      .fill(globalComment);
     await page.getByTestId("review-handoff-button").click();
 
     await expect(page.getByTestId("review-handoff-button")).toHaveText(
@@ -316,22 +321,21 @@ test.describe("review handoff", () => {
     );
     await expect
       .poll(() => readProjectFile(projectDir, relativePath))
-      .toContain(`body: "${overallComment}"`);
-    // Wait until the tab has loaded the server's write, so the edit below
-    // does not race it into a "changed on disk" conflict.
-    await expect(codeEditor(page)).toContainText(overallComment);
+      .toContain(`body: "${globalComment}"`);
     await page.keyboard.press("Escape");
 
-    // An edit returns the button to ready; the overall comment field must be
-    // empty, so the second Done cannot repeat the comment.
+    // An edit returns the button to ready; the second Done has no comment
+    // to repeat (the Done button has no comment box).
+    await page.getByTestId("document-editor-view-toggle").click();
     await appendInCodeEditor(page, "\nSecond round.\n");
     await expect(page.getByTestId("review-handoff-button")).toHaveText(
       "I'm done",
     );
-    await page.getByTestId("review-handoff-comment-trigger").click();
+    await page.getByTestId("review-handoff-status-trigger").click();
+    await expect(page.getByTestId("review-handoff-status")).toBeVisible();
     await expect(
       page.getByTestId("review-handoff-overall-comment"),
-    ).toHaveValue("");
+    ).toHaveCount(0);
     await page.keyboard.press("Escape");
     await page.getByTestId("review-handoff-button").click();
     await expect(page.getByTestId("review-handoff-button")).toHaveText(
@@ -339,6 +343,6 @@ test.describe("review handoff", () => {
     );
 
     const finalContent = readProjectFile(projectDir, relativePath);
-    expect(finalContent.split(`body: "${overallComment}"`)).toHaveLength(2);
+    expect(finalContent.split(`body: "${globalComment}"`)).toHaveLength(2);
   });
 });

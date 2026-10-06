@@ -86,6 +86,18 @@ export interface SaveMarkdownFileOptions {
   tabId?: string;
 }
 
+// The "AI editing" flag of a document (batch 3b round route): `roughdraft
+// round` and every quick command open it, `apply` closes it, and an open
+// round turns `stalled` after 30 minutes without `apply`.
+export interface RoundFlag {
+  roundId: string;
+  state: "open" | "stalled" | "closed";
+  openedAt: string;
+  updatedAt: string | null;
+  stalledAt: string | null;
+  closedAt: string | null;
+}
+
 // Tab channel wire types (batch 2 contract, "Tab channel").
 export type TabServerMessage =
   | {
@@ -97,6 +109,8 @@ export type TabServerMessage =
       session: SessionRecord | null;
       handoff: HandoffRecord | null;
       latestSequence: number | null;
+      // Null when no round was seen (or the server predates rounds).
+      round: RoundFlag | null;
     }
   | {
       type: "change";
@@ -111,6 +125,7 @@ export type TabServerMessage =
     }
   | { type: "watchers"; count: number }
   | { type: "handoff"; handoff: HandoffRecord }
+  | { type: "round"; round: RoundFlag }
   | { type: "open-request"; requestId: string; url: string }
   | { type: "ping"; seq: number };
 

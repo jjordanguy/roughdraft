@@ -158,6 +158,81 @@ describe("document comment layout helpers", () => {
     ]);
   });
 
+  it("builds one thread per root from the comment map, at its first anchor", () => {
+    // `c1` spans two blocks (two anchors carrying the root id); its reply
+    // `a1` lives only in the map, as a reply stored in the review block does.
+    const comments = createCommentsMap([
+      {
+        id: "c1",
+        content: "Split these checks by owner.",
+        createdAt: "2026-10-04T19:00:26.505Z",
+      },
+      {
+        id: "a1",
+        content: "Split into creator and ops checks.",
+        createdAt: "2026-10-04T20:00:00.000Z",
+        authorType: "ai",
+        parentCommentId: "c1",
+      },
+      {
+        id: "c2",
+        content: "Second root",
+        createdAt: "2026-10-04T21:00:00.000Z",
+      },
+    ]);
+
+    const items = buildCommentThreadRailItems(
+      [
+        { key: "c1", commentIds: ["c1"], anchorTop: 300, anchorBottom: 320 },
+        {
+          key: "c1::c2",
+          commentIds: ["c1", "c2"],
+          anchorTop: 120,
+          anchorBottom: 140,
+        },
+      ],
+      comments,
+      { excludeRootIds: new Set(["c9"]) },
+    );
+
+    expect(items).toEqual([
+      {
+        key: "c1",
+        anchorGroupKey: "c1::c2",
+        rootCommentId: "c1",
+        commentIds: ["c1", "a1"],
+        anchorTop: 120,
+        anchorBottom: 140,
+      },
+      {
+        key: "c2",
+        anchorGroupKey: "c1::c2",
+        rootCommentId: "c2",
+        commentIds: ["c2"],
+        anchorTop: 120,
+        anchorBottom: 140,
+      },
+    ]);
+  });
+
+  it("leaves out roots shown elsewhere (suggestion cards, the global section)", () => {
+    const comments = createCommentsMap([
+      {
+        id: "c1",
+        content: "On a suggestion",
+        createdAt: "2026-10-04T19:00:00Z",
+      },
+    ]);
+
+    expect(
+      buildCommentThreadRailItems(
+        [{ key: "c1", commentIds: ["c1"], anchorTop: 10, anchorBottom: 20 }],
+        comments,
+        { excludeRootIds: new Set(["c1"]) },
+      ),
+    ).toEqual([]);
+  });
+
   it("expands a shared anchor into one rail item per root thread", () => {
     const comments = createCommentsMap([
       {

@@ -1,9 +1,15 @@
 import { tables, taskListItems } from "@joplin/turndown-plugin-gfm";
+import {
+  type RfmEndmatterStatus,
+  type RfmYamlError,
+  type RoughdraftDocumentSplit,
+  splitRoughdraftDocument,
+} from "@roughdraft/rfm";
 import { marked } from "marked";
 import TurndownService from "turndown";
-import { parse as parseYaml } from "yaml";
 
 export const rawMarkdownBlockAttribute = "data-markdown-raw-block";
+export const looseListAttribute = "data-loose";
 
 export interface MarkdownOptions {
   resolveFileUrl?: (path: string) => string | null;
@@ -19,6 +25,8 @@ export interface YamlDocumentMetadataSplit {
   frontmatter: string | null;
   body: string;
   endmatter: string | null;
+  status: RfmEndmatterStatus;
+  yamlError: RfmYamlError | null;
 }
 
 function isExternalUrl(path: string): boolean {
@@ -176,46 +184,6 @@ function isYamlFrontmatterDelimiter(line: string): boolean {
   return /^(?:---|\.\.\.)[ \t]*$/.test(line.replace(/\r$/, ""));
 }
 
-function isReviewEndmatterMap(value: unknown): boolean {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function hasDocumentLevelComment(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-
-  return Object.values(value as Record<string, unknown>).some(
-    (entry) =>
-      Boolean(entry) &&
-      typeof entry === "object" &&
-      !Array.isArray(entry) &&
-      typeof (entry as Record<string, unknown>).body === "string" &&
-      typeof (entry as Record<string, unknown>).by === "string" &&
-      typeof (entry as Record<string, unknown>).at === "string" &&
-      typeof (entry as Record<string, unknown>).re !== "string",
-  );
-}
-
-function isRoughdraftReviewEndmatter(endmatter: string): boolean {
-  const yamlText = endmatter.replace(/^---[ \t]*(?:\r\n|\n)/, "");
-  let parsed: unknown;
-
-  try {
-    parsed = parseYaml(yamlText);
-  } catch {
-    return false;
-  }
-
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return false;
-  }
-
-  const record = parsed as Record<string, unknown>;
-  return (
-    isReviewEndmatterMap(record.comments) ||
-    isReviewEndmatterMap(record.suggestions)
-  );
-}
-
 export function splitYamlFrontmatter(markdown: string): YamlFrontmatterSplit {
   const openingDelimiter = markdown.match(/^---[ \t]*(?:\r\n|\n)/);
   if (!openingDelimiter) return { frontmatter: null, body: markdown };
@@ -265,36 +233,30 @@ export function prependYamlFrontmatter(
   return frontmatter ? `${frontmatter}${markdown}` : markdown;
 }
 
+// The one split rule, shared with rfm, the doctor and the agent tools: a final
+// `---` block is the review block when it is review-shaped and recognized.
+// An `invalid` block (unparsable YAML, a duplicate key, two review blocks) is
+// still kept out of the body, so the editor never shows it as prose and the
+// serializer never flattens it.
 export function splitYamlDocumentMetadata(
   markdown: string,
 ): YamlDocumentMetadataSplit {
-  const { frontmatter, body } = splitYamlFrontmatter(markdown);
-  const matches = [...body.matchAll(/\n---[ \t]*\r?\n/g)];
-  const match = matches.at(-1);
+  return yamlDocumentMetadataFromSplit(splitRoughdraftDocument(markdown));
+}
 
-  if (!match || match.index === undefined) {
-    return { frontmatter, body, endmatter: null };
-  }
-
-  const endmatter = body.slice(match.index);
-  const candidate = endmatter.replace(/^\n/, "");
-
-  const precedingBody = body.slice(0, match.index);
-  if (!isRoughdraftReviewEndmatter(candidate)) {
-    return { frontmatter, body, endmatter: null };
-  }
-  if (!precedingBody.includes("{#")) {
-    const yamlText = candidate.replace(/^---[ \t]*(?:\r\n|\n)/, "");
-    const parsed = parseYaml(yamlText) as Record<string, unknown> | null;
-    if (!hasDocumentLevelComment(parsed?.comments)) {
-      return { frontmatter, body, endmatter: null };
-    }
-  }
+export function yamlDocumentMetadataFromSplit(
+  split: RoughdraftDocumentSplit,
+): YamlDocumentMetadataSplit {
+  const keepsBlockOut =
+    split.endmatter !== null &&
+    (split.status === "recognized" || split.status === "invalid");
 
   return {
-    frontmatter,
-    body: body.slice(0, match.index).replace(/\s*$/, "\n"),
-    endmatter: candidate,
+    frontmatter: split.frontmatter,
+    body: keepsBlockOut ? split.body.replace(/\s*$/, "\n") : split.body,
+    endmatter: keepsBlockOut ? split.endmatter : null,
+    status: split.status,
+    yamlError: split.yamlError,
   };
 }
 
@@ -357,7 +319,12 @@ export function createMarkedRenderer(options?: MarkdownOptions) {
   renderer.list = function (token) {
     const hasTaskItems = token.items.some((item) => item.task);
     if (!hasTaskItems) {
-      return baseRenderer.list.call(this, token);
+      const html = baseRenderer.list.call(this, token);
+      // The editor wraps every item in a paragraph, so it cannot tell a
+      // tight list from a loose one; the attribute carries it to the save.
+      return token.loose
+        ? html.replace(/^<(ul|ol)\b/, `<$1 ${looseListAttribute}="true"`)
+        : html;
     }
 
     const items = token.items
@@ -370,13 +337,25 @@ export function createMarkedRenderer(options?: MarkdownOptions) {
       })
       .join("");
 
-    return `<ul data-type="taskList">${items}</ul>`;
+    return `<ul data-type="taskList"${
+      token.loose ? ` ${looseListAttribute}="true"` : ""
+    }>${items}</ul>`;
   };
 
   return renderer;
 }
 
-export function createTurndownService(): TurndownService {
+export interface TurndownServiceOptions {
+  /**
+   * Write list items the way earlier Roughdraft builds did (every item
+   * followed by a line of two spaces), so files they saved keep their bytes.
+   */
+  legacyListSpacing?: boolean;
+}
+
+export function createTurndownService(
+  serviceOptions: TurndownServiceOptions = {},
+): TurndownService {
   const service = new TurndownService({
     headingStyle: "atx",
     codeBlockStyle: "fenced",
@@ -400,23 +379,41 @@ export function createTurndownService(): TurndownService {
   service.addRule("compactListItem", {
     filter: "li",
     replacement(content, node, options) {
-      const trimmed = content
-        .replace(/^\n+/, "")
-        .replace(/\n+$/, "\n")
-        .replace(/\n/gm, "\n  ");
-
-      let prefix = `${options.bulletListMarker} `;
       const parent = node.parentNode;
+      let prefix = `${options.bulletListMarker} `;
       if (parent && parent.nodeName === "OL") {
         const start = (parent as HTMLOListElement).getAttribute("start");
         const index = Array.prototype.indexOf.call(parent.children, node);
         prefix = `${start ? Number(start) + index : index + 1}. `;
       }
 
+      if (serviceOptions.legacyListSpacing) {
+        const legacy = content
+          .replace(/^\n+/, "")
+          .replace(/\n+$/, "\n")
+          .replace(/\n/gm, "\n  ");
+        return (
+          prefix +
+          legacy +
+          (node.nextSibling && !/\n$/.test(legacy) ? "\n" : "")
+        );
+      }
+
+      // A tight list keeps one item per line; a loose one a blank line
+      // between items. Continuation lines are indented under the marker and
+      // a blank line inside an item carries no trailing spaces.
+      const loose =
+        parent instanceof HTMLElement &&
+        parent.getAttribute(looseListAttribute) === "true";
+      let body = content.replace(/^\n+/, "").replace(/\s+$/, "");
+      if (!loose) body = body.replace(/\n{2,}/g, "\n");
+      const trimmed = body
+        .split("\n")
+        .map((line, index) => (index === 0 || line === "" ? line : `  ${line}`))
+        .join("\n");
+
       return (
-        prefix +
-        trimmed +
-        (node.nextSibling && !/\n$/.test(trimmed) ? "\n" : "")
+        prefix + trimmed + (node.nextSibling ? (loose ? "\n\n" : "\n") : "")
       );
     },
   });
@@ -536,13 +533,59 @@ const turndown = createTurndownService();
  * producing a more compact output that round-trips with fewer
  * gratuitous whitespace changes.
  */
-export function normalizeBlockSpacing(md: string): string {
+export function normalizeBlockSpacing(
+  md: string,
+  options?: { looseHeadings?: boolean },
+): string {
   let normalized = md.replace(/\n{3,}/g, "\n\n");
+  // A file written with a blank line around every heading keeps them.
+  if (options?.looseHeadings) return normalized;
   // Remove blank line immediately before a heading.
   normalized = normalized.replace(/\n\n(#{1,6} )/g, "\n$1");
   // Remove blank line immediately after a heading line.
   normalized = normalized.replace(/(^#{1,6} [^\n]+)\n\n/gm, "$1\n");
   return normalized;
+}
+
+/**
+ * True when every ATX heading outside code has a blank line (or the start or
+ * end of the text) on both sides, the style agents and most editors write.
+ * The browser's own writer keeps headings tight, so a body with no headings,
+ * or any tight heading, stays on that default.
+ */
+export function usesLooseHeadingSpacing(body: string): boolean {
+  const lines = body.split(/\r?\n/);
+  let fence: string | null = null;
+  let headings = 0;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1] ?? "";
+      if (fence === null) fence = marker;
+      else if (marker[0] === fence[0] && marker.length >= fence.length) {
+        fence = null;
+      }
+      continue;
+    }
+    if (fence !== null || !/^#{1,6} /.test(line)) continue;
+
+    headings += 1;
+    const previous = lines[index - 1];
+    const next = lines[index + 1];
+    if (previous !== undefined && previous.trim() !== "") return false;
+    if (next !== undefined && next.trim() !== "" && index + 1 < lines.length) {
+      return false;
+    }
+  }
+
+  return headings > 0;
+}
+
+/** A list item followed by a line of exactly two spaces: what earlier builds wrote. */
+export function usesLegacyListSpacing(body: string): boolean {
+  return /^[ \t]*(?:[-*+]|\d+[.)]) [^\n]*\n {2}$/m.test(body);
 }
 
 export function toMarkdown(html: string): string {

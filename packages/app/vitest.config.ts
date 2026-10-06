@@ -5,6 +5,10 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
+      // Tests read rfm from source, so they never run against a stale build.
+      "@roughdraft/rfm": fileURLToPath(
+        new URL("../rfm/src/index.ts", import.meta.url),
+      ),
     },
   },
   test: {

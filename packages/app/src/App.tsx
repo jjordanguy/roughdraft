@@ -1518,6 +1518,7 @@ export function App() {
   documentSaveStateRef.current = documentSaveState;
 
   const applyDocumentPage = useCallback((nextDocument: Page) => {
+    documentPageRef.current = nextDocument;
     setDocumentPage(nextDocument);
     documentDraftContentRef.current = nextDocument.content;
   }, []);
@@ -1799,17 +1800,20 @@ export function App() {
         currentDocument.id.split("/").at(-1) || currentDocument.id;
       const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
 
-      const savedDocument = (await currentBackend.saveMarkdownFile(
-        currentPath,
-        content,
-        expectedVersion,
-      )) ?? {
-        ...currentDocument,
-        content,
-        title,
-      };
-
-      applyDocumentPage(savedDocument);
+      // The editor flushed its own save before this call. Only write again
+      // when the draft still differs from what the page already holds.
+      if (content !== currentDocument.content) {
+        const savedDocument = (await currentBackend.saveMarkdownFile(
+          currentPath,
+          content,
+          expectedVersion,
+        )) ?? {
+          ...currentDocument,
+          content,
+          title,
+        };
+        applyDocumentPage(savedDocument);
+      }
       documentDirtyRef.current = false;
       setDocumentDiskChangeState("clean");
 

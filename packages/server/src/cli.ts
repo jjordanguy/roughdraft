@@ -1645,6 +1645,24 @@ async function findReusableServer(
       };
     }
 
+    const versionInfo = statusPayload
+      ? describeServerVersion(statusPayload)
+      : null;
+    if (pidRunning && statusPayload && !versionInfo?.versionMatches) {
+      // The tracked process is alive but runs another version (for example
+      // the previous release installed at another path). Keep its state file
+      // so stop and restart still find it, and report the mismatch.
+      return {
+        port: persistedState.port,
+        url: buildPublicBaseUrl(persistedState.port),
+        tracked: true,
+        pid: persistedState.pid,
+        startedAt: persistedState.startedAt,
+        ...describeServerVersion(statusPayload),
+        versionMatches: false,
+      };
+    }
+
     removeServerStateFile(stateFilePath);
 
     if (statusPayload && matchesServerRoot(statusPayload)) {

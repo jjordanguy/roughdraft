@@ -1845,6 +1845,58 @@ describe("cli", () => {
     expect(status.versionMatches).toBe(false);
   });
 
+  it("keeps server.json and refuses when the tracked server was installed elsewhere", async () => {
+    const stateFilePath = path.join(stateDir, "server.json");
+    fs.mkdirSync(path.dirname(stateFilePath), { recursive: true });
+    fs.writeFileSync(
+      stateFilePath,
+      JSON.stringify({
+        port: ROUGHDRAFT_DEFAULT_PORT,
+        pid: 515151,
+        startedAt: new Date().toISOString(),
+        url: `http://localhost:${ROUGHDRAFT_DEFAULT_PORT}`,
+      }),
+    );
+    const errors: string[] = [];
+    const deps = createCliDependencies({
+      env: { ...process.env, ROUGHDRAFT_STATE_DIR: stateDir },
+      cwd: projectDir,
+      fetchImpl: async (input) => {
+        const url =
+          input instanceof URL
+            ? input
+            : new URL(
+                typeof input === "string" ? input : input.url,
+                "http://localhost",
+              );
+        if (url.pathname === "/api/status") {
+          return new Response(
+            JSON.stringify({
+              backend: "local-files",
+              pid: 515151,
+              port: ROUGHDRAFT_DEFAULT_PORT,
+              projectDir,
+              serverRoot: "/opt/homebrew/lib/node_modules/roughdraft",
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        throw new Error("connect ECONNREFUSED");
+      },
+      log: () => {},
+      error: (message) => errors.push(message),
+      resolveUpdateStatus: noUpdateStatus,
+      spawnServerProcess: async () => {
+        throw new Error("should not spawn beside another install's server");
+      },
+      isProcessRunning: (pid) => pid === 515151,
+    });
+
+    expect(await runCli(["start"], deps)).toBe(3);
+    expect(errors[0]).toContain("older than 0.2.0");
+    expect(fs.existsSync(stateFilePath)).toBe(true);
+  });
+
   it("treats a server without a version as older and refuses it", async () => {
     const errors: string[] = [];
     const deps = createCliDependencies({

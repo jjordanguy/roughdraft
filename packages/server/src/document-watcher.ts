@@ -1,6 +1,12 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  type AtomicWriteOptions,
+  type WriteMode,
+  writeFileAtomic,
+  writeModeFromEnv,
+} from "./atomic-write.js";
 import { documentKey } from "./registry.js";
 
 /**
@@ -77,6 +83,10 @@ export interface DocumentWatcherOptions {
   releaseMs?: number;
   /** Parent-directory `fs.watch`. Default true; tests turn it off to prove the poll. */
   fsWatch?: boolean;
+  /** Temp file plus rename (default), or in place. Default: `ROUGHDRAFT_WRITE_MODE`. */
+  writeMode?: WriteMode;
+  /** Test seam: runs inside a write after the temp file is synced, before the last hash check. */
+  beforeWriteCommit?: AtomicWriteOptions["beforeCommit"];
 }
 
 export const WATCH_POLL_MS = 1_000;
@@ -308,6 +318,8 @@ export class DocumentWatcher {
   private readonly rehashMs: number;
   private readonly releaseMs: number;
   private readonly fsWatch: boolean;
+  private readonly writeMode: WriteMode;
+  private readonly beforeWriteCommit: AtomicWriteOptions["beforeCommit"];
   private nextEpoch = 1;
 
   constructor(options: DocumentWatcherOptions = {}) {
@@ -315,6 +327,8 @@ export class DocumentWatcher {
     this.rehashMs = options.rehashMs ?? WATCH_REHASH_MS;
     this.releaseMs = options.releaseMs ?? WATCH_RELEASE_MS;
     this.fsWatch = options.fsWatch ?? true;
+    this.writeMode = options.writeMode ?? writeModeFromEnv();
+    this.beforeWriteCommit = options.beforeWriteCommit;
   }
 
   /** The last known state without touching the disk. */
@@ -410,37 +424,66 @@ export class DocumentWatcher {
     content: string,
     options: { expectedHash: string | null; tabId?: string | null },
   ): Promise<WriteResult> {
-    return this.mutate(filePath, () => content, options);
+    return this.mutate(filePath, () => content, {
+      ...options,
+      // The content does not depend on what was read: an unconditional write
+      // stays unconditional.
+      recheck: options.expectedHash !== null,
+    });
   }
 
-  /** Read, transform and write under the document lock. */
+  /**
+   * Read, transform and write under the document lock. The write is atomic
+   * (see `atomic-write.ts`) and checks right before the rename that the file
+   * still holds what the transform read: writers outside Roughdraft do not
+   * take this lock. When it moved, a caller with `expectedHash` gets a
+   * conflict; a plain transform runs again on the new content (three tries).
+   */
   mutate(
     filePath: string,
     transform: (current: string) => string,
-    options: { expectedHash?: string | null; tabId?: string | null } = {},
+    options: {
+      expectedHash?: string | null;
+      tabId?: string | null;
+      recheck?: boolean;
+    } = {},
   ): Promise<WriteResult> {
     const entry = this.entryFor(filePath);
     return entry.lock.run(async () => {
-      const snapshot = await readSnapshot(entry.filePath);
-      const current = this.apply(entry, snapshot);
-      if (!snapshot.exists) return { status: "missing", read: current };
-      if (!snapshot.bytes) return { status: "unavailable", read: current };
+      for (let attempt = 1; ; attempt += 1) {
+        const snapshot = await readSnapshot(entry.filePath);
+        const current = this.apply(entry, snapshot);
+        if (!snapshot.exists) return { status: "missing", read: current };
+        if (!snapshot.bytes) return { status: "unavailable", read: current };
 
-      const bytes = Buffer.from(transform(current.content ?? ""), "utf8");
-      if (bytes.equals(snapshot.bytes)) {
-        return { status: "unchanged", read: current };
-      }
-      const expectedHash = options.expectedHash ?? null;
-      if (expectedHash !== null && expectedHash !== snapshot.contentHash) {
-        return { status: "conflict", read: current };
-      }
+        const bytes = Buffer.from(transform(current.content ?? ""), "utf8");
+        if (bytes.equals(snapshot.bytes)) {
+          return { status: "unchanged", read: current };
+        }
+        const expectedHash = options.expectedHash ?? null;
+        if (expectedHash !== null && expectedHash !== snapshot.contentHash) {
+          return { status: "conflict", read: current };
+        }
 
-      this.rememberOwnWrite(entry, sha256(bytes), options.tabId ?? null);
-      await fs.promises.writeFile(entry.filePath, bytes);
-      return {
-        status: "written",
-        read: this.apply(entry, await readSnapshot(entry.filePath)),
-      };
+        const hash = sha256(bytes);
+        this.rememberOwnWrite(entry, hash, options.tabId ?? null);
+        const written = await writeFileAtomic(entry.filePath, bytes, {
+          mode: this.writeMode,
+          expectedHash: options.recheck === false ? null : snapshot.contentHash,
+          beforeCommit: this.beforeWriteCommit,
+        });
+        if (written.status === "written") {
+          return {
+            status: "written",
+            read: this.apply(entry, await readSnapshot(entry.filePath)),
+          };
+        }
+        entry.ownWrites.delete(hash);
+        const moved = this.apply(entry, await readSnapshot(entry.filePath));
+        if (expectedHash !== null || attempt >= 3) {
+          return { status: "conflict", read: moved };
+        }
+      }
     });
   }
 

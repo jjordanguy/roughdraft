@@ -82,7 +82,7 @@ describe("DocumentRegistry", () => {
     expect(registry.tabCount(plan.key)).toBe(1);
   });
 
-  it("drops an idle document after an hour with nothing connected", () => {
+  it("drops an idle document after an hour when it never had a session or a Done", () => {
     registry.recordVersion(plan, "v1");
 
     clock += DOCUMENT_IDLE_MS - 1;
@@ -92,6 +92,24 @@ describe("DocumentRegistry", () => {
     clock += 1;
     registry.sweep();
     expect(registry.view(plan.key)).toBeNull();
+  });
+
+  it("keeps the log entry of a document that had a Done, even after it is acknowledged", () => {
+    const reviewed = identityFor("/docs/reviewed.md");
+    const record = registry.log.recordHandoff(reviewed, {
+      handoffId: "h-keep",
+      version: "v1",
+      summary: { comments: 1, replies: 0, suggestions: 0, unresolved: 1 },
+      overallComment: null,
+      wakeRouteId: null,
+    });
+    registry.log.acknowledge(record, "test");
+
+    clock += DOCUMENT_IDLE_MS * 2;
+    registry.sweep();
+
+    expect(registry.view(reviewed.key)).not.toBeNull();
+    expect(registry.view(reviewed.key)?.pendingHandoffs).toBe(0);
   });
 
   it("keeps an idle document while a watcher is connected or a Done is pending", () => {

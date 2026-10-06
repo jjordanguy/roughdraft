@@ -214,8 +214,9 @@ export class DocumentRegistry {
       }
     }
     for (const document of this.log.all()) {
-      if (this.isIdle(document, now)) {
-        this.presence.delete(document.key);
+      if (!this.isIdle(document, now)) continue;
+      this.presence.delete(document.key);
+      if (document.session === null && document.handoffs.length === 0) {
         this.log.remove(document.key);
       }
     }

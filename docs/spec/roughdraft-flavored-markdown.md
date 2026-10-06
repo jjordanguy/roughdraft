@@ -10,7 +10,7 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this docu
 
 This specification defines the review markup that Roughdraft reads and writes. It does not define a replacement for Markdown, a hosted document format, a sync protocol, or a project database.
 
-A conforming document is a Markdown document that may contain Roughdraft review spans. Markdown parsing SHOULD follow CommonMark with GitHub Flavored Markdown extensions. Implementations MAY preserve YAML frontmatter as document metadata. Roughdraft review state lives in the same Markdown file, either as inline review anchors or as final YAML endmatter.
+A conforming document is a Markdown document that may contain Roughdraft review spans. Markdown parsing SHOULD follow CommonMark with GitHub Flavored Markdown extensions. Implementations MAY preserve YAML frontmatter as document metadata. Roughdraft review state lives in the same Markdown file: markers in the prose and one YAML review block at the end. [Canonical Review Format](#canonical-review-format) is the shape every writer produces; the sections after it describe the CriticMarkup grammar the markers use and the older inline forms readers still accept.
 
 ## Canonical Review Format
 
@@ -72,8 +72,8 @@ suggestions:
 ### Anchors
 
 - **Prose anchor**: `{==highlighted text==}{#c1}`. No comment text inline. A highlight MAY carry several refs.
-- **Continuation anchors**: a comment over several blocks has one prose anchor per block, all with the same id. The first in document order is the primary anchor. Readers show one thread whose highlight covers every anchor.
-- **Code block anchor**: the opening fence line carries the ref after the info string, `` ```ts {#c1} ``, one or more refs separated by spaces. The entry records `lines: [start, end]` (1-based, inclusive, counted inside the block) and `quote` (the highlighted lines joined with a newline). Nothing inside the fence is review markup. Inline code keeps a normal prose anchor around the backticks: ``{==`pnpm dev`==}{#c2}``.
+- **Continuation anchors**: a comment over several blocks (paragraphs, list items, headings, table cells) has one prose anchor per block, every one carrying the same id, and a single entry in the review block. The first anchor in document order is the primary anchor: it decides where the thread sits in the comment rail and in the round list. Readers show one thread whose highlight covers every anchor, and a reply belongs to the thread, not to one segment. Deleting one segment's text removes that anchor only; when every anchor is gone the entry becomes a lost anchor (see [Document-level comments](#document-level-comments)). Writers never repeat the comment text per block; that older replicated form is listed under [Legacy Forms](#legacy-forms).
+- **Code block anchor**: the opening fence line carries the ref after the info string, `` ```ts {#c1} ``, one or more refs separated by spaces. The entry records `lines: [start, end]`, 1-based and inclusive, counted from the first line inside the fence (the fence lines are not counted), and `quote`, those lines joined with a newline (written with the `\n` escape inside the double-quoted value). Readers show `quote` as the highlighted text. When `quote` is missing they take the lines from the block; when `lines` points past the end of the block they ignore it. An entry that keeps its `quote` after the fence ref was deleted shows with the document-level comments, quoting the lines it was about. Nothing inside the fence is review markup. Inline code keeps a normal prose anchor around the backticks: ``{==`pnpm dev`==}{#c2}``.
 - **Standalone comment**: a bare `{#c1}` immediately after the text it follows, with no highlight. It shows as an anchorless card at that spot. A bare ref counts only when its id is a key in the review block or has the Roughdraft id shape (`c`, `a` or `s` followed by digits), so Pandoc heading ids such as `{#intro}` stay plain text.
 
 ### Document-level comments
@@ -82,28 +82,36 @@ A document-level (global) comment is an entry with `body`, no anchor anywhere in
 
 ### Suggestions
 
-Suggestions keep their inline form, one marker per block: `{++text++}{#s1}`, `{--text--}{#s1}`, `{~~old~>new~~}{#s1}`. A suggestion over several blocks is one marker per block, each with its own id, and every later part's entry carries `continues: <first id>`. Suggestion entries keep `by`, `at`, and optionally `status` and `resolved`. Every `suggestions` entry needs a marker in the text.
+Suggestions keep their inline form, one marker per block: `{++text++}{#s1}`, `{--text--}{#s1}`, `{~~old~>new~~}{#s1}`. A suggestion over several blocks (or several lines) is one marker per block, each with its own id, and every later part's entry carries `continues: <first id>`; the first part has no `continues`. Readers and the round list treat the parts as one suggestion under the first id, and deciding it (accept or reject) settles every part. Suggestion entries keep `by`, `at`, and optionally `status` and `resolved`. Every `suggestions` entry needs a marker in the text.
 
 ### Entries
 
 | Key | Meaning |
 | --- | --- |
-| `body` | Comment text. A line break is stored as `<br>` and read back as a line break. |
+| `body` | Comment text, on one line. A line break is stored as `<br>` ([Line breaks](#line-breaks)). |
 | `by` | Author label. `user` for the person reviewing, `AI` for an agent. |
 | `at` | ISO 8601 date-time with `T` and `Z` or an offset. |
 | `re` | Parent comment or suggestion id. A non-empty string; any other value is an error (`re-not-string`). |
 | `status` | `resolved` or absent. |
 | `resolved` | Short resolution summary, `<br>` for line breaks. |
-| `scope` | `document` for an explicit document-level comment. |
-| `lines` | Code comments: `[start, end]` inside the block. |
+| `scope` | `document` on a document-level comment. Writers write no other value. Readers take every other comment's scope from its anchor (`inline`, `code` or `standalone`), so an anchored entry is never document-level whatever `scope` says. |
+| `lines` | Code comments: `[start, end]`, 1-based and inclusive, inside the block. |
 | `quote` | Code comments: the highlighted lines joined with a newline. |
-| `continues` | Suggestions: the id of the suggestion this part continues. |
+| `continues` | Suggestions: the id of the first part of a suggestion split over several blocks, on every later part. |
 
 Unknown keys MUST be preserved. Replies live only in the review block: an entry with `body`, `by`, `at` and `re`.
 
+### Line breaks
+
+A line break inside `body` or `resolved` is stored as `<br>`, so every value stays on one line. Writers turn each `\r\n`, `\r` and `\n` in those two fields into `<br>`; readers turn `<br>`, `<br/>` and `<br />`, in any case, back into a line break. There is no escape, so comment text cannot show the characters `<br>` themselves. `quote` uses the `\n` escape instead, and no other field holds a line break. In the prose, writers never put a line break inside a highlight: a highlight over several lines is one highlight per line under the same id.
+
 ### Ids
 
-`cN` for comments of every kind, `sN` for suggestions, `aN` for agent-written replies and notes. Ids are unique across refs, attribute blocks, legacy blocks and every key of both maps.
+- `cN`: comments of every kind (anchored, code, standalone, document-level), and replies written by the person reviewing.
+- `sN`: suggestions, one id per marker.
+- `aN`: every entry an agent writes, replies and the round note alike. Readers treat an `aN` entry as agent-written whatever its `by` says (`AI`, or an agent's own label such as `Mike`).
+
+Ids are unique across refs, attribute blocks, legacy blocks and every key of both maps. A writer takes the next number after the largest id in use with the same letter. Because the browser writes only `cN` and `sN` and agents write only `aN`, an id an agent creates cannot collide with one an open tab is creating.
 
 ### Writing the review block
 
@@ -197,7 +205,7 @@ The agent edits the clean text and answers each thread with a reply, a resolutio
 
 ## Canonical Markers
 
-Roughdraft uses these CriticMarkup-compatible markers:
+Roughdraft uses these CriticMarkup-compatible markers. Canonical files use the highlight and the three suggestion markers; the comment marker appears only in older files.
 
 ```markdown
 {>>comment<<}
@@ -211,7 +219,9 @@ An implementation MUST treat the opening and closing marker pairs as review deli
 
 Implementations MUST treat review markers inside inline code spans and fenced code blocks as literal example text. They MUST NOT create comments, suggestions, or highlights from those code contexts.
 
-## Comments
+## Inline Comments (older files)
+
+This section and the next describe how older files wrote comment text inline. Readers MUST accept these forms; writers MUST NOT produce them (see [Legacy Forms](#legacy-forms)). A canonical file keeps every comment's text in the review block.
 
 A comment is written as:
 
@@ -233,7 +243,7 @@ comments:
     at: "2026-04-28T12:00:00.000Z"
 ```
 
-## Anchored Comments
+## Anchored Inline Comments (older files)
 
 An anchored comment is a highlight immediately followed by one or more comment blocks:
 
@@ -256,7 +266,7 @@ comments:
 
 The highlighted text is the visible anchor. Implementations SHOULD attach all immediately following comment blocks to the same anchor until another token interrupts the sequence.
 
-A standalone highlight is valid CriticMarkup. Roughdraft 0.1 reserves it as review syntax, but standalone highlights are not required to produce a review-thread item unless an implementation explicitly supports highlight-only annotations.
+A standalone highlight with no ref is valid CriticMarkup. Roughdraft reserves it as review syntax but does not make a review item from it.
 
 ## Suggestions
 
@@ -310,7 +320,7 @@ suggestions:
     at: "2026-04-28T12:07:00.000Z"
 ```
 
-Trailing comment blocks after a suggestion attach discussion to that suggestion:
+A reply to a suggestion is an entry with `re: <suggestion id>`:
 
 ```markdown
 Add {++one concrete example++}{#s1}.
@@ -330,7 +340,7 @@ suggestions:
 
 ## Metadata
 
-Roughdraft's preferred metadata format is a compact inline reference backed by final YAML endmatter:
+Roughdraft's metadata format is a compact inline reference backed by the review block at the end of the file:
 
 ```ebnf
 reference = "{#" id "}"
@@ -338,31 +348,35 @@ id        = ALPHA *( ALPHA / DIGIT / "_" / "-" )
 ```
 
 ```markdown
-Please revisit {==this sentence==}{>>Needs a source.<<}{#c1}.
+Please revisit {==this sentence==}{#c1}.
 
 ---
 comments:
   c1:
+    body: "Needs a source."
     by: user
     at: "2026-04-28T12:00:00.000Z"
 ```
 
-Root comment bodies and suggestion text stay inline so their anchors remain portable. Replies live entirely in endmatter because their `re` field already points at a parent id:
+Comment text lives in the entry, never in the prose. Replies live only in the review block, because their `re` field already points at a parent id:
 
 ```markdown
-Please revisit {==this sentence==}{>>Needs a source.<<}{#c1}.
+Please revisit {==this sentence==}{#c1}.
 
 ---
 comments:
   c1:
+    body: "Needs a source."
     by: user
     at: "2026-04-28T12:00:00.000Z"
-  c2:
-    body: I can add one from the intro.
+  a1:
+    body: "I added one from the intro."
     by: AI
     at: "2026-04-28T12:05:00.000Z"
     re: c1
 ```
+
+Older files kept the comment text inline, `{==this sentence==}{>>Needs a source.<<}{#c1}`, with an entry holding only `by` and `at`. Readers accept that form (`legacy-inline-body` warning) and `roughdraft doctor --fix` moves the text into the entry.
 
 Suggested-change metadata lives under `suggestions:`:
 
@@ -376,7 +390,7 @@ suggestions:
     at: "2026-04-28T12:05:00.000Z"
 ```
 
-For compatibility, readers also accept the older inline attribute block written immediately after a comment or suggestion:
+Readers also accept the older inline attribute block written immediately after a comment or suggestion. Writers no longer produce it:
 
 ```ebnf
 metadata  = "{" 1*attribute "}"
@@ -400,39 +414,39 @@ Known metadata attributes:
 Example:
 
 ```markdown
-{>>Needs a source.<<}{#c1}
-
----
-comments:
-  c1:
-    by: user
-    at: "2026-04-28T12:00:00.000Z"
+{>>Needs a source.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}
 ```
 
-Implementations SHOULD generate simple document-local ids. Roughdraft uses `c1`, `c2`, and so on for comments and `s1`, `s2`, and so on for suggestions. Implementations MUST preserve unknown valid attributes or YAML keys when possible, but they MUST NOT require unknown metadata for correct review rendering.
+Implementations SHOULD generate simple document-local ids as described under [Ids](#ids). Implementations MUST preserve unknown valid attributes or YAML keys when possible, but they MUST NOT require unknown metadata for correct review rendering.
 
-For compatibility, readers MAY accept legacy comment metadata of the form `{@id:c1; by:AI; at:2026-04-28T12:00:00.000Z@}`. Writers SHOULD emit compact references plus YAML endmatter for new review data.
+For compatibility, readers MAY accept legacy comment metadata of the form `{@id:c1; by:AI; at:2026-04-28T12:00:00.000Z@}`. Writers MUST emit compact references plus the review block for new review data.
 
 ## Threads
 
-Threading is represented by `re`.
+Threading is represented by `re`. A reply may answer the root or another reply; readers show every reply under the thread's root, in time order.
 
 ```markdown
-Review {==this sentence==}{>>Needs a source.<<}{#c1}.
+Review {==this sentence==}{#c1}.
 
 ---
 comments:
   c1:
+    body: "Needs a source."
     by: user
     at: "2026-04-28T12:00:00.000Z"
-  c2:
-    body: I can add one from the intro.
+  a1:
+    body: "I can add one from the intro."
     by: AI
     at: "2026-04-28T12:05:00.000Z"
     re: c1
+  c2:
+    body: "Please do."
+    by: user
+    at: "2026-04-28T12:07:00.000Z"
+    re: a1
 ```
 
-A reply whose `re` points to a missing id SHOULD be treated as a top-level comment. A comment MUST NOT be its own parent.
+A reply whose `re` points to a missing id SHOULD be treated as a top-level comment (`missing-reply-target` warning). A comment MUST NOT be its own parent. Resolving a thread sets `status: resolved` (and optionally `resolved`) on the root entry; its replies stay.
 
 ## Parsing And Round Trips
 
@@ -447,36 +461,49 @@ Round trips SHOULD preserve:
 - Raw review marker text inside code contexts.
 - Metadata values, including escaped quotes and backslashes.
 
-When importing a valid comment or suggestion without metadata, an implementation MAY synthesize missing `id`, `by`, and `at` values on write.
+When importing a valid comment or suggestion without metadata, an implementation MAY synthesize missing `id`, `by`, and `at` values on write. Roughdraft's own writers change nothing outside the review data they were asked to write, and write the review block in the fixed shape described under [Writing the review block](#writing-the-review-block).
 
 ## Review Interchange JSON
 
-The Markdown file is the normative storage format. For APIs, tests, and integrations, implementations MAY expose a review index JSON document that follows [`roughdraft-flavored-markdown.schema.json`](./roughdraft-flavored-markdown.schema.json).
+The Markdown file is the normative storage format. For APIs, tests and integrations, implementations MAY expose a review index. The reference implementation's index (`extractRoughdraftReviewIndex` in `packages/rfm`, returned by the `roughdraft_get_review_index` MCP tool) has `format`, `version: "0.2"`, `items`, `diagnostics` and `summary`. Each item carries `id`, `kind` (`comment`, `reply` or `suggestion`), `parentId`, `author`, `createdAt`, `status`, `text` (with line breaks decoded), `scope`, `anchors` (every continuation anchor or suggestion part, each with its text and line), `lines`, `quote`, `continues`, `resolved` and `lostAnchor`.
 
-The review index intentionally does not replace a Markdown AST. It indexes Roughdraft review annotations while leaving block parsing to the Markdown implementation.
+The review index does not replace a Markdown AST. It indexes Roughdraft review annotations while leaving block parsing to the Markdown implementation.
 
-Example:
+Example, for the file under [Metadata](#metadata) with one reply:
 
 ```json
 {
   "format": "roughdraft-flavored-markdown",
-  "version": "0.1",
-  "source": {
-    "markdown": "Please revisit {==this sentence==}{>>Needs a source.<<}{#c1}.\\n\\n---\\ncomments:\\n  c1:\\n    by: user\\n    at: \"2026-04-28T12:00:00.000Z\"\\n"
-  },
-  "comments": [
+  "version": "0.2",
+  "items": [
     {
       "id": "c1",
-      "body": "Needs a source.",
-      "by": "user",
-      "at": "2026-04-28T12:00:00.000Z",
-      "anchor": {
-        "text": "this sentence"
-      }
+      "kind": "comment",
+      "parentId": null,
+      "author": "user",
+      "createdAt": "2026-04-28T12:00:00.000Z",
+      "status": null,
+      "text": "Needs a source.",
+      "scope": "inline",
+      "anchorText": "this sentence",
+      "lines": null,
+      "quote": null,
+      "continues": null,
+      "resolved": null,
+      "lostAnchor": false
+    },
+    {
+      "id": "a1",
+      "kind": "reply",
+      "parentId": "c1",
+      "author": "AI",
+      "text": "I added one from the intro.",
+      "scope": "inline"
     }
-  ],
-  "suggestions": []
+  ]
 }
 ```
 
-Conformance fixtures live in [`fixtures/`](./fixtures/). A parser that claims Roughdraft Flavored Markdown 0.1 support SHOULD pass those examples or document any intentional differences.
+Offsets, line numbers, `anchors`, `diagnostics` and `summary` are left out of the example, and the reply is shortened. The JSON Schema in [`roughdraft-flavored-markdown.schema.json`](./roughdraft-flavored-markdown.schema.json) describes the earlier interchange shape (separate `comments` and `suggestions` lists) and has not been updated to `items` yet.
+
+Conformance fixtures live in [`fixtures/`](./fixtures/). A parser that claims Roughdraft Flavored Markdown 0.2 support SHOULD pass those examples or document any intentional differences. The `canonical-*` fixtures are the canonical shape; the others are older forms readers accept.

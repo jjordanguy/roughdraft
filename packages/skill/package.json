@@ -2,5 +2,8 @@
   "name": "@roughdraft/skill",
   "version": "0.1.0",
   "private": true,
-  "description": "Claude Code skill for Roughdraft"
+  "description": "Claude Code skill for Roughdraft",
+  "files": [
+    "SKILL.md"
+  ]
 }

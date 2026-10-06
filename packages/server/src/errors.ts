@@ -8,7 +8,6 @@
  * 130 and 143 SIGINT and SIGTERM.
  */
 
-export const EXIT_OK = 0;
 export const EXIT_INTERNAL = 1;
 export const EXIT_USAGE = 2;
 export const EXIT_SERVER = 3;

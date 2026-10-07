@@ -5,16 +5,17 @@ import {
   CodeXml,
   Copy,
   Eye,
+  FilePlus2,
   Loader2,
   MessageSquarePlus,
   MessageSquareText,
   PencilLine,
   RefreshCcw,
-  Upload,
 } from "lucide-react";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -48,7 +49,7 @@ import {
   type DocumentSync,
   type DocumentSyncView,
   HandoffError,
-  type Snapshot,
+  type SyncNotice,
 } from "./document-sync";
 import { cn } from "./lib/utils";
 import {
@@ -56,6 +57,7 @@ import {
   type DocumentReviewController,
   type DocumentSaveState,
   PageCard,
+  type RevealChangeRequest,
 } from "./PageCard";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
 import {
@@ -65,6 +67,11 @@ import {
   type ReviewHandoffErrorKind,
   type ReviewHandoffPhase,
 } from "./review-handoff";
+import {
+  ConflictResolverBanner,
+  QuietSyncNotice,
+  RemovedTextNotice,
+} from "./SyncNotices";
 import type {
   CompleteReviewResult,
   HandoffRecord,
@@ -137,27 +144,6 @@ const documentInteractionModeOptions = [
   label: string;
   Icon: typeof Eye;
 }[];
-
-const conflictNoticeCopy: Record<
-  "changed" | "conflict" | "paused",
-  {
-    title: string;
-    body: string;
-  }
-> = {
-  changed: {
-    title: "File changed on disk",
-    body: "Roughdraft found a newer version of this file on disk. Reload to use that version, or overwrite it with your current draft.",
-  },
-  conflict: {
-    title: "Save conflict",
-    body: "This file changed on disk while you have unsaved edits. Autosave is paused so your draft will not overwrite those changes.",
-  },
-  paused: {
-    title: "Autosave paused",
-    body: "Keep editing locally, then reload from disk to discard your draft or overwrite the disk file when you are ready.",
-  },
-};
 
 const fileCopyMenuOptions = [
   { action: "path", label: "Path" },
@@ -261,27 +247,9 @@ export function getSyncStatus(view: DocumentSyncView): {
       return { saveState: "offline", diskState: "clean" };
     case "unavailable":
       return { saveState: unsavedOrSaved, diskState: "unavailable" };
-    case "changed":
     case "conflict":
-      return {
-        saveState: unsavedOrSaved,
-        diskState: view.paused ? "paused" : view.state.kind,
-      };
+      return { saveState: unsavedOrSaved, diskState: "conflict" };
   }
-}
-
-function formatDiskVersion(snapshot: Snapshot): string {
-  const shortHash = snapshot.contentHash.replace(/^local:\d+:/, "").slice(0, 7);
-  const mtime = Number(snapshot.version.split(":")[0]);
-  if (Number.isFinite(mtime) && mtime > 0) {
-    const time = new Date(mtime).toLocaleTimeString([], {
-      hour: "numeric",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-    return `Disk version from ${time} (${shortHash})`;
-  }
-  return `Disk version ${shortHash}`;
 }
 
 function useNow(active: boolean) {
@@ -313,26 +281,8 @@ function getSaveStatusViewModel(
 ) {
   if (diskChangeState === "conflict") {
     return {
-      label: "Save conflict",
-      ariaLabel: "Save conflict",
-      tone: "warning" as const,
-      Icon: AlertTriangle,
-    };
-  }
-
-  if (diskChangeState === "changed") {
-    return {
-      label: "File changed on disk",
-      ariaLabel: "File changed on disk",
-      tone: "warning" as const,
-      Icon: AlertTriangle,
-    };
-  }
-
-  if (diskChangeState === "paused") {
-    return {
-      label: "Autosave paused",
-      ariaLabel: "Autosave paused",
+      label: "Overlaps a change on disk",
+      ariaLabel: "Overlaps a change on disk",
       tone: "warning" as const,
       Icon: AlertTriangle,
     };
@@ -797,16 +747,24 @@ export function DocumentWorkspace({
   );
   const ActiveDocumentInteractionModeIcon =
     activeDocumentInteractionMode?.Icon ?? PencilLine;
-  const conflictNotice =
-    documentDiskChangeState === "changed" ||
-    documentDiskChangeState === "conflict" ||
-    documentDiskChangeState === "paused"
-      ? conflictNoticeCopy[documentDiskChangeState]
-      : null;
-  const conflictTheirs =
-    syncView?.state.kind === "changed" || syncView?.state.kind === "conflict"
-      ? syncView.state.theirs
-      : null;
+  const conflictState =
+    syncView?.state.kind === "conflict" ? syncView.state : null;
+  const notices = syncView?.notices ?? [];
+  const removedNotice =
+    notices.find(
+      (notice): notice is Extract<SyncNotice, { kind: "removed" }> =>
+        notice.kind === "removed",
+    ) ?? null;
+  // The newest quiet line wins the slot next to the badge.
+  const quietNotice =
+    [...notices]
+      .reverse()
+      .find(
+        (
+          notice,
+        ): notice is Extract<SyncNotice, { kind: "updated" | "restored" }> =>
+          notice.kind === "updated" || notice.kind === "restored",
+      ) ?? null;
   const offlineRetryAt =
     syncView?.state.kind === "offline" ? syncView.state.retryAt : null;
   const now = useNow(offlineRetryAt !== null);
@@ -814,32 +772,81 @@ export function DocumentWorkspace({
     syncView?.state.kind === "unavailable"
       ? {
           state: "unavailable" as const,
-          title:
+          title: `File unavailable: ${
             syncView.state.reason === "missing"
-              ? "File not found on disk"
-              : "File unavailable",
-          body:
-            syncView.state.reason === "missing"
-              ? `Roughdraft cannot find ${documentCopyPath ?? documentFilenameLabel}. Your edits stay in this tab and save when the file is back.`
-              : `Roughdraft cannot read this file (${syncView.state.reason}). Your edits stay in this tab and save when it can read it again.`,
+              ? `${documentCopyPath ?? documentFilenameLabel} is not on disk`
+              : syncView.state.reason
+          }`,
+          body: "Your edits are kept in this browser and will save when the file is readable again.",
           retry: false,
+          recreate: syncView.state.reason === "missing",
+          error: syncView.lastError,
         }
       : offlineRetryAt !== null
         ? {
             state: "offline" as const,
-            title: "Roughdraft is not answering",
-            body: `Your edits stay in this tab and save when it is back. Trying again in ${Math.max(
+            title: "Roughdraft is offline.",
+            body: `Your edits are kept in this browser and will save when it is back. Trying again in ${Math.max(
               0,
               Math.ceil((offlineRetryAt - now) / 1000),
             )} s.`,
             retry: true,
+            recreate: false,
+            error: null,
           }
         : null;
-  const hasNotice = !!conflictNotice || !!syncNotice;
+  const hasNotice = !!conflictState || !!syncNotice || !!removedNotice;
+  // The status stack sits right below whichever banner is showing; the
+  // conflict banner grows with its list of overlaps.
+  const [bannerBottom, setBannerBottom] = useState<number | null>(null);
+  const bannerIdentity = conflictState
+    ? `conflict:${conflictState.hunks.length}`
+    : removedNotice
+      ? `removed:${removedNotice.id}`
+      : (syncNotice?.state ?? "");
+  useLayoutEffect(() => {
+    void bannerIdentity;
+    const banner = document.querySelector<HTMLElement>(
+      "[data-workspace-banner='true']",
+    );
+    if (!banner) {
+      setBannerBottom(null);
+      return;
+    }
+    const update = () => setBannerBottom(banner.getBoundingClientRect().bottom);
+    update();
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(banner);
+    window.addEventListener("resize", update);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, [bannerIdentity]);
+  const dismissNotice = useCallback(
+    (id: number) => sync?.dismissNotice(id),
+    [sync],
+  );
+  const quietNoticeId = quietNotice?.id ?? null;
+  const dismissQuietNotice = useCallback(() => {
+    if (quietNoticeId !== null) dismissNotice(quietNoticeId);
+  }, [dismissNotice, quietNoticeId]);
+  const [revealRequest, setRevealRequest] =
+    useState<RevealChangeRequest | null>(null);
+  const showQuietNoticeChange = useCallback(() => {
+    if (!quietNotice || quietNotice.kind !== "updated") return;
+    setRevealRequest((current) => ({
+      key: (current?.key ?? 0) + 1,
+      epoch: quietNotice.epoch,
+      commentId: quietNotice.commentId,
+    }));
+  }, [quietNotice]);
   const reviewHandoffView = getReviewHandoffView({
     enabled: !!activeDocumentPath && backend?.info.kind === "local-files",
     watcherCount: reviewWatcherCount,
     diskState: documentDiskChangeState,
+    conflictCount: conflictState?.hunks.length ?? 0,
     saveState,
     phase: reviewHandoffPhase,
     errorKind: reviewHandoffErrorKind,
@@ -903,6 +910,11 @@ export function DocumentWorkspace({
           "fixed right-3 z-[60] flex max-w-[min(22rem,calc(100vw-1rem))] flex-col items-end gap-1.5",
           hasNotice ? "top-[19rem] sm:top-[11rem]" : "top-3",
         )}
+        style={
+          hasNotice && bannerBottom !== null
+            ? { top: bannerBottom + 8 }
+            : undefined
+        }
         data-testid="document-status-stack"
         data-document-status-stack="true"
       >
@@ -1169,86 +1181,26 @@ export function DocumentWorkspace({
           ) : null}
         </div>
       </div>
-      {conflictNotice ? (
-        <div
-          data-testid="file-conflict-notice"
-          role="status"
-          aria-label="File conflict"
-          className="fixed top-3 left-1/2 z-50 flex w-[min(calc(100vw-1rem),52rem)] -translate-x-1/2 flex-col gap-3 rounded-[8px] border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950 px-3 py-3 text-amber-950 dark:text-amber-100 shadow-[0_14px_40px_rgba(120,53,15,0.18)] dark:shadow-[0_14px_40px_rgba(0,0,0,0.4)] sm:flex-row sm:items-center sm:justify-between sm:px-4"
-        >
-          <div className="flex min-w-0 items-start gap-2.5">
-            <AlertTriangle
-              className="mt-0.5 size-4 shrink-0 text-amber-700 dark:text-amber-400"
-              aria-hidden="true"
-            />
-            <div className="min-w-0">
-              <div className="text-sm font-semibold leading-5">
-                {conflictNotice.title}
-              </div>
-              <div className="mt-0.5 text-xs leading-5 text-amber-900 dark:text-amber-200">
-                {conflictNotice.body}
-                {documentDiskChangeState === "paused" &&
-                syncView &&
-                syncView.theirsUpdates > 0 ? (
-                  <span data-testid="file-conflict-later-change">
-                    {" "}
-                    The file changed on disk again while autosave was paused.
-                  </span>
-                ) : null}
-              </div>
-              {conflictTheirs ? (
-                <div
-                  data-testid="file-conflict-disk-version"
-                  className="mt-0.5 text-[0.68rem] leading-4 text-amber-800/80 dark:text-amber-300/80"
-                >
-                  {formatDiskVersion(conflictTheirs)}. Overwrite replaces this
-                  version.
-                </div>
-              ) : null}
-            </div>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:justify-end">
-            <Button
-              type="button"
-              data-testid="file-conflict-action-reload"
-              variant="ghost"
-              size="sm"
-              className="h-8 rounded-[7px] bg-white/55 dark:bg-white/10 px-2 text-xs text-amber-950 dark:text-amber-100 hover:bg-white dark:hover:bg-white/20"
-              onClick={() => void sync?.reloadFromDisk()}
-            >
-              <RefreshCcw className="size-3.5" />
-              Reload from disk
-            </Button>
-            {documentDiskChangeState !== "paused" ? (
-              <Button
-                type="button"
-                data-testid="file-conflict-action-keep-editing"
-                variant="ghost"
-                size="sm"
-                className="h-8 rounded-[7px] bg-white/55 dark:bg-white/10 px-2 text-xs text-amber-950 dark:text-amber-100 hover:bg-white dark:hover:bg-white/20"
-                onClick={() => sync?.keepEditing()}
-              >
-                <PencilLine className="size-3.5" />
-                Keep editing with autosave paused
-              </Button>
-            ) : null}
-            <Button
-              type="button"
-              data-testid="file-conflict-action-overwrite"
-              variant="ghost"
-              size="sm"
-              className="h-8 rounded-[7px] bg-amber-900 dark:bg-amber-600 px-2 text-xs text-white hover:bg-amber-800 dark:hover:bg-amber-500"
-              onClick={() => void sync?.overwrite()}
-            >
-              <Upload className="size-3.5" />
-              Overwrite disk file
-            </Button>
-          </div>
-        </div>
+      {conflictState && sync ? (
+        <ConflictResolverBanner
+          hunks={conflictState.hunks}
+          theirs={conflictState.theirs}
+          draft={() => sync.draft}
+          onResolve={(hunkId, choice) => sync.resolveHunk(hunkId, choice)}
+          onOverwrite={(shown) => sync.overwrite(shown)}
+        />
       ) : null}
-      {!conflictNotice && syncNotice ? (
+      {!conflictState && removedNotice && sync ? (
+        <RemovedTextNotice
+          notice={removedNotice}
+          onRestore={() => sync.restoreRemovedText(removedNotice.id)}
+          onDismiss={() => sync.dismissNotice(removedNotice.id)}
+        />
+      ) : null}
+      {!conflictState && !removedNotice && syncNotice ? (
         <div
           data-testid="sync-status-notice"
+          data-workspace-banner="true"
           data-sync-state={syncNotice.state}
           role="status"
           aria-label={syncNotice.title}
@@ -1266,6 +1218,14 @@ export function DocumentWorkspace({
               <div className="mt-0.5 text-xs leading-5 text-stone-600 dark:text-slate-300">
                 {syncNotice.body}
               </div>
+              {syncNotice.error ? (
+                <div
+                  data-testid="sync-status-error"
+                  className="mt-0.5 text-xs leading-5 text-rose-700 dark:text-rose-300"
+                >
+                  {syncNotice.error}
+                </div>
+              ) : null}
             </div>
           </div>
           {syncNotice.retry ? (
@@ -1283,6 +1243,39 @@ export function DocumentWorkspace({
               </Button>
             </div>
           ) : null}
+          {syncNotice.recreate ? (
+            <div className="flex shrink-0 items-center gap-1.5 sm:justify-end">
+              <Button
+                type="button"
+                data-testid="sync-status-recreate"
+                variant="ghost"
+                size="sm"
+                className="h-8 rounded-[7px] bg-white/70 px-2 text-xs hover:bg-white dark:bg-white/10 dark:hover:bg-white/20"
+                onClick={() => void sync?.recreateFromDraft()}
+              >
+                <FilePlus2 className="size-3.5" />
+                Recreate from my draft
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {quietNotice ? (
+        // The quiet line: a toast at the bottom, visible wherever the
+        // document is scrolled. When a round closes with a write it takes
+        // over from the "AI editing..." badge, which goes at the same time.
+        <div
+          data-testid="sync-toast"
+          className="pointer-events-none fixed bottom-4 left-1/2 z-50 flex w-max max-w-[calc(100vw-1rem)] -translate-x-1/2 justify-center"
+        >
+          <div className="pointer-events-auto max-w-full shadow-[0_10px_28px_rgba(0,0,0,0.12)]">
+            <QuietSyncNotice
+              key={quietNotice.id}
+              notice={quietNotice}
+              onShow={showQuietNoticeChange}
+              onDismiss={dismissQuietNotice}
+            />
+          </div>
         </div>
       ) : null}
       <div className="mx-auto min-h-full max-w-[1080px]">
@@ -1455,6 +1448,7 @@ export function DocumentWorkspace({
               globalCommentRequest={globalCommentRequest}
               onGlobalCommentRequestHandled={handleGlobalCommentRequestHandled}
               onReviewControllerChange={handleReviewControllerChange}
+              revealRequest={revealRequest}
             />
           ) : null
         ) : (

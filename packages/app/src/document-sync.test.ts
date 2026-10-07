@@ -1,15 +1,21 @@
+import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type ContentUpdate,
   DocumentSync,
-  HandoffError,
-  mergeSingleEdit,
+  type HandoffError,
   type SyncBackend,
   type SyncEnvironmentHandlers,
 } from "./document-sync";
 import {
+  createIndexedDbDraftStore,
+  createMemoryDraftStore,
+  type DraftStore,
+} from "./draft-store";
+import {
   type CompleteReviewOptions,
   MarkdownFileConflictError,
+  MarkdownFileNotFoundError,
   type MarkdownFileState,
   type Page,
   type SaveMarkdownFileOptions,
@@ -87,6 +93,8 @@ class FakeServer {
   putFailures = 0;
   stateUnsupported = false;
   reviewConflict = false;
+  // Runs once inside the next Done request, before its version check.
+  beforeReview: (() => void) | null = null;
 
   constructor(content: string) {
     this.content = content;
@@ -169,6 +177,9 @@ class FakeServer {
       },
       completeReview: async (_path, options = {}) => {
         this.reviews.push(options);
+        const before = this.beforeReview;
+        this.beforeReview = null;
+        before?.();
         if (
           this.reviewConflict ||
           (options.expectedContentHash &&
@@ -317,27 +328,24 @@ describe("DocumentSync saving", () => {
     });
   });
 
-  it("keeps the draft and uses the 409 body's page without fetching again", async () => {
-    const server = new FakeServer("Start");
-    const { sync } = createSync(server);
+  it("merges onto the 409 body's page without fetching again, then saves the merge", async () => {
+    const server = new FakeServer("# T\n\nIntro.\n\nBody.\n");
+    const { sync, updates } = createSync(server);
 
-    server.write("Agent text");
-    sync.edit("Start mine");
+    server.write("# T\n\nIntro.\n\nBody, from the agent.\n");
+    sync.edit("# T\n\nIntro, typed.\n\nBody.\n");
     await advance(500);
 
     expect(server.gets).toBe(0);
-    expect(sync.draft).toBe("Start mine");
-    expect(sync.getView().state).toEqual({
-      kind: "conflict",
-      theirs: {
-        content: "Agent text",
-        version: "v2",
-        contentHash: hashOf("Agent text"),
-        seq: 2,
-      },
-    });
-    expect(sync.getView().base.content).toBe("Start");
-    expect(server.content).toBe("Agent text");
+    expect(server.puts).toHaveLength(1);
+    expect(sync.draft).toBe("# T\n\nIntro, typed.\n\nBody, from the agent.\n");
+    expect(updates.at(-1)).toMatchObject({ reason: "rebase" });
+
+    await advance(500);
+    expect(server.content).toBe(
+      "# T\n\nIntro, typed.\n\nBody, from the agent.\n",
+    );
+    expect(sync.getView().state).toEqual({ kind: "synced" });
   });
 
   it("retries a failed save with 1, 2, 5, 10 and then 30 s backoff and returns to synced", async () => {
@@ -474,34 +482,35 @@ describe("DocumentSync incoming changes", () => {
     ]);
   });
 
-  it("does not apply a reload over a draft that became dirty during the fetch", async () => {
-    // Sync finding 1: the dirty check must happen after the fetch.
-    const server = new FakeServer("Original.");
-    const { sync, updates } = createSync(server);
+  it("merges a reload into a draft that became dirty during the fetch", async () => {
+    // Sync finding 1: the dirty check must happen after the fetch, and the
+    // agent's paragraph must never be erased.
+    const server = new FakeServer("# Race\n\nOriginal.\n");
+    const { sync } = createSync(server);
     server.lastChannel().open();
     const hold = deferred<void>();
     server.holdGet = hold;
 
-    server.write("Original.\n\nAgent paragraph.");
+    server.write("# Race\n\nOriginal.\n\nAgent paragraph.\n");
     server.lastChannel().receive(change(server));
     await settle();
     expect(server.gets).toBe(1);
 
-    sync.edit("Original.\n\nTyped by user.");
+    sync.edit("# Race\n\nOriginal, typed by user.\n");
     hold.resolve();
     await settle();
 
-    expect(updates).toHaveLength(0);
-    expect(sync.draft).toBe("Original.\n\nTyped by user.");
-    expect(sync.getView().base.content).toBe("Original.");
-    expect(sync.getView().state).toMatchObject({
-      kind: "changed",
-      theirs: { content: "Original.\n\nAgent paragraph." },
-    });
+    expect(sync.draft).toBe(
+      "# Race\n\nOriginal, typed by user.\n\nAgent paragraph.\n",
+    );
+    expect(sync.getView().base.content).toBe(
+      "# Race\n\nOriginal.\n\nAgent paragraph.\n",
+    );
 
-    await advance(5_000);
-    expect(server.puts).toHaveLength(0);
-    expect(server.content).toBe("Original.\n\nAgent paragraph.");
+    await advance(500);
+    expect(server.content).toBe(
+      "# Race\n\nOriginal, typed by user.\n\nAgent paragraph.\n",
+    );
   });
 
   it("moves to unavailable when the file goes missing and saves the held draft when it returns", async () => {
@@ -762,21 +771,22 @@ describe("DocumentSync handoff and banner actions", () => {
     ]);
   });
 
-  it("maps a 409 from the review event to the conflict state", async () => {
-    const server = new FakeServer("Start");
+  it("takes a disk change that answered the review event and sends Done again", async () => {
+    const server = new FakeServer("# T\n\nIntro.\n\nBody.\n");
     const { sync } = createSync(server);
 
-    server.write("Agent wrote first");
-    const failure = await sync.completeReview({ handoffId: "h1" }).then(
-      () => null,
-      (error: unknown) => error,
-    );
+    sync.edit("# T\n\nIntro, mine.\n\nBody.\n");
+    // The agent writes between the flush and the Done.
+    server.beforeReview = () =>
+      server.write("# T\n\nIntro, mine.\n\nBody, agent.\n");
+    const result = await sync.completeReview({ handoffId: "h1" });
 
-    expect(failure).toBeInstanceOf(HandoffError);
-    expect((failure as HandoffError).kind).toBe("file-changed");
-    expect(sync.getView().state).toMatchObject({
-      kind: "conflict",
-      theirs: { content: "Agent wrote first" },
+    expect(result.delivered).toBe(true);
+    expect(sync.draft).toBe("# T\n\nIntro, mine.\n\nBody, agent.\n");
+    expect(server.reviews).toHaveLength(2);
+    expect(server.reviews.at(-1)).toMatchObject({
+      handoffId: "h1",
+      expectedContentHash: hashOf("# T\n\nIntro, mine.\n\nBody, agent.\n"),
     });
   });
 
@@ -795,92 +805,614 @@ describe("DocumentSync handoff and banner actions", () => {
     expect(server.reviews).toHaveLength(0);
   });
 
-  it("overwrites with the version the banner shows as expectedVersion", async () => {
-    const server = new FakeServer("Start");
+  it("refuses Done while an overlap waits for a choice", async () => {
+    const server = new FakeServer(MARKUP_BASE);
     const { sync } = createSync(server);
-
-    server.write("Agent text");
-    sync.edit("Start mine");
-    await advance(500);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE);
+    server.write(MARKUP_THEIRS);
+    server.lastChannel().receive(change(server));
+    await settle();
     expect(sync.getView().state.kind).toBe("conflict");
 
-    await sync.overwrite();
+    const failure = await sync.completeReview({ handoffId: "h1" }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect((failure as HandoffError).kind).toBe("file-changed");
+    expect(server.reviews).toHaveLength(0);
+  });
+
+  it("overwrites only the version the confirmation showed", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE);
+    server.write(MARKUP_THEIRS);
+    server.lastChannel().receive(change(server));
+    await settle();
+    const state = sync.getView().state;
+    if (state.kind !== "conflict") throw new Error("expected a conflict");
+
+    await sync.overwrite(state.theirs);
 
     expect(server.puts.at(-1)).toMatchObject({
-      content: "Start mine",
+      content: MARKUP_MINE,
       expectedVersion: "v2",
-      options: { expectedContentHash: hashOf("Agent text") },
+      options: { expectedContentHash: hashOf(MARKUP_THEIRS) },
     });
-    expect(server.content).toBe("Start mine");
+    expect(server.content).toBe(MARKUP_MINE);
     expect(sync.getView().state).toEqual({ kind: "synced" });
   });
 
-  it("does not overwrite a newer disk version than the one shown", async () => {
-    const server = new FakeServer("Start");
-    const { sync } = createSync(server);
-
-    server.write("Agent text");
-    sync.edit("Start mine");
-    await advance(500);
-    server.write("Agent text, edited again");
-
-    await sync.overwrite();
-
-    expect(server.content).toBe("Agent text, edited again");
-    expect(sync.getView().state).toMatchObject({
-      kind: "conflict",
-      theirs: { content: "Agent text, edited again" },
-    });
-  });
-
-  it("shows changes that arrive while autosave is paused", async () => {
-    const server = new FakeServer("Start");
+  it("does not overwrite a disk version newer than the one shown", async () => {
+    const server = new FakeServer(MARKUP_BASE);
     const { sync } = createSync(server);
     server.lastChannel().open();
-
-    server.write("Agent text");
-    sync.edit("Start mine");
-    await advance(500);
-    sync.keepEditing();
-    expect(sync.getView().paused).toBe(true);
-
-    server.write("Agent text, edited again");
+    sync.edit(MARKUP_MINE);
+    server.write(MARKUP_THEIRS);
     server.lastChannel().receive(change(server));
     await settle();
+    const state = sync.getView().state;
+    if (state.kind !== "conflict") throw new Error("expected a conflict");
+    const newest = MARKUP_THEIRS.replace("there me", "there us");
+    server.write(newest);
 
-    expect(sync.getView()).toMatchObject({
-      paused: true,
-      theirsUpdates: 1,
-      state: { theirs: { content: "Agent text, edited again" } },
+    await sync.overwrite(state.theirs);
+
+    expect(server.content).toBe(newest);
+    expect(sync.getView().state).toMatchObject({
+      kind: "conflict",
+      theirs: { content: newest },
     });
   });
 
   it("reload from disk drops the draft and pushes the disk content", async () => {
-    const server = new FakeServer("Start");
+    const server = new FakeServer(MARKUP_BASE);
     const { sync, updates } = createSync(server);
-
-    server.write("Agent text");
-    sync.edit("Start mine");
-    await advance(500);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE);
+    server.write(MARKUP_THEIRS);
+    server.lastChannel().receive(change(server));
+    await settle();
 
     await sync.reloadFromDisk();
 
-    expect(sync.draft).toBe("Agent text");
+    expect(sync.draft).toBe(MARKUP_THEIRS);
     expect(sync.getView().state).toEqual({ kind: "synced" });
     expect(updates.at(-1)).toMatchObject({
-      content: "Agent text",
+      content: MARKUP_THEIRS,
       reason: "reload",
     });
   });
 });
 
-describe("mergeSingleEdit", () => {
-  it("places an edit before or after a non-overlapping change", () => {
-    expect(mergeSingleEdit("a b c", "a B c", "a b c d")).toBe("a B c d");
-    expect(mergeSingleEdit("a b c", "a b c!", "z a b c")).toBe("z a b c!");
+// --- Batch 5: rebase instead of blocking ------------------------------------
+
+const ENTRY = (id: string, extra = "") =>
+  `  ${id}:\n    body: "Why?"\n    by: user\n    at: "2026-01-01T00:00:00.000Z"\n${extra}`;
+const MARKUP_BASE = `# T\n\nHi {==there==}{#c1}.\n\n---\ncomments:\n${ENTRY("c1")}`;
+const MARKUP_MINE = `# T\n\nHi {==there you==}{#c1}.\n\n---\ncomments:\n${ENTRY("c1")}`;
+const MARKUP_THEIRS = `# T\n\nHi {==there me==}{#c1}.\n\n---\ncomments:\n${ENTRY("c1")}`;
+
+async function agentWrites(server: FakeServer, content: string) {
+  server.write(content);
+  server.lastChannel().receive(change(server));
+  await settle();
+}
+
+describe("DocumentSync rebase", () => {
+  it("merges an agent edit in another paragraph without a conflict and saves both", async () => {
+    const server = new FakeServer(
+      "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n",
+    );
+    const { sync, updates } = createSync(server);
+    server.lastChannel().open();
+
+    sync.edit("# Plan\n\nFirst paragraph, typed.\n\nSecond paragraph.\n");
+    await agentWrites(
+      server,
+      "# Plan\n\nFirst paragraph.\n\nSecond paragraph, by the agent.\n",
+    );
+
+    const merged =
+      "# Plan\n\nFirst paragraph, typed.\n\nSecond paragraph, by the agent.\n";
+    expect(sync.draft).toBe(merged);
+    expect(sync.getView().base.content).toBe(
+      "# Plan\n\nFirst paragraph.\n\nSecond paragraph, by the agent.\n",
+    );
+    expect(updates.at(-1)).toMatchObject({ content: merged, reason: "rebase" });
+    expect(sync.getView().state).toEqual({ kind: "pending" });
+
+    await advance(500);
+    expect(server.content).toBe(merged);
+    expect(sync.getView().state).toEqual({ kind: "synced" });
   });
 
-  it("refuses overlapping edits", () => {
-    expect(mergeSingleEdit("a b c", "a X c", "a Y c")).toBeNull();
+  it("keeps an overlapping edit as Jordan's suggestion against the agent's text", async () => {
+    const server = new FakeServer(
+      "# Plan\n\nThe pilot is limited on purpose.\n",
+    );
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+
+    sync.edit("# Plan\n\nThe pilot is tiny on purpose.\n");
+    await agentWrites(server, "# Plan\n\nThe pilot is small on purpose.\n");
+
+    expect(sync.getView().state.kind).toBe("pending");
+    expect(sync.draft).toContain(
+      "The pilot is {~~small~>tiny~~}{#s1} on purpose.",
+    );
+    expect(sync.draft).toMatch(/suggestions:\n {2}s1:\n {4}by: user\n/);
+    const notice = sync.getView().notices.find((n) => n.kind === "updated");
+    expect(notice).toMatchObject({ suggestionsAdded: ["s1"] });
+
+    await advance(500);
+    expect(server.content).toBe(sync.draft);
+  });
+
+  it("keeps the draft and lists the overlap when it sits inside review markup", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const { sync, updates } = createSync(server);
+    server.lastChannel().open();
+
+    sync.edit(MARKUP_MINE);
+    await agentWrites(server, MARKUP_THEIRS);
+
+    const state = sync.getView().state;
+    expect(state).toMatchObject({
+      kind: "conflict",
+      theirs: { content: MARKUP_THEIRS },
+      hunks: [
+        {
+          id: "h1",
+          kind: "body",
+          reason: "markup-overlap",
+          choices: ["ours", "theirs"],
+        },
+      ],
+    });
+    expect(sync.draft).toBe(MARKUP_MINE);
+    expect(updates).toHaveLength(0);
+
+    // Typing goes on elsewhere; nothing is written while the overlap waits.
+    sync.edit(MARKUP_MINE.replace("# T", "# Title"));
+    await advance(5_000);
+    expect(server.puts).toHaveLength(0);
+    expect(server.content).toBe(MARKUP_THEIRS);
+    expect(sync.getView().state).toMatchObject({
+      kind: "conflict",
+      hunks: [{ reason: "markup-overlap" }],
+    });
+    expect(await sync.flush()).toEqual({
+      status: "blocked",
+      reason: "conflict",
+    });
+  });
+
+  it("settles a hunk with the disk version and saves the rest of the draft", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE.replace("# T", "# Title"));
+    await agentWrites(server, MARKUP_THEIRS);
+    expect(sync.getView().state.kind).toBe("conflict");
+
+    sync.resolveHunk("h1", "theirs");
+
+    expect(sync.draft).toBe(MARKUP_THEIRS.replace("# T", "# Title"));
+    await advance(500);
+    expect(server.content).toBe(MARKUP_THEIRS.replace("# T", "# Title"));
+    expect(sync.getView().state).toEqual({ kind: "synced" });
+  });
+
+  it("settles a hunk with mine", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE);
+    await agentWrites(server, MARKUP_THEIRS);
+
+    sync.resolveHunk("h1", "ours");
+    await advance(500);
+
+    expect(server.content).toBe(MARKUP_MINE);
+    expect(sync.getView().state).toEqual({ kind: "synced" });
+  });
+
+  it("merges again once typing pauses, and leaves the conflict when the overlap is gone", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE);
+    await agentWrites(server, MARKUP_THEIRS);
+    expect(sync.getView().state.kind).toBe("conflict");
+
+    // Jordan types the agent's words himself.
+    sync.edit(MARKUP_THEIRS.replace("# T", "# T2"));
+    await advance(500);
+
+    expect(sync.getView().state.kind).not.toBe("conflict");
+    await advance(500);
+    expect(server.content).toBe(MARKUP_THEIRS.replace("# T", "# T2"));
+  });
+
+  it("re-applies keystrokes typed on content the editor had not replaced yet", async () => {
+    const server = new FakeServer("Intro.\n\nBody.\n");
+    const { sync, updates } = createSync(server);
+    server.lastChannel().open();
+
+    await agentWrites(server, "Intro.\n\nBody.\n\nAgent reply.\n");
+    expect(updates.at(-1)?.epoch).toBe(1);
+
+    // The editor still shows epoch 0 and reports a keystroke on it.
+    sync.edit("Intro!\n\nBody.\n", 0);
+
+    expect(sync.draft).toBe("Intro!\n\nBody.\n\nAgent reply.\n");
+    expect(updates.at(-1)).toMatchObject({
+      content: "Intro!\n\nBody.\n\nAgent reply.\n",
+      reason: "rebase",
+    });
+
+    await advance(500);
+    expect(server.content).toBe("Intro!\n\nBody.\n\nAgent reply.\n");
   });
 });
+
+describe("DocumentSync notices", () => {
+  it("says what a fast-forward changed, with the thread to show", async () => {
+    const before = `# Plan\n\nSee {==this==}{#c1}.\n\n---\ncomments:\n${ENTRY("c1")}`;
+    const after = `${before}  a1:\n    body: "Because."\n    by: AI\n    at: "2026-01-01T00:01:00.000Z"\n    re: c1\n`;
+    const server = new FakeServer(before);
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+
+    await agentWrites(server, after);
+
+    expect(sync.getView().notices).toEqual([
+      {
+        id: 1,
+        kind: "updated",
+        summary: "1 reply added",
+        epoch: 1,
+        commentId: "c1",
+        suggestionsAdded: [],
+      },
+    ]);
+    sync.dismissNotice(1);
+    expect(sync.getView().notices).toEqual([]);
+  });
+
+  it("names the section whose text changed", async () => {
+    const server = new FakeServer(
+      "# Plan\n\n## Rollout\n\nTwo weeks.\n\n## Risks\n\nNone.\n",
+    );
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+
+    await agentWrites(
+      server,
+      "# Plan\n\n## Rollout\n\nThree weeks.\n\n## Risks\n\nNone.\n",
+    );
+
+    expect(sync.getView().notices).toMatchObject([
+      { kind: "updated", summary: "text changed in Rollout" },
+    ]);
+  });
+
+  it("raises the loud notice when an outside write removes text this tab saved, and restores it as a suggestion", async () => {
+    const server = new FakeServer("# Plan\n\nIntro.\n\nOutro.\n");
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit("# Plan\n\nIntro.\n\nMy point about the rollout.\n\nOutro.\n");
+    await advance(500);
+    expect(server.content).toContain("My point about the rollout.");
+
+    // A blind overwrite from an old read: the paragraph is gone.
+    await agentWrites(server, "# Plan\n\nIntro, agent.\n\nOutro.\n");
+
+    const removed = sync.getView().notices.find((n) => n.kind === "removed");
+    expect(removed).toMatchObject({
+      kind: "removed",
+      removed: [{ text: "My point about the rollout.", whole: true }],
+    });
+    if (!removed) throw new Error("expected the removed-text notice");
+
+    sync.restoreRemovedText(removed.id);
+    expect(sync.draft).toContain(
+      "Intro, agent.\n\n{++My point about the rollout.++}{#s1}\n",
+    );
+    expect(sync.draft).toMatch(/suggestions:\n {2}s1:\n {4}by: user\n/);
+    expect(sync.getView().notices.some((n) => n.kind === "removed")).toBe(
+      false,
+    );
+    await advance(500);
+    expect(server.content).toBe(sync.draft);
+  });
+
+  it("stays quiet about removed text saved more than five minutes ago", async () => {
+    const server = new FakeServer("# Plan\n\nIntro.\n\nOutro.\n");
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit("# Plan\n\nIntro.\n\nMy point about the rollout.\n\nOutro.\n");
+    await advance(500);
+
+    await advance(5 * 60 * 1000 + 1_000);
+    await agentWrites(server, "# Plan\n\nIntro, agent.\n\nOutro.\n");
+
+    expect(sync.getView().notices.map((n) => n.kind)).toEqual(["updated"]);
+  });
+
+  it("shows nothing for the echo of its own save", async () => {
+    const server = new FakeServer("# Plan\n\nIntro.\n");
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    sync.edit("# Plan\n\nIntro, mine.\n");
+    await advance(500);
+
+    server
+      .lastChannel()
+      .receive(change(server, { origin: "tab", tabId: "tab-1" }));
+    await settle();
+
+    expect(sync.getView().notices).toEqual([]);
+  });
+});
+
+describe("DocumentSync drafts kept in the browser", () => {
+  it("writes the draft and its base 250 ms after an edit and removes it once saved", async () => {
+    const server = new FakeServer("# Plan\n\nIntro.\n");
+    const store = createMemoryDraftStore();
+    const sync = createSyncWithStore(server, store);
+
+    sync.edit("# Plan\n\nIntro, mine.\n");
+    await advance(200);
+    expect(store.records.size).toBe(0);
+    await advance(50);
+    await sync.whenDraftsWritten();
+    expect(store.records.get("/docs/doc.md")).toMatchObject({
+      draft: "# Plan\n\nIntro, mine.\n",
+      base: {
+        content: "# Plan\n\nIntro.\n",
+        contentHash: hashOf("# Plan\n\nIntro.\n"),
+      },
+      tabId: "tab-1",
+    });
+
+    await advance(500);
+    await sync.whenDraftsWritten();
+    expect(server.content).toBe("# Plan\n\nIntro, mine.\n");
+    expect(store.records.size).toBe(0);
+  });
+
+  it("keeps the draft while a conflict is open", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const store = createMemoryDraftStore();
+    const sync = createSyncWithStore(server, store);
+    server.lastChannel().open();
+    sync.edit(MARKUP_MINE);
+    await agentWrites(server, MARKUP_THEIRS);
+    await advance(300);
+    await sync.whenDraftsWritten();
+
+    expect(store.records.get("/docs/doc.md")).toMatchObject({
+      draft: MARKUP_MINE,
+      base: { content: MARKUP_BASE },
+    });
+  });
+
+  it("restores a stored draft on load, merged onto the file as it is now", async () => {
+    const server = new FakeServer("# Plan\n\nIntro.\n\nBody.\n");
+    const store = createMemoryDraftStore();
+    const first = createSyncWithStore(server, store);
+    first.edit("# Plan\n\nIntro, mine.\n\nBody.\n");
+    await advance(300);
+    await first.whenDraftsWritten();
+    // The tab dies before the save; the agent writes meanwhile.
+    first.dispose();
+    server.write("# Plan\n\nIntro.\n\nBody, agent.\n");
+
+    const second = new DocumentSync({
+      backend: server.backend(),
+      path: "doc.md",
+      tabId: "tab-9",
+      initialPage: server.page(),
+      environment: new FakeEnvironment().environment(),
+      draftStore: store,
+      draftKey: "/docs/doc.md",
+    });
+    syncs.push(second);
+    const updates: ContentUpdate[] = [];
+    second.onContentUpdate((update) => updates.push(update));
+
+    expect(await second.restoreDraft()).toBe(true);
+    second.start();
+
+    expect(second.draft).toBe("# Plan\n\nIntro, mine.\n\nBody, agent.\n");
+    expect(second.getView().notices).toMatchObject([{ kind: "restored" }]);
+    expect(updates.at(-1)).toMatchObject({ reason: "rebase" });
+    await advance(500);
+    await second.whenDraftsWritten();
+    expect(server.content).toBe("# Plan\n\nIntro, mine.\n\nBody, agent.\n");
+    expect(store.records.size).toBe(0);
+  });
+
+  it("restores into the conflict state when the stored draft overlaps the disk", async () => {
+    const server = new FakeServer(MARKUP_BASE);
+    const store = createMemoryDraftStore();
+    await store.put({
+      key: "/docs/doc.md",
+      draft: MARKUP_MINE,
+      base: {
+        content: MARKUP_BASE,
+        version: "v1",
+        contentHash: hashOf(MARKUP_BASE),
+        seq: 1,
+      },
+      tabId: "old-tab",
+      savedAt: Date.now(),
+    });
+    server.write(MARKUP_THEIRS);
+    const sync = createSyncWithStore(server, store, { start: false });
+    const updates: ContentUpdate[] = [];
+    sync.onContentUpdate((update) => updates.push(update));
+
+    expect(await sync.restoreDraft()).toBe(true);
+
+    expect(sync.draft).toBe(MARKUP_MINE);
+    expect(sync.getView().state).toMatchObject({ kind: "conflict" });
+    expect(updates.at(-1)).toMatchObject({
+      content: MARKUP_MINE,
+      reason: "restore",
+    });
+  });
+
+  it("drops a stored draft that disk already holds", async () => {
+    const server = new FakeServer("# Plan\n");
+    const store = createMemoryDraftStore();
+    await store.put({
+      key: "/docs/doc.md",
+      draft: "# Plan\n",
+      base: {
+        content: "# Old\n",
+        version: "v0",
+        contentHash: hashOf("# Old\n"),
+        seq: 0,
+      },
+      tabId: "old-tab",
+      savedAt: Date.now(),
+    });
+    const sync = createSyncWithStore(server, store, { start: false });
+
+    expect(await sync.restoreDraft()).toBe(false);
+    await sync.whenDraftsWritten();
+    expect(store.records.size).toBe(0);
+    expect(sync.getView().notices).toEqual([]);
+  });
+
+  it("round-trips a draft through IndexedDB", async () => {
+    const store = createIndexedDbDraftStore(new IDBFactory(), "drafts-test");
+    if (!store) throw new Error("expected an IndexedDB store");
+    vi.useRealTimers();
+    const record = {
+      key: "/docs/doc.md",
+      draft: "# Plan\n\nMine.\n",
+      base: { content: "# Plan\n", version: "v1", contentHash: "h1", seq: 1 },
+      tabId: "tab-1",
+      savedAt: 1,
+    };
+    await store.put(record);
+    expect(await store.get("/docs/doc.md")).toEqual(record);
+    await store.delete("/docs/doc.md", (stored) => stored.tabId === "tab-2");
+    expect(await store.get("/docs/doc.md")).toEqual(record);
+    await store.delete("/docs/doc.md", (stored) => stored.tabId === "tab-1");
+    expect(await store.get("/docs/doc.md")).toBeNull();
+  });
+});
+
+describe("DocumentSync offline and unavailable", () => {
+  it("goes offline on a failed save with a retry time and saves when the server is back", async () => {
+    const server = new FakeServer("Start");
+    const { sync } = createSync(server);
+    server.putFailures = 1;
+
+    sync.edit("Start, mine");
+    await advance(500);
+    const state = sync.getView().state;
+    expect(state.kind).toBe("offline");
+    if (state.kind === "offline") {
+      expect(state.retryAt - Date.now()).toBe(1_000);
+    }
+
+    await advance(1_000);
+    expect(server.content).toBe("Start, mine");
+    expect(sync.getView().state).toEqual({ kind: "synced" });
+  });
+
+  it("goes unavailable when the file disappears and recreates it from the draft", async () => {
+    const server = new FakeServer("# Plan\n");
+    let created: string | null = null;
+    const backend = server.backend();
+    const sync = new DocumentSync({
+      backend: {
+        ...backend,
+        saveMarkdownFile: async (path, content, expected, options) => {
+          if (options?.create) {
+            server.exists = true;
+            server.write(content);
+            created = content;
+            return server.page();
+          }
+          return backend.saveMarkdownFile(path, content, expected, options);
+        },
+      },
+      path: "doc.md",
+      tabId: "tab-1",
+      initialPage: server.page(),
+      environment: new FakeEnvironment().environment(),
+    });
+    syncs.push(sync);
+    sync.start();
+    server.lastChannel().open();
+
+    server.exists = false;
+    server.lastChannel().receive(change(server));
+    await settle();
+    expect(sync.getView().state).toEqual({
+      kind: "unavailable",
+      reason: "missing",
+    });
+
+    sync.edit("# Plan\n\nMine.\n");
+    expect(await sync.recreateFromDraft()).toBe(true);
+    expect(created).toBe("# Plan\n\nMine.\n");
+    expect(sync.getView().state).toEqual({ kind: "synced" });
+  });
+
+  it("says when the server cannot recreate a missing file", async () => {
+    const server = new FakeServer("# Plan\n");
+    const backend = server.backend();
+    const sync = new DocumentSync({
+      backend: {
+        ...backend,
+        saveMarkdownFile: async () => {
+          throw new MarkdownFileNotFoundError("doc.md", "not found");
+        },
+      },
+      path: "doc.md",
+      tabId: "tab-1",
+      initialPage: server.page(),
+      environment: new FakeEnvironment().environment(),
+    });
+    syncs.push(sync);
+    sync.start();
+    server.lastChannel().open();
+    server.exists = false;
+    server.lastChannel().receive(change(server));
+    await settle();
+
+    expect(await sync.recreateFromDraft()).toBe(false);
+    expect(sync.getView().state.kind).toBe("unavailable");
+    expect(sync.getView().lastError).toMatch(/cannot recreate a missing file/);
+  });
+});
+
+function createSyncWithStore(
+  server: FakeServer,
+  store: DraftStore,
+  { start = true }: { start?: boolean } = {},
+) {
+  const sync = new DocumentSync({
+    backend: server.backend(),
+    path: "doc.md",
+    tabId: "tab-1",
+    initialPage: server.page(),
+    environment: new FakeEnvironment().environment(),
+    draftStore: store,
+    draftKey: "/docs/doc.md",
+  });
+  if (start) sync.start();
+  syncs.push(sync);
+  return sync;
+}

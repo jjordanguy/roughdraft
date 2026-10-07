@@ -2,6 +2,7 @@ import { markdown } from "@codemirror/lang-markdown";
 import { yamlFrontmatter } from "@codemirror/lang-yaml";
 import { EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { diffSequences } from "@roughdraft/rfm";
 import { basicSetup } from "codemirror";
 import { type RefObject, useEffect, useRef } from "react";
 import { cn } from "./lib/utils";
@@ -16,6 +17,9 @@ interface MarkdownCodeEditorProps {
   // Receives a function that replaces the document with new text in place
   // (only the changed range), keeping the selection and focus.
   externalApplyRef?: RefObject<((value: string) => boolean) | null>;
+  // "show me" on the Updated from disk notice: scroll to the last change
+  // applied through `externalApplyRef`.
+  revealRequest?: { key: number } | null;
 }
 
 // The smallest single replacement that turns `current` into `next`, so a
@@ -41,6 +45,43 @@ export function minimalChange(current: string, next: string) {
   };
 }
 
+// One change per changed run of lines, each narrowed to its common prefix
+// and suffix, so a cursor between two separate changes from disk stays
+// where it was (a single replacement would swallow it).
+export function lineChanges(current: string, next: string) {
+  // Lines with their line breaks, so the last line without one differs
+  // from the same line with one.
+  const linesOf = (text: string) => text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+  const offsetsOf = (lines: string[]) => {
+    const offsets = [0];
+    for (const line of lines) {
+      offsets.push((offsets.at(-1) ?? 0) + line.length);
+    }
+    return offsets;
+  };
+  const a = linesOf(current);
+  const b = linesOf(next);
+  const offsetsA = offsetsOf(a);
+  const offsetsB = offsetsOf(b);
+  const changes: { from: number; to: number; insert: string }[] = [];
+  for (const hunk of diffSequences(a, b)) {
+    const fromA = offsetsA[hunk.aStart] ?? current.length;
+    const toA = offsetsA[hunk.aEnd] ?? current.length;
+    const fromB = offsetsB[hunk.bStart] ?? next.length;
+    const toB = offsetsB[hunk.bEnd] ?? next.length;
+    const change = minimalChange(
+      current.slice(fromA, toA),
+      next.slice(fromB, toB),
+    );
+    changes.push({
+      from: fromA + change.from,
+      to: fromA + change.to,
+      insert: change.insert,
+    });
+  }
+  return changes;
+}
+
 function replaceInPlace(
   view: EditorView,
   value: string,
@@ -49,7 +90,7 @@ function replaceInPlace(
   const currentValue = view.state.doc.toString();
   lastValueRef.current = value;
   if (currentValue === value) return;
-  view.dispatch({ changes: minimalChange(currentValue, value) });
+  view.dispatch({ changes: lineChanges(currentValue, value) });
 }
 
 export function createMarkdownCodeEditorExtensions(
@@ -129,8 +170,12 @@ export function MarkdownCodeEditor({
   className,
   testId,
   externalApplyRef,
+  revealRequest = null,
 }: MarkdownCodeEditorProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const lastExternalChangeRef = useRef<{ from: number; to: number } | null>(
+    null,
+  );
   const editorViewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const initialValueRef = useRef(value);
@@ -180,6 +225,14 @@ export function MarkdownCodeEditor({
     const apply = (nextValue: string) => {
       const view = editorViewRef.current;
       if (!view) return false;
+      const currentValue = view.state.doc.toString();
+      if (currentValue !== nextValue) {
+        const change = minimalChange(currentValue, nextValue);
+        lastExternalChangeRef.current = {
+          from: change.from,
+          to: change.from + change.insert.length,
+        };
+      }
       replaceInPlace(view, nextValue, lastValueRef);
       return true;
     };
@@ -188,6 +241,18 @@ export function MarkdownCodeEditor({
       if (externalApplyRef.current === apply) externalApplyRef.current = null;
     };
   }, [externalApplyRef]);
+
+  const revealKey = revealRequest?.key ?? null;
+  useEffect(() => {
+    const view = editorViewRef.current;
+    const range = lastExternalChangeRef.current;
+    if (revealKey === null || !view || !range) return;
+    const size = view.state.doc.length;
+    const from = Math.min(range.from, size);
+    view.dispatch({
+      effects: EditorView.scrollIntoView(from, { y: "center" }),
+    });
+  }, [revealKey]);
 
   return (
     <div

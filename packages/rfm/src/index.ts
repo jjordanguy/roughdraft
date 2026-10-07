@@ -52,6 +52,16 @@ export {
   type RfmMergedEntries,
   type RfmMergeResult,
 } from "./merge.js";
+export { type DiffHunk, diffSequences } from "./diff3.js";
+export {
+  type ConflictHunk,
+  mergeReview,
+  type RfmConflictHunk,
+  type RfmConflictReason,
+  type RfmMergeChoice,
+  type RfmMergeReviewOptions,
+  type RfmMergeReviewResult,
+} from "./merge-review.js";
 export {
   parseReviewModel,
   type RfmAnchor,

@@ -2,10 +2,13 @@ import type { Editor } from "@tiptap/react";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { localContentHash } from "../src/content-hash";
+import { DocumentSync } from "../src/document-sync";
 import {
   type DocumentSaveController,
   type ManualSaveResult,
   PageCard,
+  type RevealChangeRequest,
   shouldDismissCommentThread,
 } from "../src/PageCard";
 import type { Page, StorageBackend } from "../src/storage";
@@ -2054,5 +2057,201 @@ describe("PageCard editor integration", () => {
     expect(rendered.getEditor()).toBe(initialEditor);
     expect(getEditable(rendered.container)).toBe(initialEditable);
     expect(rendered.getEditor().getText()).toContain("Heading");
+  });
+
+  // Batch 5: a disk change that arrives while the tab has unsaved edits is
+  // merged into the draft and applied to the live editor as a transaction,
+  // so the editor instance stays and the selection maps through the change.
+  async function renderSyncedPageCard(content: string) {
+    const disk = { content, version: 1 };
+    const page = (): Page => ({
+      id: "doc-sync",
+      title: "Doc",
+      content: disk.content,
+      version: `v${disk.version}`,
+    });
+    const backend: StorageBackend = {
+      ...createBackend(),
+      info: { kind: "local-files", label: "Test", detail: "Test" },
+      getMarkdownFile: async () => page(),
+      saveMarkdownFile: async (_path, nextContent) => {
+        disk.content = nextContent;
+        disk.version += 1;
+        return page();
+      },
+      getMarkdownFileState: async () => ({
+        exists: true,
+        available: true,
+        version: `v${disk.version}`,
+        contentHash: localContentHash(disk.content),
+        seq: disk.version,
+      }),
+      openTabChannel: () => ({ send() {}, close() {} }),
+    };
+    const sync = new DocumentSync({
+      backend,
+      path: "doc.md",
+      tabId: "tab",
+      initialPage: page(),
+      environment: { isVisible: () => true, listen: () => () => {} },
+    });
+    sync.start();
+    cleanups.push(async () => sync.dispose());
+    const editors: Editor[] = [];
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    cleanups.push(async () => {
+      await act(async () => root.unmount());
+      container.remove();
+    });
+    const initialPage = page();
+    const render = async (revealRequest: RevealChangeRequest | null) => {
+      await act(async () => {
+        root.render(
+          <PageCard
+            page={initialPage}
+            selected
+            onSave={async () => {}}
+            editorViewMode="rich-text"
+            interactionMode="editing"
+            backend={backend}
+            onEditorReady={(editor) => {
+              if (editor) editors.push(editor);
+            }}
+            sync={sync}
+            revealRequest={revealRequest}
+          />,
+        );
+        await Promise.resolve();
+      });
+    };
+    await render(null);
+    const editor = editors.at(-1) as Editor;
+    // "show me" on the Updated from disk notice.
+    let revealKey = 0;
+    const showMe = async () => {
+      revealKey += 1;
+      await render({ key: revealKey, epoch: sync.epoch, commentId: null });
+    };
+    // An outside writer (the agent).
+    const agentWrites = async (nextContent: string) => {
+      disk.content = nextContent;
+      disk.version += 1;
+      await act(async () => {
+        await sync.resync();
+      });
+    };
+    const caretAfter = async (text: string) => {
+      const range = findTextRange(editor, text);
+      if (!range) throw new Error(`Could not find "${text}"`);
+      await act(async () => {
+        editor.view.dom.setAttribute("tabindex", "0");
+        editor.view.dom.focus();
+        editor.commands.setTextSelection(range.to);
+      });
+    };
+    return { disk, sync, editor, editors, agentWrites, caretAfter, showMe };
+  }
+
+  it("show me brings the block the disk change landed in into view, even after more typing above it", async () => {
+    const scrolled: Element[] = [];
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = function scrollIntoView() {
+      scrolled.push(this);
+    };
+    cleanups.push(async () => {
+      HTMLElement.prototype.scrollIntoView = original;
+    });
+    const { editor, agentWrites, caretAfter, showMe } =
+      await renderSyncedPageCard(
+        "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n",
+      );
+
+    await caretAfter("First paragraph.");
+    await act(async () => {
+      editor.commands.insertContent(" Typed");
+    });
+    await agentWrites(
+      "# Plan\n\nFirst paragraph.\n\nSecond paragraph, by the agent.\n",
+    );
+    await act(async () => {
+      editor.commands.insertContent(" and more after the change came in.");
+    });
+    await showMe();
+
+    expect(scrolled.map((element) => element.textContent)).toEqual([
+      "Second paragraph, by the agent.",
+    ]);
+  });
+
+  it("an external update keeps the editor instance and maps the selection", async () => {
+    const { disk, sync, editor, editors, agentWrites, caretAfter } =
+      await renderSyncedPageCard(
+        "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n",
+      );
+
+    // Jordan types at the end of the second paragraph.
+    await caretAfter("Second paragraph.");
+    await act(async () => {
+      editor.commands.insertContent(" Mine");
+    });
+    expect(sync.getView().dirty).toBe(true);
+    const caretBefore = editor.state.selection.from;
+
+    // The agent rewrites the first paragraph before the autosave goes out.
+    await agentWrites(
+      "# Plan\n\nFirst paragraph, made longer by the agent.\n\nSecond paragraph.\n",
+    );
+
+    expect(editors).toHaveLength(1);
+    expect(editor.isDestroyed).toBe(false);
+    expect(editor.getText()).toContain(
+      "First paragraph, made longer by the agent.",
+    );
+    expect(editor.getText()).toContain("Second paragraph. Mine");
+    expect(editor.state.selection.from).toBe(
+      caretBefore + ", made longer by the agent".length,
+    );
+    expect(document.activeElement).toBe(editor.view.dom);
+
+    // The next keystroke lands right after what was typed; both reach disk.
+    await act(async () => {
+      editor.commands.insertContent("!");
+    });
+    await act(async () => {
+      await sync.flush();
+    });
+    expect(disk.content).toBe(
+      "# Plan\n\nFirst paragraph, made longer by the agent.\n\nSecond paragraph. Mine!\n",
+    );
+  });
+
+  it("keeps a space just typed and the caret when disk changes another paragraph", async () => {
+    // The space at the end of a paragraph is not in the markdown yet, so a
+    // diff of the whole document used to reach back to it and move the
+    // caret into the agent's paragraph.
+    const { disk, sync, editor, agentWrites, caretAfter } =
+      await renderSyncedPageCard(
+        "# Plan\n\nFirst paragraph.\n\nSecond paragraph.\n",
+      );
+
+    await caretAfter("First paragraph.");
+    await act(async () => {
+      editor.commands.insertContent(" Typed ");
+    });
+    await agentWrites(
+      "# Plan\n\nFirst paragraph.\n\nSecond paragraph, by the agent.\n",
+    );
+    await act(async () => {
+      editor.commands.insertContent("more.");
+    });
+    await act(async () => {
+      await sync.flush();
+    });
+
+    expect(disk.content).toBe(
+      "# Plan\n\nFirst paragraph. Typed more.\n\nSecond paragraph, by the agent.\n",
+    );
   });
 });

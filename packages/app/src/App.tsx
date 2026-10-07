@@ -54,6 +54,7 @@ import {
   resolveAnchoredRailLayouts,
 } from "./document-comments";
 import { DocumentSync } from "./document-sync";
+import { createIndexedDbDraftStore, type DraftStore } from "./draft-store";
 import { cn } from "./lib/utils";
 import {
   acknowledgeOpenRequest,
@@ -92,6 +93,19 @@ export function shouldWarnBeforeUnload({
       saveState !== "saved" ||
       (diskChangeState !== "clean" && diskChangeState !== "unavailable"))
   );
+}
+
+// One IndexedDB draft store per page; null where the browser has none.
+let draftStore: DraftStore | null | undefined;
+function getDraftStore(): DraftStore | null {
+  if (draftStore === undefined) {
+    try {
+      draftStore = createIndexedDbDraftStore();
+    } catch {
+      draftStore = null;
+    }
+  }
+  return draftStore;
 }
 
 const AGENT_SETUP_PROMPT =
@@ -1699,6 +1713,13 @@ export function App() {
           path: documentPath,
           tabId: getOrCreateTabId(readSessionStorage()),
           initialPage: page,
+          // Unsaved drafts stay in this browser until they reach disk,
+          // keyed by the document's absolute path.
+          draftStore:
+            detectedBackend.info.kind === "local-files"
+              ? getDraftStore()
+              : null,
+          draftKey: joinPath(projectPath, documentPath),
           onOpenRequest: (request) =>
             handleOpenRequestEvent(JSON.stringify(request), {
               currentHref: window.location.href,
@@ -1712,6 +1733,10 @@ export function App() {
             }),
         });
         created = controller;
+        // A draft kept from an earlier session goes in before the editor
+        // mounts, merged onto the file as it is now.
+        await controller.restoreDraft();
+        if (cancelled) return;
         controller.start();
         autoRetriesRef.current = 0;
         setSync(controller);

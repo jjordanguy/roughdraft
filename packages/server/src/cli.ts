@@ -2563,8 +2563,17 @@ function describeRoute(route: WakeRoute | null | undefined): string {
 
 /** "plan.md: 1 tab, no agent listening, Done waiting since 3:42 PM (4 comments)" */
 function formatDocumentLine(view: DocumentView): string {
+  // Unsaved edits in a tab: an agent should let them save before writing.
+  const tabState: string[] = [];
+  if ((view.tabsDirty ?? 0) > 0)
+    tabState.push(`${view.tabsDirty} with unsaved edits`);
+  if ((view.tabsConflict ?? 0) > 0)
+    tabState.push(
+      `${view.tabsConflict} with ${view.tabsConflict === 1 ? "a conflict" : "conflicts"}`,
+    );
   const parts = [
-    plural(view.tabs, "tab"),
+    plural(view.tabs, "tab") +
+      (tabState.length > 0 ? ` (${tabState.join(", ")})` : ""),
     view.watchers > 0
       ? `${plural(view.watchers, "agent")} listening`
       : "no agent listening",

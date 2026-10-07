@@ -134,3 +134,88 @@ export async function blockTabChannel(page: Page) {
 export async function fireWindowFocus(page: Page) {
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
 }
+
+// Editing mode: typed words go in as text, not as suggestions.
+export async function useEditingMode(page: Page) {
+  await page.getByTestId("document-mode-trigger").click();
+  await page.getByTestId("document-mode-option-editing").click();
+}
+
+// Puts the rich-text caret right after `text` (the first match).
+export async function placeRichTextCaretAfter(page: Page, text: string) {
+  await richTextEditor(page).focus();
+  await page.evaluate((targetText) => {
+    const editor = document.querySelector(".ProseMirror");
+    if (!editor) throw new Error("Could not find rich-text editor");
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      const index = node.textContent?.indexOf(targetText) ?? -1;
+      if (index >= 0) {
+        const range = document.createRange();
+        range.setStart(node, index + targetText.length);
+        range.collapse(true);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        document.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+        return;
+      }
+      node = walker.nextNode();
+    }
+    throw new Error(`Could not find text "${targetText}"`);
+  }, text);
+}
+
+// Puts the code-view caret right after `text` (the first match inside one
+// line); CodeMirror reads the DOM selection.
+export async function placeCodeCaretAfter(page: Page, text: string) {
+  const editor = codeEditor(page);
+  await expect(editor).toBeVisible();
+  await editor.click();
+  await page.evaluate((targetText) => {
+    const content = document.querySelector(".cm-content");
+    if (!content) throw new Error("Could not find the code editor");
+    const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      const index = node.textContent?.indexOf(targetText) ?? -1;
+      if (index >= 0) {
+        const range = document.createRange();
+        range.setStart(node, index + targetText.length);
+        range.collapse(true);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        document.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+        return;
+      }
+      node = walker.nextNode();
+    }
+    throw new Error(`Could not find text "${targetText}"`);
+  }, text);
+}
+
+// A reload or close with unsaved edits asks first; the tests say yes.
+export function acceptBeforeUnload(page: Page) {
+  page.on("dialog", (dialog) => {
+    void dialog.accept();
+  });
+}
+
+// Holds the tab's saves until the returned function is called, so an
+// outside write lands first.
+export async function holdSaves(page: Page) {
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    (url) => url.pathname === "/api/markdown-file",
+    async (route) => {
+      if (route.request().method() === "PUT") await held;
+      await route.continue();
+    },
+  );
+  return () => release();
+}

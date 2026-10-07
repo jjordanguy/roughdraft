@@ -18,6 +18,7 @@ import express, {
   type Request,
   type Response,
 } from "express";
+import type { WriteMode } from "./atomic-write.js";
 import {
   type DocumentChange,
   type DocumentRead,
@@ -152,6 +153,10 @@ interface CreateAppOptions {
   tabPingMs?: number;
   /** An open round turns "stalled" after this long (default 30 minutes). */
   roundStallMs?: number;
+  /** Document writes: temp file plus rename (default) or in place. Default: `ROUGHDRAFT_WRITE_MODE`. */
+  writeMode?: WriteMode;
+  /** Test seam: runs inside each document write right before its last hash check. */
+  beforeWriteCommit?: (realPath: string) => void | Promise<void>;
 }
 
 interface CreateAppResult {
@@ -578,6 +583,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     pollMs: options.watchPollMs,
     rehashMs: options.watchRehashMs,
     releaseMs: options.watchReleaseMs,
+    writeMode: options.writeMode,
+    beforeWriteCommit: options.beforeWriteCommit,
   });
   const tabChannel = new TabChannel({
     watcher: documents,

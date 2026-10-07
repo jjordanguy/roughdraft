@@ -362,6 +362,11 @@ test.describe("global comments @batch4", () => {
     await expect(
       globalSection(page).getByTestId("global-comment-thread-a1"),
     ).toContainText("Round 1: no changes needed.");
+    // Batch 5: the round's write takes over from the badge as the quiet
+    // notice.
+    await expect(page.getByTestId("disk-update-notice")).toContainText(
+      "Updated from disk: 1 comment added",
+    );
   });
 
   test("Done saves an open global draft first", async ({ page }) => {

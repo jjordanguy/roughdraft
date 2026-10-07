@@ -20,8 +20,10 @@ import {
   type CompleteReviewResult,
   type HandoffRecord,
   MarkdownFileConflictError,
+  MarkdownFileNotFoundError,
   type Page,
   type RoundFlag,
+  ServerUnreachableError,
   type SessionRecord,
   type StorageBackend,
   type TabChannelHandlers,
@@ -36,6 +38,12 @@ class TestServer {
   kind: BackendInfo["kind"];
   saves: string[] = [];
   conflictOnSave = false;
+  // What a 409 says disk holds.
+  conflictContent = "Changed elsewhere";
+  // The file is gone; a PUT with `create` brings it back.
+  missing = false;
+  // Saves fail as if the server did not answer.
+  unreachable = false;
   channels: TabChannelHandlers[] = [];
   completeReview: (
     options?: CompleteReviewOptions,
@@ -81,20 +89,27 @@ class TestServer {
       },
       canManageProjects: false,
       getMarkdownFile: async () => this.page(),
-      saveMarkdownFile: async (_path, content) => {
+      saveMarkdownFile: async (_path, content, _expected, options) => {
+        if (this.unreachable) {
+          throw new ServerUnreachableError("PUT /api/markdown-file");
+        }
+        if (this.missing && !options?.create) {
+          throw new MarkdownFileNotFoundError("test.md", "not found");
+        }
         if (this.conflictOnSave) {
           throw new MarkdownFileConflictError({
             ...this.page(),
-            content: "Changed elsewhere",
+            content: this.conflictContent,
             version: "v99",
           });
         }
+        this.missing = false;
         this.saves.push(content);
         this.write(content);
         return this.page();
       },
       getMarkdownFileState: async () => ({
-        exists: true,
+        exists: !this.missing,
         available: true,
         version: `v${this.version}`,
         contentHash: localContentHash(this.content),
@@ -185,25 +200,26 @@ afterEach(() => {
   for (const sync of openSyncs.splice(0)) sync.dispose();
 });
 
-// Puts the tab in the state the old `documentDiskChangeState` prop forced:
-// a save that answered 409, optionally followed by "keep editing".
+// A document whose highlighted text both sides change: the merge cannot hold
+// that as a suggestion, so it waits in the conflict banner.
+const ENTRY = `  c1:\n    body: "Why?"\n    by: user\n    at: "2026-01-01T00:00:00.000Z"\n`;
+const MARKUP_BASE = `# T\n\nHi {==there==}{#c1}.\n\n---\ncomments:\n${ENTRY}`;
+const MARKUP_MINE = `# T\n\nHi {==there you==}{#c1}.\n\n---\ncomments:\n${ENTRY}`;
+const MARKUP_THEIRS = `# T\n\nHi {==there me==}{#c1}.\n\n---\ncomments:\n${ENTRY}`;
+
+// Puts the tab in the conflict state: a save of an overlapping edit that
+// answered 409. The document must start as MARKUP_BASE.
 async function driveDiskState(
   server: TestServer,
   sync: DocumentSync,
-  state: "clean" | "changed" | "conflict" | "paused",
+  state: "clean" | "conflict",
 ) {
   if (state === "clean") return;
   await act(async () => {
-    if (state === "changed") {
-      sync.edit(`${server.content} (local)`);
-      server.write("Changed elsewhere");
-      await sync.resync();
-      return;
-    }
     server.conflictOnSave = true;
-    sync.edit(`${server.content} (local)`);
+    server.conflictContent = MARKUP_THEIRS;
+    sync.edit(MARKUP_MINE);
     await sync.flush();
-    if (state === "paused") sync.keepEditing();
   });
 }
 
@@ -411,12 +427,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
     documentDiskChangeState = "clean",
   }: {
     saveState?: DocumentSaveState;
-    documentDiskChangeState?:
-      | "clean"
-      | "changed"
-      | "conflict"
-      | "paused"
-      | "unavailable";
+    documentDiskChangeState?: "clean" | "conflict" | "unavailable";
   } = {}) {
     await act(async () => {
       root.render(
@@ -431,11 +442,11 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
 
   async function renderWorkspace({
     documentDiskChangeState = "clean",
-    documentContent = "Hello world",
+    documentContent,
     documentCopyPath = "test.md",
     backendKind = "local-storage",
   }: {
-    documentDiskChangeState?: "clean" | "changed" | "conflict" | "paused";
+    documentDiskChangeState?: "clean" | "conflict";
     documentContent?: string;
     documentCopyPath?: string | null;
     backendKind?: BackendInfo["kind"];
@@ -444,7 +455,9 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
     ).IS_REACT_ACT_ENVIRONMENT = true;
     const server = new TestServer({
-      content: documentContent,
+      content:
+        documentContent ??
+        (documentDiskChangeState === "conflict" ? MARKUP_BASE : "Hello world"),
       kind: backendKind,
     });
     const sync = createSync(server);
@@ -493,9 +506,7 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
   });
 
   it.each([
-    ["changed", "File changed on disk"],
-    ["conflict", "Save conflict"],
-    ["paused", "Autosave paused"],
+    ["conflict", "Overlaps a change on disk"],
     ["unavailable", "File unavailable"],
   ] as const)("shows disk-blocked %s save status", async (state, label) => {
     await renderSaveStatus({ documentDiskChangeState: state });
@@ -761,41 +772,238 @@ describe("saving/saved status indicator (issue 2 fix)", () => {
 
     expect(preventDefault).toHaveBeenCalled();
     expect(server.saves).toEqual([]);
-    expect(container.textContent).toContain("Save conflict");
+    expect(container.textContent).toContain(
+      "Your edit overlaps a change on disk",
+    );
   });
 
-  it("shows conflict status without replacing the existing conflict banner", async () => {
+  it("lists each overlap with its choices and no autosave-paused option", async () => {
     await renderWorkspace({ documentDiskChangeState: "conflict" });
 
-    expect(container.textContent).toContain("Save conflict");
-    expect(container.textContent).toContain("This file changed on disk");
+    const banner = getByTestId(container, "file-conflict-notice");
+    expect(banner.textContent).toContain("Your edit overlaps a change on disk");
+    expect(
+      getByTestId(container, "file-conflict-hunk-h1-mine").textContent,
+    ).toBe("Hi {==there you==}{#c1}.");
+    expect(
+      getByTestId(container, "file-conflict-hunk-h1-disk").textContent,
+    ).toBe("Hi {==there me==}{#c1}.");
+    // The engine offers two choices for an overlap inside review markup.
+    expect(
+      getByTestId(container, "file-conflict-hunk-h1-theirs").textContent,
+    ).toBe("Use the disk version");
+    expect(
+      getByTestId(container, "file-conflict-hunk-h1-ours").textContent,
+    ).toBe("Use mine");
+    expect(
+      queryByTestId(container, "file-conflict-hunk-h1-suggestion"),
+    ).toBeNull();
+    expect(banner.textContent).not.toContain("autosave paused");
+    expect(
+      queryByTestId(container, "file-conflict-action-keep-editing"),
+    ).toBeNull();
     expect(
       getByTestId(container, "document-save-status").getAttribute("aria-label"),
-    ).toBe("Save conflict");
+    ).toBe("Overlaps a change on disk");
   });
 
-  it("names the disk version that Overwrite will replace", async () => {
-    await renderWorkspace({ documentDiskChangeState: "conflict" });
+  it("settles an overlap from the banner and saves", async () => {
+    const { server, sync } = await renderWorkspace({
+      documentDiskChangeState: "conflict",
+    });
+    server.conflictOnSave = false;
+    server.write(MARKUP_THEIRS);
+
+    await click(getByTestId(container, "file-conflict-hunk-h1-ours"));
+    await act(async () => {
+      await sync.flush();
+    });
+
+    expect(queryByTestId(container, "file-conflict-notice")).toBeNull();
+    expect(server.saves.at(-1)).toBe(MARKUP_MINE);
+  });
+
+  it("asks before an overwrite and shows the lines it replaces", async () => {
+    const { server } = await renderWorkspace({
+      documentDiskChangeState: "conflict",
+    });
+    server.conflictOnSave = false;
+    server.write(MARKUP_THEIRS);
 
     expect(
       getByTestId(container, "file-conflict-disk-version").textContent,
-    ).toContain("Overwrite replaces this version");
+    ).toContain("Disk version");
+    await click(getByTestId(container, "file-conflict-action-overwrite"));
+    const diff = getByTestId(document.body, "overwrite-confirm-diff");
+    expect(
+      [
+        ...diff.querySelectorAll("[data-testid='overwrite-diff-row-removed']"),
+      ].map((row) => row.textContent),
+    ).toEqual(["- Hi {==there me==}{#c1}."]);
+    expect(
+      [
+        ...diff.querySelectorAll("[data-testid='overwrite-diff-row-added']"),
+      ].map((row) => row.textContent),
+    ).toEqual(["+ Hi {==there you==}{#c1}."]);
+    expect(server.saves).toEqual([]);
+
+    await click(getByTestId(document.body, "overwrite-confirm-submit"));
+
+    expect(server.saves).toEqual([MARKUP_MINE]);
   });
 
-  it("shows a change that lands while autosave is paused", async () => {
+  it("says quietly what an outside write changed, in a toast", async () => {
     const { server, sync } = await renderWorkspace({
-      documentDiskChangeState: "paused",
+      documentContent: "# Plan\n\n## Rollout\n\nTwo weeks.\n",
     });
-    expect(queryByTestId(container, "file-conflict-later-change")).toBeNull();
 
-    server.write("Changed again by the agent");
+    server.write("# Plan\n\n## Rollout\n\nThree weeks.\n");
     await act(async () => {
       await sync.resync();
     });
 
+    const notice = getByTestId(container, "disk-update-notice");
+    expect(notice.textContent).toContain(
+      "Updated from disk: text changed in Rollout",
+    );
+    expect(getByTestId(container, "sync-toast").contains(notice)).toBe(true);
+    expect(queryByTestId(container, "file-conflict-notice")).toBeNull();
+    await click(getByTestId(notice, "disk-update-show"));
+    await click(getByTestId(notice, "sync-notice-dismiss"));
+    expect(queryByTestId(container, "disk-update-notice")).toBeNull();
+  });
+
+  it("asks loudly to restore text an outside write removed, and restores it as a suggestion", async () => {
+    const { server, sync } = await renderWorkspace({
+      documentContent: "# Plan\n\nIntro.\n\nOutro.\n",
+    });
+    await act(async () => {
+      sync.edit("# Plan\n\nIntro.\n\nMy point about the rollout.\n\nOutro.\n");
+      await sync.flush();
+    });
+
+    server.write("# Plan\n\nIntro.\n\nOutro.\n");
+    await act(async () => {
+      await sync.resync();
+    });
+
+    const notice = getByTestId(container, "removed-text-notice");
+    expect(notice.textContent).toContain(
+      "An outside write removed text you saved. Restore it?",
+    );
+    expect(getByTestId(notice, "removed-text-preview").textContent).toBe(
+      "My point about the rollout.",
+    );
+
+    await click(getByTestId(notice, "removed-text-restore"));
+    await act(async () => {
+      await sync.flush();
+    });
+
+    expect(queryByTestId(container, "removed-text-notice")).toBeNull();
+    expect(server.content).toContain(
+      "Intro.\n\n{++My point about the rollout.++}{#s1}\n\nOutro.",
+    );
+    expect(server.content).toMatch(/suggestions:\n {2}s1:\n {4}by: user\n/);
+  });
+
+  it("says Roughdraft is offline with a countdown and Retry now", async () => {
+    const { server, sync } = await renderWorkspace();
+    server.unreachable = true;
+    await act(async () => {
+      sync.edit("Hello world, offline");
+      await sync.flush();
+    });
+
+    const notice = getByTestId(container, "sync-status-notice");
+    expect(notice.getAttribute("data-sync-state")).toBe("offline");
+    expect(notice.textContent).toContain(
+      "Roughdraft is offline.Your edits are kept in this browser and will save when it is back. Trying again in 1 s.",
+    );
+
+    server.unreachable = false;
+    await click(getByTestId(notice, "sync-status-retry"));
+    await act(async () => {
+      await sync.flush();
+    });
+    expect(server.content).toBe("Hello world, offline");
+    expect(queryByTestId(container, "sync-status-notice")).toBeNull();
+  });
+
+  it("says the file is unavailable and recreates it from the draft", async () => {
+    const { server, sync } = await renderWorkspace();
+    server.missing = true;
+    await act(async () => {
+      await sync.resync();
+    });
+
+    const notice = getByTestId(container, "sync-status-notice");
+    expect(notice.getAttribute("data-sync-state")).toBe("unavailable");
+    expect(notice.textContent).toContain(
+      "File unavailable: test.md is not on disk",
+    );
+
+    await act(async () => {
+      sync.edit("Hello world, kept");
+    });
+    await click(getByTestId(notice, "sync-status-recreate"));
+
+    expect(server.missing).toBe(false);
+    expect(server.content).toBe("Hello world, kept");
+    expect(queryByTestId(container, "sync-status-notice")).toBeNull();
+  });
+
+  it("shows the restored-draft line after a draft comes back from the browser", async () => {
+    const { createMemoryDraftStore } = await import("../src/draft-store");
+    const store = createMemoryDraftStore();
+    const server = new TestServer({ content: "Hello world" });
+    await store.put({
+      key: "/docs/test.md",
+      draft: "Hello world, from last session",
+      base: {
+        content: "Hello world",
+        version: "v1",
+        contentHash: localContentHash("Hello world"),
+        seq: 1,
+      },
+      tabId: "old",
+      savedAt: Date.now(),
+    });
+    const sync = new DocumentSync({
+      backend: server.backend(),
+      path: "test.md",
+      tabId: "tab-test",
+      initialPage: server.page(),
+      environment: { isVisible: () => true, listen: () => () => {} },
+      draftStore: store,
+      draftKey: "/docs/test.md",
+    });
+    openSyncs.push(sync);
+    await sync.restoreDraft();
+    sync.start();
+
+    await act(async () => {
+      root.render(
+        <DocumentWorkspace
+          sync={sync}
+          activeDocumentPath="test.md"
+          documentCopyPath="test.md"
+          documentFilenameLabel="test.md"
+          documentEditorViewMode="rich-text"
+          onDocumentEditorViewModeChange={() => {}}
+          backend={server.backend()}
+        />,
+      );
+      await Promise.resolve();
+    });
+
+    expect(getByTestId(container, "draft-restored-notice").textContent).toBe(
+      "Restored unsaved edits from your last session",
+    );
     expect(
-      getByTestId(container, "file-conflict-later-change").textContent,
-    ).toContain("The file changed on disk again");
+      container.querySelector('[data-testid="rich-text-editor"] .ProseMirror')
+        ?.textContent,
+    ).toContain("Hello world, from last session");
   });
 
   it("ignores initial editor dirty signals before user input is possible", () => {
@@ -1263,33 +1471,60 @@ describe("review handoff watcher affordance", () => {
     ).toContain("Done, waiting");
   });
 
-  it("says the file changed when the Done answers 409, and blocks Retry until it is resolved", async () => {
+  it("says the edit overlaps a change on disk when Done finds one, and blocks Retry until it is resolved", async () => {
     const onCompleteReview = vi
       .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
-      .mockRejectedValue(
-        new MarkdownFileConflictError({
-          id: "test-doc",
-          title: "Test Doc",
-          content: "The agent wrote this first",
-          version: "v7",
-        }),
-      );
+      .mockResolvedValue({ delivered: true });
+    const { server, sync } = await renderWorkspace({
+      watchers: 1,
+      onCompleteReview,
+      content: MARKUP_BASE,
+    });
+    server.conflictOnSave = true;
+    server.conflictContent = MARKUP_THEIRS;
+    await act(async () => {
+      sync.edit(MARKUP_MINE);
+    });
 
-    await renderWorkspace({ watchers: 1, onCompleteReview });
     await click(getByTestId(container, "review-handoff-button"));
     await settle();
 
     const status = getByTestId(document.body, "review-handoff-status");
     expect(status.textContent).toContain(
-      "The file changed on disk before Roughdraft could record your Done.",
+      "Your edit overlaps a change on disk, so Roughdraft did not record your Done.",
     );
     expect(
       getByTestId<HTMLButtonElement>(status, "review-handoff-retry").disabled,
     ).toBe(true);
+    expect(onCompleteReview).not.toHaveBeenCalled();
     expect(
       getByTestId(container, "document-save-status").getAttribute("aria-label"),
-    ).toBe("Save conflict");
+    ).toBe("Overlaps a change on disk");
     expect(getByTestId(container, "file-conflict-notice")).not.toBeNull();
+  });
+
+  it("sends Done again after a disk change that answered it merges cleanly", async () => {
+    const onCompleteReview = vi
+      .fn<(options?: CompleteReviewOptions) => Promise<CompleteReviewResult>>()
+      .mockRejectedValueOnce(
+        new MarkdownFileConflictError({
+          id: "test-doc",
+          title: "Test Doc",
+          content: "Hello world\n\nThe agent wrote this first.\n",
+          version: "v7",
+        }),
+      )
+      .mockResolvedValue({ delivered: false, pending: true });
+
+    await renderWorkspace({ watchers: 1, onCompleteReview });
+    await click(getByTestId(container, "review-handoff-button"));
+    await settle();
+
+    expect(onCompleteReview).toHaveBeenCalledTimes(2);
+    expect(
+      getByTestId(container, "review-handoff-button").textContent,
+    ).toContain("Done, waiting");
+    expect(queryByTestId(container, "file-conflict-notice")).toBeNull();
   });
 
   it("says the server did not answer when the Done never got a reply", async () => {
@@ -1340,8 +1575,11 @@ describe("review handoff watcher affordance", () => {
     expect(onCompleteReview.mock.calls[0]?.[0]?.overallComment).toBeUndefined();
   });
 
-  it("disables Done with a reason while the file is in conflict", async () => {
-    const { server, sync } = await renderWorkspace({ watchers: 1 });
+  it("reads Resolve N overlaps first while overlaps wait for a choice", async () => {
+    const { server, sync } = await renderWorkspace({
+      watchers: 1,
+      content: MARKUP_BASE,
+    });
     await driveDiskState(server, sync, "conflict");
 
     const button = getByTestId<HTMLButtonElement>(
@@ -1349,9 +1587,17 @@ describe("review handoff watcher affordance", () => {
       "review-handoff-button",
     );
     expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.textContent).toBe("Resolve 1 overlap first");
     expect(
       getByTestId(container, "review-handoff-blocked-reason").textContent,
-    ).toBe("Save conflict. Resolve it before you finish.");
+    ).toBe("Resolve 1 overlap first: your edit overlaps a change on disk.");
+
+    // Choosing a version clears it.
+    server.conflictOnSave = false;
+    server.write(MARKUP_THEIRS);
+    await click(getByTestId(container, "file-conflict-hunk-h1-theirs"));
+    expect(button.textContent).not.toContain("Resolve");
+    expect(button.getAttribute("aria-disabled")).toBeNull();
   });
 
   it("fades the whole handoff split button after sending", async () => {

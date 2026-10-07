@@ -33,9 +33,16 @@ describe("documentKey", () => {
     );
   });
 
-  it("falls back to the resolved path for a file that does not exist", () => {
-    expect(documentKey(path.join(linkDir, "missing.md"))).toBe(
-      path.join(linkDir, "missing.md"),
+  it("keys a missing file on its real parent, so the key survives the file disappearing", () => {
+    const key = documentKey(path.join(realDir, "plan.md"));
+    fs.rmSync(path.join(realDir, "plan.md"));
+
+    expect(documentKey(path.join(linkDir, "plan.md"))).toBe(key);
+  });
+
+  it("falls back to the resolved path when the parent does not exist either", () => {
+    expect(documentKey(path.join(linkDir, "gone", "missing.md"))).toBe(
+      path.join(linkDir, "gone", "missing.md"),
     );
   });
 });

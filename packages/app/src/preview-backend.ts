@@ -1,4 +1,12 @@
-import type { BackendInfo, Page, StorageBackend, StoredAsset } from "./storage";
+import { localContentHash } from "./content-hash";
+import type {
+  BackendInfo,
+  MarkdownFileState,
+  Page,
+  StorageBackend,
+  StoredAsset,
+  TabChannel,
+} from "./storage";
 
 function titleFromContent(content: string, fallback: string) {
   const firstLine = content.split("\n")[0] || "";
@@ -60,6 +68,23 @@ export class PreviewBackend implements StorageBackend {
     };
 
     return this.page;
+  }
+
+  async getMarkdownFileState(
+    _relativePath: string,
+  ): Promise<MarkdownFileState> {
+    return {
+      exists: true,
+      available: true,
+      version: this.page.version ?? null,
+      contentHash: localContentHash(this.page.content),
+      seq: 0,
+    };
+  }
+
+  // Nothing else can change an in-memory page, so the channel stays silent.
+  openTabChannel(): TabChannel {
+    return { send() {}, close() {} };
   }
 
   async completeReview(

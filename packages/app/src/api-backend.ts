@@ -4,13 +4,20 @@ import {
   type CompleteReviewResult,
   type HandoffRecord,
   type HandoffWake,
-  type MarkdownFileChangeEvent,
   MarkdownFileConflictError,
+  MarkdownFileNotFoundError,
+  type MarkdownFileState,
   type Page,
-  type ReviewWatchStatus,
+  type SaveMarkdownFileOptions,
+  ServerResponseError,
+  ServerUnreachableError,
   type SessionRecord,
   type StorageBackend,
   type StoredAsset,
+  type TabChannel,
+  type TabChannelHandlers,
+  type TabServerMessage,
+  UnsupportedRouteError,
 } from "./storage";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -49,6 +56,122 @@ function parseSessionRecord(value: unknown): SessionRecord | null {
   return value as unknown as SessionRecord;
 }
 
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function optionalNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function parseMarkdownFileState(
+  value: unknown,
+): MarkdownFileState | null {
+  if (!isRecord(value) || typeof value.exists !== "boolean") return null;
+  return {
+    exists: value.exists,
+    available: value.available !== false,
+    reason: optionalString(value.reason),
+    version: optionalString(value.version),
+    contentHash: optionalString(value.contentHash),
+    seq: optionalNumber(value.seq) ?? 0,
+    ...(typeof value.instanceId === "string"
+      ? { instanceId: value.instanceId }
+      : {}),
+    ...(typeof value.tabs === "number" ? { tabs: value.tabs } : {}),
+  };
+}
+
+// One JSON object per message. Unknown or malformed messages become null so
+// a newer server cannot break an older tab.
+export function parseTabServerMessage(value: unknown): TabServerMessage | null {
+  if (!isRecord(value) || typeof value.type !== "string") return null;
+  switch (value.type) {
+    case "hello": {
+      const document = parseMarkdownFileState(value.document);
+      if (!document) return null;
+      return {
+        type: "hello",
+        instanceId: optionalString(value.instanceId) ?? "",
+        document,
+        tabs: optionalNumber(value.tabs) ?? 0,
+        watchers: optionalNumber(value.watchers) ?? 0,
+        session: parseSessionRecord(value.session),
+        handoff: parseHandoffRecord(value.handoff),
+        latestSequence: optionalNumber(value.latestSequence),
+      };
+    }
+    case "change": {
+      const state = parseMarkdownFileState(value);
+      if (!state) return null;
+      const origin =
+        value.origin === "tab" || value.origin === "outside"
+          ? value.origin
+          : "unknown";
+      return {
+        type: "change",
+        seq: state.seq,
+        exists: state.exists,
+        available: state.available,
+        reason: state.reason ?? null,
+        version: state.version,
+        contentHash: state.contentHash,
+        origin,
+        ...(typeof value.tabId === "string" ? { tabId: value.tabId } : {}),
+      };
+    }
+    case "watchers": {
+      const count = optionalNumber(value.count);
+      return count === null ? null : { type: "watchers", count };
+    }
+    case "handoff": {
+      const handoff = parseHandoffRecord(value.handoff);
+      return handoff ? { type: "handoff", handoff } : null;
+    }
+    case "open-request": {
+      if (typeof value.url !== "string") return null;
+      return {
+        type: "open-request",
+        requestId: optionalString(value.requestId) ?? "",
+        url: value.url,
+      };
+    }
+    case "ping":
+      return { type: "ping", seq: optionalNumber(value.seq) ?? 0 };
+    default:
+      return null;
+  }
+}
+
+function parsePage(value: unknown, fallbackId: string): Page {
+  const record = isRecord(value) ? value : {};
+  return {
+    id: typeof record.id === "string" ? record.id : fallbackId,
+    title: typeof record.title === "string" ? record.title : fallbackId,
+    content: typeof record.content === "string" ? record.content : "",
+    ...(typeof record.version === "string" ? { version: record.version } : {}),
+    ...(typeof record.contentHash === "string"
+      ? { contentHash: record.contentHash }
+      : {}),
+    ...(typeof record.seq === "number" ? { seq: record.seq } : {}),
+    ...(typeof record.instanceId === "string"
+      ? { instanceId: record.instanceId }
+      : {}),
+  };
+}
+
+async function readErrorDetail(res: Response): Promise<string | undefined> {
+  try {
+    const payload = (await res.clone().json()) as unknown;
+    if (isRecord(payload) && typeof payload.error === "string") {
+      return payload.error;
+    }
+  } catch {
+    // Not JSON.
+  }
+  return undefined;
+}
+
 export class ApiBackend implements StorageBackend {
   info: BackendInfo;
   canManageProjects = true;
@@ -80,26 +203,75 @@ export class ApiBackend implements StorageBackend {
     return `${url.pathname}${url.search}`;
   }
 
+  // fetch rejects only when no answer arrived; name the route in the error so
+  // the start-up screen and the handoff can say what failed.
+  private async request(
+    route: string,
+    url: string,
+    init?: RequestInit,
+  ): Promise<Response> {
+    try {
+      return await fetch(url, init);
+    } catch (error) {
+      throw new ServerUnreachableError(route, error);
+    }
+  }
+
   async getMarkdownFile(relativePath: string): Promise<Page> {
-    const res = await fetch(
-      this.buildUrl("/api/markdown-file", {
-        path: relativePath,
-      }),
+    const route = "GET /api/markdown-file";
+    const res = await this.request(
+      route,
+      this.buildUrl("/api/markdown-file", { path: relativePath }),
     );
-    if (!res.ok) {
-      throw new Error(
-        `Failed to get markdown file ${relativePath}: ${res.status}`,
+    if (res.status === 404) {
+      throw new MarkdownFileNotFoundError(
+        relativePath,
+        (await readErrorDetail(res)) ?? `File not found: ${relativePath}`,
       );
     }
-    return res.json();
+    if (!res.ok) {
+      throw new ServerResponseError(
+        route,
+        res.status,
+        await readErrorDetail(res),
+      );
+    }
+    return parsePage(await res.json(), relativePath);
+  }
+
+  async getMarkdownFileState(relativePath: string): Promise<MarkdownFileState> {
+    const route = "GET /api/markdown-file/state";
+    const res = await this.request(
+      route,
+      this.buildUrl("/api/markdown-file/state", { path: relativePath }),
+    );
+    let payload: unknown = null;
+    try {
+      payload = await res.clone().json();
+    } catch {
+      // A server without this route answers with the app's HTML or a 404.
+    }
+    const state = parseMarkdownFileState(payload);
+    if (res.ok && state) return state;
+    if (!state && (res.ok || res.status === 404)) {
+      throw new UnsupportedRouteError(route);
+    }
+    throw new ServerResponseError(
+      route,
+      res.status,
+      await readErrorDetail(res),
+    );
   }
 
   async saveMarkdownFile(
     relativePath: string,
     content: string,
     expectedVersion?: string,
+    options: SaveMarkdownFileOptions = {},
   ): Promise<Page> {
-    const res = await fetch(
+    const route = "PUT /api/markdown-file";
+    const res = await this.request(
+      route,
       this.buildUrl("/api/markdown-file", { path: relativePath }),
       {
         method: "PUT",
@@ -107,46 +279,95 @@ export class ApiBackend implements StorageBackend {
         body: JSON.stringify({
           content,
           expectedVersion,
+          ...(options.expectedContentHash
+            ? { expectedContentHash: options.expectedContentHash }
+            : {}),
+          ...(options.tabId ? { tabId: options.tabId } : {}),
           projectPath: this.info.projectPath,
         }),
       },
     );
     if (res.status === 409) {
-      const payload = (await res.json()) as { current?: Page };
+      const payload = (await res.json().catch(() => ({}))) as {
+        current?: unknown;
+      };
       if (payload.current) {
-        throw new MarkdownFileConflictError(payload.current);
+        throw new MarkdownFileConflictError(
+          parsePage(payload.current, relativePath),
+        );
       }
     }
-    if (!res.ok) {
-      throw new Error(
-        `Failed to save markdown file ${relativePath}: ${res.status}`,
+    if (res.status === 404) {
+      throw new MarkdownFileNotFoundError(
+        relativePath,
+        (await readErrorDetail(res)) ?? `File not found: ${relativePath}`,
       );
     }
-    return res.json();
+    if (!res.ok) {
+      throw new ServerResponseError(
+        route,
+        res.status,
+        await readErrorDetail(res),
+      );
+    }
+    return parsePage(await res.json(), relativePath);
   }
 
-  watchMarkdownFile(
+  openTabChannel(
     relativePath: string,
-    onChange: (event: MarkdownFileChangeEvent) => void,
-  ): () => void {
-    const source = new EventSource(
-      this.buildUrl("/api/markdown-file/events", { path: relativePath }),
+    tabId: string,
+    handlers: TabChannelHandlers,
+  ): TabChannel {
+    const url = new URL(
+      this.buildUrl("/api/tab", { path: relativePath, tabId }),
+      window.location.origin,
     );
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
 
-    source.addEventListener("change", (event) => {
-      try {
-        onChange(JSON.parse((event as MessageEvent<string>).data));
-      } catch (error) {
-        console.error("Failed to read markdown file change event:", error);
-      }
-    });
+    let socket: WebSocket | null = null;
+    try {
+      socket = new WebSocket(url.toString());
+    } catch (error) {
+      console.error("Could not open the Roughdraft tab channel:", error);
+      queueMicrotask(() => handlers.onClose());
+    }
 
-    source.onerror = (error) => {
-      console.error("Markdown file event stream failed:", error);
-    };
+    if (socket) {
+      socket.onopen = () => handlers.onOpen();
+      socket.onmessage = (event: MessageEvent) => {
+        if (typeof event.data !== "string") return;
+        for (const line of event.data.split("\n")) {
+          if (!line.trim()) continue;
+          let raw: unknown;
+          try {
+            raw = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const message = parseTabServerMessage(raw);
+          if (message) handlers.onMessage(message);
+        }
+      };
+      // An error is always followed by close, which drives the reconnect.
+      socket.onerror = () => {};
+      socket.onclose = () => handlers.onClose();
+    }
 
-    return () => {
-      source.close();
+    return {
+      send(message) {
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify(message));
+        }
+      },
+      close() {
+        if (!socket) return;
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+        socket = null;
+      },
     };
   }
 
@@ -154,8 +375,10 @@ export class ApiBackend implements StorageBackend {
     relativePath: string,
     options: CompleteReviewOptions = {},
   ): Promise<CompleteReviewResult> {
+    const route = "POST /api/review-events";
     const overallComment = options.overallComment?.trim();
-    const res = await fetch(
+    const res = await this.request(
+      route,
       this.buildUrl("/api/review-events", { path: relativePath }),
       {
         method: "POST",
@@ -165,13 +388,32 @@ export class ApiBackend implements StorageBackend {
           path: relativePath,
           ...(overallComment ? { overallComment } : {}),
           ...(options.handoffId ? { handoffId: options.handoffId } : {}),
+          ...(options.expectedVersion
+            ? { expectedVersion: options.expectedVersion }
+            : {}),
+          ...(options.expectedContentHash
+            ? { expectedContentHash: options.expectedContentHash }
+            : {}),
         }),
       },
     );
 
+    if (res.status === 409) {
+      const payload = (await res.json().catch(() => ({}))) as {
+        current?: unknown;
+      };
+      if (payload.current) {
+        throw new MarkdownFileConflictError(
+          parsePage(payload.current, relativePath),
+        );
+      }
+    }
+
     if (!res.ok) {
-      throw new Error(
-        `Failed to complete review ${relativePath}: ${res.status}`,
+      throw new ServerResponseError(
+        route,
+        res.status,
+        await readErrorDetail(res),
       );
     }
 
@@ -182,28 +424,6 @@ export class ApiBackend implements StorageBackend {
       pending: payload.pending === true,
       handoff,
       wake: parseHandoffWake(payload.wake) ?? handoff?.wake ?? null,
-    };
-  }
-
-  async getReviewWatchStatus(relativePath: string): Promise<ReviewWatchStatus> {
-    const res = await fetch(
-      this.buildUrl("/api/review-events/status", { path: relativePath }),
-    );
-
-    if (!res.ok) {
-      throw new Error(
-        `Failed to get review watch status ${relativePath}: ${res.status}`,
-      );
-    }
-
-    const payload = (await res.json()) as Record<string, unknown>;
-    return {
-      watching: payload.watching === true,
-      watcherCount:
-        typeof payload.watcherCount === "number" ? payload.watcherCount : 0,
-      tabs: typeof payload.tabs === "number" ? payload.tabs : undefined,
-      handoff: parseHandoffRecord(payload.handoff),
-      session: parseSessionRecord(payload.session),
     };
   }
 

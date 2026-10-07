@@ -53,6 +53,18 @@ const demoBackend: StorageBackend = {
       content,
     };
   },
+  async getMarkdownFileState() {
+    return {
+      exists: true,
+      available: true,
+      version: null,
+      contentHash: null,
+      seq: 0,
+    };
+  },
+  openTabChannel() {
+    return { send() {}, close() {} };
+  },
   async saveAsset(file) {
     return {
       markdownPath: file.name,

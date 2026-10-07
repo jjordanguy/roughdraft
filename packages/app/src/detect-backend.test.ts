@@ -61,4 +61,14 @@ describe("detectBackend", () => {
 
     expect(backend).toBeInstanceOf(LocalStorageBackend);
   });
+
+  it("throws instead of using local storage when a file page needs the server", async () => {
+    global.fetch = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    }) as unknown as typeof fetch;
+
+    await expect(detectBackend({ requireServer: true })).rejects.toThrow(
+      "The Roughdraft server did not answer (GET /api/status): Failed to fetch",
+    );
+  });
 });

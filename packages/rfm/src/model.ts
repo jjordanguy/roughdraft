@@ -147,8 +147,81 @@ export interface RfmModelSummary {
   endmatter: RfmEndmatterStatus;
 }
 
+/** One train or ref in the tail of a highlight, a suggestion marker or a standalone run. */
+export interface RfmTailItem {
+  type: "train" | "ref";
+  /** The id from the train's metadata or the ref; null for a train with no metadata. */
+  id: string | null;
+  offset: number;
+  endOffset: number;
+  /** Train text between `{>>` and `<<}` (raw, `<br>` not decoded). */
+  content: string | null;
+  /** How the train's metadata is written; null for a ref or a train with none. */
+  metadata: "reference" | "attribute" | "legacy" | null;
+  /** Attribute or legacy metadata of the train, unknown attributes included. */
+  attributes: Record<string, string> | null;
+}
+
+/**
+ * One run of review markup in the body, in document order. Text between runs
+ * is plain Markdown. Writers use these to rewrite the markup without touching
+ * the prose around it.
+ */
+export interface RfmMarkupRun {
+  /**
+   * - `highlight`: `{==text==}` and the trains and refs after it.
+   * - `standalone`: trains or a bare ref with no highlight before them.
+   * - `suggestion`: a suggestion marker, its metadata, and the trains and refs after it.
+   * - `fence-ref`: one ref on the opening line of a fenced code block.
+   */
+  type: "highlight" | "standalone" | "suggestion" | "fence-ref";
+  offset: number;
+  endOffset: number;
+  /** Highlight text range (highlight runs). */
+  textStart: number | null;
+  textEnd: number | null;
+  /** Suggestion marker fields (suggestion runs). */
+  suggestionKind: RfmSuggestionKind | null;
+  markerEnd: number | null;
+  /** Deleted or replaced text (deletions and substitutions). */
+  original: string | null;
+  /** Inserted text (additions and substitutions). */
+  replacement: string | null;
+  /** The marker's id (suggestion runs) or the ref's id (fence-ref runs). */
+  id: string | null;
+  /** How the marker's metadata is written (suggestion runs). */
+  metadata: "reference" | "attribute" | "legacy" | null;
+  attributes: Record<string, string> | null;
+  /** End of the marker's metadata (suggestion runs). */
+  metadataEnd: number | null;
+  /** Index into `fences` (fence-ref runs). */
+  fenceIndex: number | null;
+  tail: RfmTailItem[];
+}
+
+/** A fenced code block in the body. */
+export interface RfmFence {
+  /** Start of the opening fence line. */
+  offset: number;
+  /** Start of the info string (after the backticks or tildes). */
+  infoOffset: number;
+  /** End of the opening line (before its line break). */
+  openLineEnd: number;
+  /** First byte of the code (the line after the opening line). */
+  codeStart: number;
+  /** End of the code: the start of the closing fence line, or the end of the body. */
+  codeEnd: number;
+  info: string;
+  codeLines: string[];
+  blockIndex: number;
+}
+
 export interface RfmReviewModel {
   split: RoughdraftDocumentSplit;
+  /** Every run of review markup in the body, in document order. */
+  markup: RfmMarkupRun[];
+  /** Every fenced code block in the body, in document order. */
+  fences: RfmFence[];
   /** Roots, document-level comments and replies in document order; endmatter-only entries follow in YAML order. */
   comments: RfmModelComment[];
   suggestions: RfmModelSuggestion[];
@@ -203,6 +276,8 @@ interface MarkerOcc {
 
 interface FenceBlock {
   offset: number;
+  openLineEnd: number;
+  codeEnd: number;
   infoOffset: number;
   info: string;
   codeLines: string[];
@@ -587,6 +662,32 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
 
   const trains: TrainOcc[] = [];
   const refs: RefOcc[] = [];
+  const runs: RfmMarkupRun[] = [];
+  const emptyRun = (
+    type: RfmMarkupRun["type"],
+    offset: number,
+  ): RfmMarkupRun => ({
+    type,
+    offset,
+    endOffset: offset,
+    textStart: null,
+    textEnd: null,
+    suggestionKind: null,
+    markerEnd: null,
+    original: null,
+    replacement: null,
+    id: null,
+    metadata: null,
+    attributes: null,
+    metadataEnd: null,
+    fenceIndex: null,
+    tail: [],
+  });
+  const metadataKindOf = (meta: Metadata | null): RfmTailItem["metadata"] => {
+    if (!meta) return null;
+    if (meta.kind === "reference") return "reference";
+    return meta.kind === "legacy" ? "legacy" : "attribute";
+  };
   const markers: MarkerOcc[] = [];
   const fences: FenceBlock[] = [];
   let legacyMetadata = 0;
@@ -679,18 +780,40 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
     return train;
   };
 
-  const parseTail = (from: number, anchor: RfmAnchor): number => {
+  const parseTail = (
+    from: number,
+    anchor: RfmAnchor,
+    tail: RfmTailItem[] = [],
+  ): number => {
     let cursor = from;
     for (;;) {
       if (markdown.startsWith("{>>", cursor)) {
         const train = parseTrain(cursor, anchor);
         if (!train) break;
+        tail.push({
+          type: "train",
+          id: train.synthetic ? null : train.id,
+          offset: train.offset,
+          endOffset: train.endOffset,
+          content: train.content,
+          metadata: metadataKindOf(train.meta),
+          attributes: attrsRecord(train.meta),
+        });
         cursor = train.endOffset;
         continue;
       }
       const ref = markdown.slice(cursor, cursor + 200).match(refPattern);
       if (ref) {
         const end = cursor + ref[0].length;
+        tail.push({
+          type: "ref",
+          id: ref[1] ?? "",
+          offset: cursor,
+          endOffset: end,
+          content: null,
+          metadata: null,
+          attributes: null,
+        });
         refs.push({
           id: ref[1] ?? "",
           offset: cursor,
@@ -792,6 +915,7 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
       const fenceMatch = matchFence(lineText, fence);
       if (fenceMatch) {
         if (fence) {
+          if (currentFence) currentFence.codeEnd = offset;
           fence = null;
           currentFence = null;
         } else {
@@ -800,6 +924,8 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
           const infoOffset = offset + (markerMatch?.[0].length ?? 0);
           currentFence = {
             offset,
+            openLineEnd: offset + lineText.length,
+            codeEnd: scanEnd,
             infoOffset,
             info: markdown.slice(infoOffset, offset + lineText.length),
             codeLines: [],
@@ -850,7 +976,12 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
         endOffset: close + 3,
         line: lineOf(offset),
       };
-      const tailEnd = parseTail(close + 3, anchor);
+      const run = emptyRun("highlight", offset);
+      run.textStart = offset + 3;
+      run.textEnd = close;
+      const tailEnd = parseTail(close + 3, anchor, run.tail);
+      run.endOffset = Math.max(tailEnd, close + 3);
+      runs.push(run);
       offset = tailEnd > close + 3 ? tailEnd : close + 3;
       continue;
     }
@@ -865,9 +996,12 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
         line: lineOf(offset),
       };
       const before = trains.length;
-      const tailEnd = parseTail(offset, anchor);
+      const run = emptyRun("standalone", offset);
+      const tailEnd = parseTail(offset, anchor, run.tail);
       if (trains.length > before) {
         anchor.endOffset = trains[before]?.endOffset ?? tailEnd;
+        run.endOffset = tailEnd;
+        runs.push(run);
         offset = tailEnd;
         continue;
       }
@@ -883,7 +1017,21 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
         endOffset: marker.markerEnd,
         line: marker.line,
       };
-      offset = parseTail(marker.endOffset, anchor);
+      const run = emptyRun("suggestion", marker.offset);
+      run.suggestionKind = marker.kind;
+      run.markerEnd = marker.markerEnd;
+      run.original = marker.originalText ?? null;
+      run.replacement =
+        marker.kind === "deletion"
+          ? null
+          : (marker.replacementText ?? marker.text);
+      run.id = marker.synthetic ? null : marker.id;
+      run.metadata = metadataKindOf(marker.meta);
+      run.attributes = attrsRecord(marker.meta);
+      run.metadataEnd = marker.meta ? marker.meta.endOffset : null;
+      offset = parseTail(marker.endOffset, anchor, run.tail);
+      run.endOffset = offset;
+      runs.push(run);
       continue;
     }
 
@@ -892,6 +1040,18 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
       const id = ref?.[1];
       if (ref && id && isQualifiedBareRef(id)) {
         const end = offset + ref[0].length;
+        const run = emptyRun("standalone", offset);
+        run.endOffset = end;
+        run.tail.push({
+          type: "ref",
+          id,
+          offset,
+          endOffset: end,
+          content: null,
+          metadata: null,
+          attributes: null,
+        });
+        runs.push(run);
         refs.push({
           id,
           offset,
@@ -921,6 +1081,11 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
       const id = match[1] ?? "";
       if (!isQualifiedBareRef(id)) continue;
       const refOffset = block.infoOffset + (match.index ?? 0);
+      const run = emptyRun("fence-ref", refOffset);
+      run.endOffset = refOffset + match[0].length;
+      run.id = id;
+      run.fenceIndex = fences.indexOf(block);
+      runs.push(run);
       refs.push({
         id,
         offset: refOffset,
@@ -1595,6 +1760,17 @@ export function parseReviewModel(markdown: string): RfmReviewModel {
       bodyOffset: split.bodyOffset,
       endmatterOffset: split.endmatterOffset,
     },
+    markup: runs.sort((a, b) => a.offset - b.offset),
+    fences: fences.map((block) => ({
+      offset: block.offset,
+      infoOffset: block.infoOffset,
+      openLineEnd: block.openLineEnd,
+      codeStart: nextLineOffset(markdown, block.offset),
+      codeEnd: block.codeEnd,
+      info: block.info,
+      codeLines: block.codeLines,
+      blockIndex: block.blockIndex,
+    })),
     comments,
     suggestions,
     orphans,

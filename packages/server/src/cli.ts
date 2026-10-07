@@ -22,7 +22,17 @@ import {
   ROUGHDRAFT_LOOPBACK_HOSTS,
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
+import { runGuardHook } from "./guard.js";
 import { findAvailablePort } from "./ports.js";
+import {
+  type ReviewCliOptions,
+  runApplyCli,
+  runDoctorFixCli,
+  runFeedbackCli,
+  runRoundCli,
+  runThreadCli,
+  type ThreadCommand,
+} from "./review-commands.js";
 import {
   type ApiContext,
   ackHandoffs,
@@ -82,6 +92,15 @@ const KNOWN_COMMANDS = [
   "route",
   "mcp",
   "doctor",
+  "feedback",
+  "reply",
+  "resolve",
+  "accept",
+  "reject",
+  "note",
+  "round",
+  "apply",
+  "guard",
   "help",
   "agent-setup",
   "criticmarkup",
@@ -151,6 +170,8 @@ export interface CliDependencies {
   watchTuning?: Partial<WatchTuning>;
   /** Clock for the watch deadline (tests use a fake one). */
   now?: () => number;
+  /** Reads standard input to the end (`reply <file> <id> -`, `apply -`, `guard`). */
+  readStdin: () => Promise<string>;
 }
 
 type OpenMode =
@@ -225,6 +246,17 @@ interface ParsedCommandOptions {
   url?: string;
   watch: boolean;
   positionals: string[];
+  author?: string;
+  summary?: string;
+  dropReplies: boolean;
+  dir?: string;
+  agentLabels?: string;
+  dryRun: boolean;
+  skipFailed: boolean;
+  waitSeconds?: number;
+  fix: boolean;
+  report?: string;
+  claudeHook: boolean;
 }
 
 const currentServerRoot = path.resolve(
@@ -325,9 +357,16 @@ type FlagGroup =
   | "session"
   | "pendingAck"
   | "route"
-  | "doctor";
+  | "doctor"
+  | "author"
+  | "summary"
+  | "decide"
+  | "round"
+  | "apply"
+  | "fix"
+  | "guard";
 
-const FLAG_GROUPS: Record<string, FlagGroup> = {
+const FLAG_GROUPS: Record<string, FlagGroup | FlagGroup[]> = {
   "--all": "all",
   "--no-open": "open",
   "--print-url": "open",
@@ -340,7 +379,7 @@ const FLAG_GROUPS: Record<string, FlagGroup> = {
   "--pending": "watch",
   "--no-pending": "watch",
   "--after": "watch",
-  "--no-ack": "watch",
+  "--no-ack": ["watch", "round"],
   "--reconnect": "watch",
   "--harness": "session",
   "--session-label": "session",
@@ -351,6 +390,17 @@ const FLAG_GROUPS: Record<string, FlagGroup> = {
   "--url": "route",
   "--label": "route",
   "--strict": "doctor",
+  "--author": "author",
+  "--summary": "summary",
+  "--drop-replies": "decide",
+  "--dir": "round",
+  "--agent-labels": "round",
+  "--dry-run": ["apply", "fix"],
+  "--skip-failed": "apply",
+  "--wait": "apply",
+  "--fix": "fix",
+  "--report": "fix",
+  "--claude-hook": "guard",
 };
 
 const VALUE_FLAGS = new Set([
@@ -368,6 +418,12 @@ const VALUE_FLAGS = new Set([
   "--label",
   "--state-file",
   "--state-dir",
+  "--author",
+  "--summary",
+  "--dir",
+  "--agent-labels",
+  "--wait",
+  "--report",
 ]);
 
 function parseCommandOptions(
@@ -389,6 +445,11 @@ function parseCommandOptions(
     replay: false,
     strict: false,
     watch: false,
+    dropReplies: false,
+    dryRun: false,
+    skipFailed: false,
+    fix: false,
+    claudeHook: false,
   };
   const allowedGroups = new Set(allowed);
 
@@ -417,11 +478,11 @@ function parseCommandOptions(
 
     const equals = arg.indexOf("=");
     const flag = equals === -1 ? arg : arg.slice(0, equals);
-    const group = FLAG_GROUPS[flag];
+    const groups = ([] as FlagGroup[]).concat(FLAG_GROUPS[flag] ?? []);
     const known =
       flag === "--state-file" ||
       flag === "--state-dir" ||
-      (group !== undefined && allowedGroups.has(group));
+      groups.some((group) => allowedGroups.has(group));
     if (!known) {
       throw usageError(`Unknown flag: ${flag}`);
     }
@@ -430,6 +491,12 @@ function parseCommandOptions(
     if (VALUE_FLAGS.has(flag)) {
       if (equals !== -1) {
         value = arg.slice(equals + 1);
+      } else if (flag === "--summary" || flag === "--author") {
+        // Free text may start with a dash.
+        const next = args[index + 1];
+        if (next === undefined) throw usageError(`${flag} requires a value.`);
+        value = next;
+        index += 1;
       } else {
         const next = takeFlagValue(args, index, flag);
         value = next.value;
@@ -520,6 +587,39 @@ function parseCommandOptions(
         break;
       case "--state-dir":
         parsed.stateDir = value;
+        break;
+      case "--author":
+        parsed.author = value;
+        break;
+      case "--summary":
+        parsed.summary = value;
+        break;
+      case "--drop-replies":
+        parsed.dropReplies = true;
+        break;
+      case "--dir":
+        parsed.dir = value;
+        break;
+      case "--agent-labels":
+        parsed.agentLabels = value;
+        break;
+      case "--dry-run":
+        parsed.dryRun = true;
+        break;
+      case "--skip-failed":
+        parsed.skipFailed = true;
+        break;
+      case "--wait":
+        parsed.waitSeconds = parsePositiveNumber(value ?? "", flag);
+        break;
+      case "--fix":
+        parsed.fix = true;
+        break;
+      case "--report":
+        parsed.report = value;
+        break;
+      case "--claude-hook":
+        parsed.claudeHook = true;
         break;
     }
   }
@@ -845,8 +945,41 @@ export function createCliDependencies(
     onInterrupt: overrides.onInterrupt ?? defaultOnInterrupt,
     watchTuning: overrides.watchTuning,
     now: overrides.now,
+    readStdin: overrides.readStdin ?? readProcessStdin,
   };
 }
+
+async function readProcessStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function reviewCliOptions(options: ParsedCommandOptions): ReviewCliOptions {
+  return {
+    positionals: options.positionals,
+    author: options.author,
+    summary: options.summary,
+    dropReplies: options.dropReplies,
+    dir: options.dir,
+    agentLabels: options.agentLabels,
+    noAck: options.noAck,
+    dryRun: options.dryRun,
+    skipFailed: options.skipFailed,
+    waitSeconds: options.waitSeconds,
+    report: options.report,
+  };
+}
+
+const THREAD_COMMANDS = new Set<string>([
+  "reply",
+  "resolve",
+  "accept",
+  "reject",
+  "note",
+]);
 
 /** Request options with the token header added when ROUGHDRAFT_TOKEN is set. */
 function withAuth(deps: CliDependencies, init: RequestInit = {}): RequestInit {
@@ -905,6 +1038,17 @@ function printHelp(log: (message: string) => void) {
   log("  route <action>     List, add, remove or test wake routes");
   log("  mcp                Start the experimental stdio MCP server");
   log("  doctor [path]      Diagnose setup or validate Markdown");
+  log("  doctor --fix <file> Convert an older review format (after --dry-run)");
+  log("  feedback <file>    List every review thread with its context");
+  log(
+    "  round <file>       Start a review round: clean copy plus response file",
+  );
+  log("  apply <response>   Land a round in one checked write");
+  log("  reply <file> <id> <text>  Answer one thread (- reads stdin)");
+  log("  resolve <file> <id>       Resolve one thread");
+  log("  accept|reject <file> <sN> Decide one suggestion");
+  log("  note <file> <text>        Add the agent's round note");
+  log("  guard --claude-hook       Claude Code PreToolUse hook");
   log("  help agent         Print the agent setup prompt");
   log("  help criticmarkup  Show CriticMarkup examples");
   log("  agent-setup        Print the agent setup prompt");
@@ -924,13 +1068,16 @@ function printHelp(log: (message: string) => void) {
   log("  roughdraft watch ./draft.md --json");
   log("  roughdraft pending ./draft.md --json --ack");
   log("  roughdraft status --json");
+  log('  roughdraft round ./draft.md && roughdraft apply "<response.json>"');
+  log("  roughdraft reply ./draft.md c1 - <<'EOF'");
   log("");
   for (const line of DONE_LOG_PARAGRAPH) log(line);
   log("");
+  log("Exit codes: 0 done, 2 bad command or path, 3 server problem, 4 timeout");
   log(
-    "Exit codes: 0 done, 2 bad command or path, 3 server problem, 4 timeout,",
+    "(or the tab stayed dirty for apply), 130 or 143 stopped by a signal, 1 unexpected",
   );
-  log("130 or 143 stopped by a signal, 1 unexpected error.");
+  log("error or a review write refused with nothing written.");
   log("");
   log(`Agent setup: ${AGENT_SETUP_URL}`);
   log("Use `roughdraft help agent` for a copyable setup prompt.");
@@ -1148,6 +1295,10 @@ function printCommandHelp(
     log("Usage:");
     log("  roughdraft doctor [path] [--json]");
     log("  roughdraft doctor <file> --strict [--json]");
+    log("  roughdraft doctor --fix <file> [--dry-run] [--json]");
+    log(
+      "  roughdraft doctor --fix --dry-run [--report <out.md>] <files...> [--json]",
+    );
     log("");
     log(
       "Diagnoses local Roughdraft setup and server state, or validates one Markdown file.",
@@ -1164,9 +1315,149 @@ function printCommandHelp(
     log("");
     log("Flags:");
     log("  --strict             Fail on warnings too (exit 1)");
+    log(
+      "  --fix                Convert an older review format to the current one; backs the",
+    );
+    log(
+      "                       file up to <stateDir>/backups/<name>.<time>.md first (exit 1 when it refuses)",
+    );
+    log("  --dry-run            With --fix: list every change, write nothing");
+    log(
+      "  --report <out.md>    With --fix --dry-run: one Markdown report over every file given",
+    );
     log("  --json               Print machine-readable output");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
+    return;
+  }
+
+  if (command === "feedback") {
+    log("Usage:");
+    log("  roughdraft feedback <file> [--agent-labels AI,Mike] [--json]");
+    log("");
+    log(
+      "Lists every review thread once, with its anchor text, section, the paragraphs around it,",
+    );
+    log(
+      "earlier replies and whether it needs an answer. Starts nothing and writes nothing.",
+    );
+    return;
+  }
+
+  if (command === "reply" || command === "note") {
+    log("Usage:");
+    log('  roughdraft reply <file> <id> "<text>" [--author <name>] [--json]');
+    log('  roughdraft note <file> "<text>" [--author <name>] [--json]');
+    log("  roughdraft reply <file> <id> - <<'EOF'");
+    log("");
+    log(
+      "Adds one agent entry (an aN id, by AI unless --author) to the review block and prints",
+    );
+    log(
+      "its id and the doctor breakdown. - reads the text from stdin (one trailing newline is",
+    );
+    log(
+      "dropped), so a quoted heredoc keeps $, backticks and quotes. Text that is empty or",
+    );
+    log(
+      "holds review markup is refused (exit 1, nothing written). An older-format file is",
+    );
+    log("refused with: run roughdraft doctor --fix first.");
+    return;
+  }
+
+  if (command === "resolve") {
+    log("Usage:");
+    log('  roughdraft resolve <file> <id> [--summary "<text>"] [--json]');
+    log("");
+    log("Marks one thread resolved, with an optional one-line summary.");
+    return;
+  }
+
+  if (command === "accept" || command === "reject") {
+    log("Usage:");
+    log("  roughdraft accept <file> <sN> [--drop-replies] [--json]");
+    log("  roughdraft reject <file> <sN> [--drop-replies] [--json]");
+    log("");
+    log(
+      "Settles one suggestion: accept keeps the proposed text, reject the original. Its",
+    );
+    log(
+      "marker and entries go; a suggestion with replies needs --drop-replies. Decide one",
+    );
+    log("only when Jordan asked for it.");
+    return;
+  }
+
+  if (command === "round") {
+    log("Usage:");
+    log(
+      "  roughdraft round <file> [--dir <dir>] [--agent-labels AI,Mike] [--no-ack] [--json]",
+    );
+    log("");
+    log(
+      "Acknowledges the waiting Done for the file and writes round.json, clean.md (the",
+    );
+    log(
+      "document with every review marker removed), response.json (a template) and base.md",
+    );
+    log(
+      "to <stateDir>/rounds/<roundId>/ or --dir. Reports tabDirty and tabConflict and one",
+    );
+    log(
+      "line per thread, and sets the document's AI editing flag. Never writes the document.",
+    );
+    log(
+      "Edit clean.md, fill in response.json, then run roughdraft apply <response.json>.",
+    );
+    return;
+  }
+
+  if (command === "apply") {
+    log("Usage:");
+    log(
+      "  roughdraft apply <response.json | -> [--dry-run] [--skip-failed] [--wait <seconds>] [--json]",
+    );
+    log("");
+    log(
+      "Lands a round in one checked write: the clean.md edits, replies, resolutions, decisions",
+    );
+    log(
+      "and the round note. Exit 0 applied (a retry answers already-applied), 1 refused with",
+    );
+    log(
+      "nothing written and every problem listed, 2 usage, 4 the tab still had unsaved text",
+    );
+    log("after --wait (default 10 seconds).");
+    log("");
+    log("Flags:");
+    log("  --dry-run        Check and report; write nothing");
+    log(
+      "  --skip-failed    Drop failing threads (with the edits tied to them) and apply the rest",
+    );
+    log("  --wait <s>       How long to wait for a dirty tab to save");
+    return;
+  }
+
+  if (command === "guard") {
+    log("Usage:");
+    log("  roughdraft guard --claude-hook");
+    log("");
+    log(
+      "A Claude Code PreToolUse hook. Reads the hook JSON on stdin and denies Edit,",
+    );
+    log(
+      "MultiEdit and Write on a file with an open round (naming its clean.md), Write over",
+    );
+    log(
+      "a file with review data, and edits that touch review markup outside code. Prints",
+    );
+    log(
+      "nothing and exits 0 for everything else and on any error (it fails open). Settings:",
+    );
+    log(
+      '  { "matcher": "Edit|MultiEdit|Write", "hooks": [{ "type": "command", "command": "roughdraft guard --claude-hook" }] }',
+    );
     return;
   }
 
@@ -1208,6 +1499,7 @@ const CRITICMARKUP_HELP = [
   "  {>>comment<<}       Inline comment (older files only; do not write it)",
   "",
   "How Roughdraft stores review feedback:",
+  "  Agents never type any of this: `roughdraft reply`, `resolve`, `accept`, `reject`, `note`, or `round` and `apply` write it.",
   "  A comment is an anchor in the prose plus an entry in the review block at the end of the file.",
   "  Comment text never sits in the prose. The prose keeps only the anchor: {==the highlighted words==}{#c1}.",
   "  Replies live only in the review block, as entries with `re: <parent id>`. Never write a reply in the prose.",
@@ -1303,10 +1595,13 @@ const REVIEW_FORMAT_PARAGRAPH = [
   "block's opening fence line (the entry then has `lines` and `quote`). Every",
   "comment's text, author, time, status and replies live in the one review block",
   "at the end of the file; a comment on the whole document is an entry there with",
-  "`scope: document`. Replies live only in the review block: write each one as an",
-  "entry with an `a1`, `a2` id, `by: AI`, a quoted `at` and `re: <comment id>`,",
-  "and write a line break as <br>. Run `roughdraft doctor <file>` afterwards and",
-  "check the count line. `roughdraft help criticmarkup` has copyable examples.",
+  "`scope: document`. Replies live only in the review block, as entries with",
+  "`a1`, `a2` ids, `by: AI` and `re: <comment id>`; a line break is <br>.",
+  "Never type any of it. Answer one thread with `roughdraft reply`, `resolve`,",
+  "`accept`, `reject` or `note`, or a whole review with `roughdraft round`",
+  "(edit the clean.md it names, fill in response.json) and `roughdraft apply`.",
+  "Run `roughdraft doctor <file>` afterwards and check the count line.",
+  "`roughdraft help criticmarkup` has the format reference.",
 ];
 
 function printCriticMarkupHelp(log: (message: string) => void) {
@@ -3457,8 +3752,17 @@ export async function runCli(
       log: [],
       route: ["route", "port"],
       mcp: [],
-      doctor: ["doctor"],
+      doctor: ["doctor", "fix"],
       open: ["open", "port", "watch", "session"],
+      feedback: ["round"],
+      reply: ["author"],
+      resolve: ["summary", "author"],
+      accept: ["decide", "author"],
+      reject: ["decide", "author"],
+      note: ["author"],
+      round: ["round"],
+      apply: ["apply"],
+      guard: ["guard"],
     };
     const options = parseCommandOptions(rest, groupsByCommand[command] ?? []);
     json = json || options.json;
@@ -3643,6 +3947,81 @@ export async function runCli(
       const { startMcpServer } = await import("./mcp.js");
       startMcpServer({ env: deps.env, fetchImpl: deps.fetchImpl });
       return new Promise<number>(() => {});
+    }
+
+    if (THREAD_COMMANDS.has(command)) {
+      return await runThreadCli(
+        { ...deps, serverRoot: currentServerRoot },
+        command as ThreadCommand,
+        reviewCliOptions(options),
+        json,
+        ctx,
+      );
+    }
+
+    if (command === "feedback") {
+      return await runFeedbackCli(
+        { ...deps, serverRoot: currentServerRoot },
+        reviewCliOptions(options),
+        json,
+        ctx,
+      );
+    }
+
+    if (command === "round") {
+      return await runRoundCli(
+        { ...deps, serverRoot: currentServerRoot },
+        reviewCliOptions(options),
+        json,
+        ctx,
+      );
+    }
+
+    if (command === "apply") {
+      return await runApplyCli(
+        { ...deps, serverRoot: currentServerRoot },
+        reviewCliOptions(options),
+        json,
+        ctx,
+      );
+    }
+
+    if (command === "guard") {
+      if (!options.claudeHook || options.positionals.length > 0) {
+        throw usageError("Usage: roughdraft guard --claude-hook");
+      }
+      // Fails open: whatever happens, exit 0 and print nothing unless denying.
+      let stdin = "";
+      try {
+        stdin = await deps.readStdin();
+      } catch {}
+      const outcome = runGuardHook(stdin, {
+        stateDir: getStateDir(deps.env),
+      });
+      if (outcome.stdout) deps.log(outcome.stdout.trimEnd());
+      return 0;
+    }
+
+    if (
+      command === "doctor" &&
+      (options.fix || options.dryRun || options.report)
+    ) {
+      if (!options.fix) {
+        throw usageError(
+          "--dry-run and --report go with --fix: roughdraft doctor --fix <file> --dry-run",
+        );
+      }
+      if (options.strict) {
+        throw usageError(
+          "--strict checks a file; run it after doctor --fix, not with it.",
+        );
+      }
+      return await runDoctorFixCli(
+        { ...deps, serverRoot: currentServerRoot },
+        reviewCliOptions(options),
+        json,
+        ctx,
+      );
     }
 
     if (command === "doctor") {

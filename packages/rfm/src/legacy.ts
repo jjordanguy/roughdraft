@@ -1,7 +1,8 @@
 // The rfm reader and writers exactly as published in roughdraft 0.1.10, frozen
 // in packages/rfm/legacy/index-0.1.10.js. Used to prove that files the fork
-// writes still read correctly on a machine running 0.1.10, and (until batch
-// 3b replaces them) as the implementation of the three mutation helpers.
+// writes still read correctly on a machine running 0.1.10 (the apply gate), and
+// for the one write the fork keeps in the 0.1.10 shape: a person's global
+// comment on a file still in the old format (see writers.ts).
 import * as frozen from "../legacy/index-0.1.10.js";
 
 export interface LegacyDiagnostic {
@@ -68,24 +69,8 @@ export function extractReviewIndexWithLegacyReader(
   return frozen.extractRoughdraftReviewIndex(markdown) as LegacyReviewIndex;
 }
 
-export const legacyAppendRoughdraftReply = frozen.appendRoughdraftReply as (
-  markdown: string,
-  options: {
-    parentId: string;
-    message: string;
-    author?: string;
-    at?: string;
-    id?: string;
-  },
-) => string;
-
 export const legacyAppendRoughdraftDocumentComment =
   frozen.appendRoughdraftDocumentComment as (
     markdown: string,
     options: { message: string; author?: string; at?: string; id?: string },
   ) => string;
-
-export const legacyMarkRoughdraftResolved = frozen.markRoughdraftResolved as (
-  markdown: string,
-  options: { targetId: string; summary?: string },
-) => string;

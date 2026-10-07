@@ -1,10 +1,3 @@
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import {
-  extractReviewIndexWithLegacyReader,
-  legacyAppendRoughdraftDocumentComment,
-  legacyAppendRoughdraftReply,
-  legacyMarkRoughdraftResolved,
-} from "./legacy.js";
 import {
   createLineStarts,
   locationForOffset,
@@ -17,11 +10,48 @@ import {
 import type { RfmEndmatterStatus } from "./split.js";
 
 export {
+  applyReviewResponse,
+  type RfmApplyAnchorReport,
+  type RfmApplyEditReport,
+  type RfmApplyError,
+  type RfmApplyInput,
+  type RfmApplyReport,
+  type RfmApplyResult,
+  type RfmEditSpec,
+  type RfmRestoredItem,
+  type RfmReviewResponse,
+  type RfmThreadAction,
+} from "./apply.js";
+export {
+  type CanonicalDocument,
+  LEGACY_FORMAT_MESSAGE,
+  RoughdraftFormatError,
+  type RoughdraftFormatErrorCode,
+} from "./canonical.js";
+export {
+  cleanOffsetToSource,
+  type RfmCleanText,
+  type RfmCleanTextAnchor,
+  type RfmCleanTextMap,
+  type RfmCleanTextRun,
+  type RfmCleanTextSuggestion,
+  reviewCleanText,
+} from "./clean.js";
+export { diffCleanText } from "./edits.js";
+export {
   extractReviewIndexWithLegacyReader,
   type LegacyReviewIndex,
   type LegacyValidationResult,
   validateWithLegacyReader,
 } from "./legacy.js";
+export { lintRoughdraftMarkdown, type RfmLintResult } from "./lint.js";
+export {
+  mergeReviewEntries,
+  type RfmEntriesInput,
+  type RfmMergeConflict,
+  type RfmMergedEntries,
+  type RfmMergeResult,
+} from "./merge.js";
 export {
   parseReviewModel,
   type RfmAnchor,
@@ -29,6 +59,8 @@ export {
   type RfmCommentScope,
   type RfmDiagnostic,
   type RfmDiagnosticSeverity,
+  type RfmFence,
+  type RfmMarkupRun,
   type RfmMetadataSource,
   type RfmModelComment,
   type RfmModelSuggestion,
@@ -37,7 +69,28 @@ export {
   type RfmReviewModel,
   type RfmSuggestionKind,
   type RfmSuggestionPart,
+  type RfmTailItem,
 } from "./model.js";
+export {
+  changesShape,
+  normalizeRoughdraftMetadata,
+  type RfmNormalizationChange,
+  type RfmNormalizationRefusal,
+  type RfmNormalizationResult,
+  serializeReviewModel,
+} from "./normalize.js";
+export {
+  buildReviewRound,
+  DEFAULT_AGENT_LABELS,
+  type RfmRound,
+  type RfmRoundAnchor,
+  type RfmRoundOptions,
+  type RfmRoundReply,
+  type RfmRoundSegment,
+  type RfmRoundThread,
+  type RfmRoundThreadKind,
+} from "./round.js";
+export { sha256Hex } from "./sha256.js";
 export {
   type RfmEndmatterEntries,
   type RfmEndmatterEntry,
@@ -52,6 +105,14 @@ export {
   type RfmEndmatterEntriesInput,
   stringifyRoughdraftEndmatter,
 } from "./writer.js";
+export {
+  type AppendRoughdraftDocumentCommentOptions,
+  type AppendRoughdraftReplyOptions,
+  appendRoughdraftDocumentComment,
+  appendRoughdraftReply,
+  type MarkRoughdraftResolvedOptions,
+  markRoughdraftResolved,
+} from "./writers.js";
 
 export interface RfmValidationSummary {
   /** Roots + document-level comments + replies (the number `doctor` prints). */
@@ -138,26 +199,6 @@ export interface RfmReviewIndex {
   items: RfmReviewItem[];
   diagnostics: RfmDiagnostic[];
   summary: RfmReviewIndexSummary;
-}
-
-export interface AppendRoughdraftReplyOptions {
-  parentId: string;
-  message: string;
-  author?: string;
-  at?: string;
-  id?: string;
-}
-
-export interface AppendRoughdraftDocumentCommentOptions {
-  message: string;
-  author?: string;
-  at?: string;
-  id?: string;
-}
-
-export interface MarkRoughdraftResolvedOptions {
-  targetId: string;
-  summary?: string;
 }
 
 const RFM_VERSION = "0.2" as const;
@@ -282,116 +323,4 @@ export function extractRoughdraftReviewIndex(markdown: string): RfmReviewIndex {
       endmatter: model.summary.endmatter,
     },
   };
-}
-
-// --------------------------------------------------------------- writers
-//
-// The three mutation helpers keep the 0.1.10 behavior until batch 3b replaces
-// them with the canonical writer. They run the frozen 0.1.10 code, with one
-// fix: a reply whose parent lives only in the review block (a document-level
-// comment, an endmatter reply, or a new-format root whose text is in the
-// block) is written to the review block with `re`. 0.1.10 wrote it as an
-// inline attribute block directly above `---`.
-
-const CRITICMARKUP_CLOSE_DELIMITER_PATTERN = /<<}|\+\+}|--}|~~}|==}/;
-
-function assertSafeCommentBodyText(message: string): void {
-  const match = message.match(CRITICMARKUP_CLOSE_DELIMITER_PATTERN);
-  if (!match) return;
-  throw new Error(
-    `Reply text contains CriticMarkup close delimiter "${match[0]}". Rewrite the reply without raw CriticMarkup delimiters.`,
-  );
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function plainObjectEntries(value: unknown): Record<string, unknown> {
-  if (!isPlainObject(value)) return {};
-  return Object.fromEntries(
-    Object.entries(value).filter(([, entry]) => isPlainObject(entry)),
-  );
-}
-
-function nextLegacyCommentId(items: Array<{ id: string }>): string {
-  let maxId = 0;
-  for (const item of items) {
-    const match = item.id.match(/^c(\d+)$/);
-    if (!match) continue;
-    maxId = Math.max(maxId, Number.parseInt(match[1] ?? "0", 10));
-  }
-  return `c${maxId + 1}`;
-}
-
-/** 0.1.10's endmatter rewrite: the final block is re-serialized with yaml defaults. */
-function writeLegacyEndmatterComment(
-  markdown: string,
-  id: string,
-  entry: Record<string, unknown>,
-): string {
-  const last = [...markdown.matchAll(/\n---[ \t]*\r?\n/g)].at(-1);
-  if (!last || last.index === undefined) {
-    throw new Error("Review block not found.");
-  }
-  const yaml = markdown.slice(last.index).replace(/^\n---[ \t]*\r?\n/, "");
-  const parsed = parseYaml(yaml) as unknown;
-  const data: Record<string, unknown> = isPlainObject(parsed)
-    ? { ...parsed }
-    : {};
-  const comments = plainObjectEntries(data.comments);
-  const suggestions = plainObjectEntries(data.suggestions);
-  comments[id] = entry;
-  data.comments = comments;
-  if (Object.keys(suggestions).length > 0) {
-    data.suggestions = suggestions;
-  } else {
-    delete data.suggestions;
-  }
-  const body = markdown.slice(0, last.index).replace(/\s*$/, "\n");
-  return `${body}\n---\n${stringifyYaml(data)}`;
-}
-
-export function appendRoughdraftReply(
-  markdown: string,
-  options: AppendRoughdraftReplyOptions,
-): string {
-  assertSafeCommentBodyText(options.message);
-  const index = extractReviewIndexWithLegacyReader(markdown);
-  const parent = index.items.find((item) => item.id === options.parentId);
-  if (!parent) {
-    throw new Error(`Review item not found: ${options.parentId}`);
-  }
-
-  // 0.1.10 locates review-block items at the block itself (offset equals
-  // endOffset); those parents have nothing inline to attach a reply to.
-  const parentOnlyInReviewBlock = parent.offset === parent.endOffset;
-  if (!parentOnlyInReviewBlock) {
-    return legacyAppendRoughdraftReply(markdown, options);
-  }
-
-  return writeLegacyEndmatterComment(
-    markdown,
-    options.id ?? nextLegacyCommentId(index.items),
-    {
-      body: options.message,
-      by: options.author ?? "AI",
-      at: options.at ?? new Date().toISOString(),
-      re: options.parentId,
-    },
-  );
-}
-
-export function appendRoughdraftDocumentComment(
-  markdown: string,
-  options: AppendRoughdraftDocumentCommentOptions,
-): string {
-  return legacyAppendRoughdraftDocumentComment(markdown, options);
-}
-
-export function markRoughdraftResolved(
-  markdown: string,
-  options: MarkRoughdraftResolvedOptions,
-): string {
-  return legacyMarkRoughdraftResolved(markdown, options);
 }

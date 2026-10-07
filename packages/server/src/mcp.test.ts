@@ -562,9 +562,10 @@ describe("mcp", () => {
           parentId: "c1",
           message: "This closes early <<} and breaks parsing.",
         },
-        { ROUGHDRAFT_STATE_FILE: stateFile },
+        // Port 9 (discard) has no listener: the write path never probes a real server.
+        { ROUGHDRAFT_STATE_FILE: stateFile, ROUGHDRAFT_PORT: "9" },
       ),
-    ).rejects.toThrow(/CriticMarkup close delimiter/);
+    ).rejects.toThrow(/contains CriticMarkup/);
 
     expect(fs.readFileSync(documentPath, "utf8")).toBe(original);
   });

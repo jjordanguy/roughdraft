@@ -113,6 +113,7 @@ export class TabChannel {
     this.pingMs = options.pingMs ?? TAB_PING_MS;
     options.registry.onChange((key, change) => {
       if (change === "watchers") this.sendWatchers(key);
+      if (change === "round") this.broadcastRound(key);
     });
   }
 
@@ -134,6 +135,14 @@ export class TabChannel {
   broadcastHandoff(key: string, handoff: HandoffRecord): void {
     for (const client of this.clients.get(key) ?? []) {
       if (client.ready) this.send(client, { type: "handoff", handoff });
+    }
+  }
+
+  /** The round flag ("AI editing") changed: open, closed or stalled. */
+  broadcastRound(key: string): void {
+    const round = this.options.registry.round(key);
+    for (const client of this.clients.get(key) ?? []) {
+      if (client.ready) this.send(client, { type: "round", round });
     }
   }
 
@@ -262,6 +271,7 @@ export class TabChannel {
       tabs: registry.tabCount(key),
       tabsDirty: registry.tabsDirty(key),
       watchers: client.lastWatchers,
+      round: registry.round(key),
       session: log.get(key)?.session ?? null,
       handoff: log.latestHandoff(key),
       latestSequence: this.options.latestSequence(),

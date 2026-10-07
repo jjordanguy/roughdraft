@@ -701,6 +701,7 @@ describe("createApp", () => {
         documentRegistry: true,
         handoffLog: true,
         wakeRoutes: true,
+        reviewRounds: true,
         tokenRequired: false,
       },
       warnings: [],

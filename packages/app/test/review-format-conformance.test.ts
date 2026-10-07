@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   extractRoughdraftReviewIndex,
+  parseReviewModel,
   splitRoughdraftDocument,
 } from "@roughdraft/rfm";
 import type { JSONContent } from "@tiptap/core";
@@ -14,6 +15,8 @@ import {
   type CriticComment,
   criticMarkdownToEditorState,
   editorStateToCriticMarkdown,
+  getReviewBlockError,
+  getReviewFormat,
 } from "../src/critic-markup";
 import { parseCodeCommentAnchors } from "../src/editor-extensions";
 
@@ -67,8 +70,20 @@ function rfmItems(markdown: string) {
         ),
       ),
   );
+  // The later parts of a suggestion over several blocks (`continues`) show
+  // as one suggestion in the browser, under the first part's id.
+  const partsOf = new Map<string, string[]>();
+  for (const item of index.items) {
+    if (item.kind === "suggestion" && item.continues) {
+      partsOf.set(item.continues, [
+        ...(partsOf.get(item.continues) ?? []),
+        item.anchors.map((anchor) => anchor.text).join(""),
+      ]);
+    }
+  }
   const items: Item[] = index.items
     .filter((item) => !(item.kind === "suggestion" && item.text === ""))
+    .filter((item) => !(item.kind === "suggestion" && item.continues))
     .map((item) => ({
       id: item.id,
       kind: item.kind,
@@ -77,7 +92,10 @@ function rfmItems(markdown: string) {
       // A legacy suggestion replicated on several blocks shows all its parts.
       text:
         item.kind === "suggestion"
-          ? item.anchors.map((anchor) => anchor.text).join("")
+          ? [
+              item.anchors.map((anchor) => anchor.text).join(""),
+              ...(partsOf.get(item.id) ?? []),
+            ].join("")
           : item.text,
       status: item.kind === "suggestion" ? null : item.status,
     }));
@@ -273,5 +291,83 @@ describe("canonical files survive a save with nothing changed", () => {
     expect(splitRoughdraftDocument(saved).endmatter).toBe(
       splitRoughdraftDocument(markdown).endmatter,
     );
+  });
+});
+
+// D11: nothing converts an older-format file on save. Its review markup and
+// its review block come back byte for byte through a save with an unrelated
+// edit. (Prose the rich-text editor cannot round-trip yet, such as tables
+// and hard-wrapped lines, is a separate, older limit; it is not compared
+// here, only every run of review markup in order.)
+function markupRuns(markdown: string) {
+  const model = parseReviewModel(markdown);
+  // Emphasis inside a highlight is rewritten as `_x_` by the editor's prose
+  // writer (the same older limit), so it is compared without the markers.
+  return model.markup.map((run) =>
+    markdown
+      .slice(run.offset, run.endOffset)
+      .replace(/\s+/g, " ")
+      .replace(/[*_]/g, ""),
+  );
+}
+
+function saveWithUnrelatedEdit(markdown: string) {
+  const parsed = criticMarkdownToEditorState(markdown);
+  const doc = structuredClone(parsed.doc);
+  doc.content?.unshift({
+    type: "paragraph",
+    content: [{ type: "text", text: "An unrelated first line." }],
+  });
+  return editorStateToCriticMarkdown(doc, parsed.comments, {
+    frontmatter: parsed.frontmatter,
+    endmatter: parsed.endmatter,
+    preservedEntryIds: parsed.preservedEntryIds,
+    looseHeadings: parsed.looseHeadings,
+    legacyListSpacing: parsed.legacyListSpacing,
+    reviewFormat: parsed.reviewFormat,
+  });
+}
+
+const legacyFiles = [...fixtures, ...corpus].filter(
+  (file) =>
+    getReviewFormat(file.markdown) === "legacy" &&
+    getReviewBlockError(file.markdown) === null,
+);
+
+describe("older-format files keep their review markup on save (D11)", () => {
+  it("covers the legacy fixtures", () => {
+    expect(
+      legacyFiles.filter((file) => fixtures.includes(file)).length,
+    ).toBeGreaterThanOrEqual(30);
+  });
+
+  it.each(
+    legacyFiles.map((file) => [file.name, file.markdown]),
+  )("%s keeps every review byte through an unrelated edit", (_name, markdown) => {
+    const saved = saveWithUnrelatedEdit(markdown);
+    expect(saved).toContain("An unrelated first line.");
+    expect(markupRuns(saved)).toEqual(markupRuns(markdown));
+    expect(splitRoughdraftDocument(saved).endmatter).toBe(
+      splitRoughdraftDocument(markdown).endmatter,
+    );
+    // rfm names a train with no id after its offset; compare those by place.
+    const ids = (text: string) =>
+      extractRoughdraftReviewIndex(text).items.map((item) =>
+        syntheticId.test(item.id) ? "*" : item.id,
+      );
+    expect(ids(saved)).toEqual(ids(markdown));
+  });
+
+  it.each(
+    fixtures
+      .filter((file) => legacyFiles.includes(file))
+      // The rich-text editor joins a hard-wrapped line (an older limit).
+      .filter((file) => file.name !== "legacy-multiline-span")
+      .map((file) => [file.name, file.markdown]),
+  )("%s saves byte for byte with nothing changed", (_name, markdown) => {
+    const parsed = criticMarkdownToEditorState(markdown);
+    expect(
+      editorStateToCriticMarkdown(parsed.doc, parsed.comments, parsed),
+    ).toBe(markdown);
   });
 });

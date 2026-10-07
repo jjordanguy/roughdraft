@@ -2,6 +2,8 @@
 
 This is the proposed replacement for the Roughdraft paragraph in Jordan's `~/.claude/CLAUDE.md`, plus the optional guard hook for `~/.claude/settings.json`. Per D12 nothing here is applied to his files until he has read it. Markup examples sit in inline code and the file has no horizontal rule, so it is safe to open in Roughdraft.
 
+The same paragraph reaches agents two other ways: `roughdraft mcp` sends it word for word as its MCP `instructions` (a test fails if the two drift apart), and the Claude Code skill in `packages/skill/SKILL.md` carries it with the command reference. Change it here first.
+
 ## What changes for the agent
 
 Today the paragraph describes CriticMarkup and asks the agent to type replies into the file and check the count with `roughdraft doctor`. With batch 3b the agent never types review markup. It reads a round, edits a clean copy of the document with its normal Edit tool, writes plain-text replies into a small JSON file, and lands everything with one command that writes the whole round or nothing. Done reaches the agent through the session log and the harness wake route (D14), so the agent does not hold a live `roughdraft open` wait.
@@ -14,7 +16,7 @@ Paste this in place of the current "Roughdraft (markdown review app, all project
 
 ## Why each step is there
 
-- `route test` at session start: the wake route is owned and tested by the agent (D14). A failing route means Done will land only in the session log, so Jordan should know to tell the agent in chat.
+- `route test` at session start: the wake route is owned and tested by the agent (D14). A failing route means Done will land only in the session log, so Jordan should know to tell the agent in chat. When the harness has no route yet, `docs/fork/routes.md` shows how to add one.
 - `open --no-watch` with the session flags: the session log records which chat opened the file, and Done fires that session's wake route. No live wait means no five-minute or seven-hour blocking call (assumption 1).
 - `round` after Done or a chat "done": it acknowledges the waiting Done in the log, writes `round.json`, `clean.md`, `response.json` and `base.md` to `~/.roughdraft/rounds/<roundId>/`, reports the tab state and one line per thread, and shows "AI editing" in Jordan's tab until `apply` lands (stalled after 30 minutes).
 - `clean.md` instead of the file: the clean copy has no markup, so the Edit tool cannot break a highlight. `apply` moves each highlight with the edit and reports what happened to it.
@@ -48,6 +50,14 @@ Settings entry for `~/.claude/settings.json` (merge into an existing `hooks` blo
 }
 ```
 
-## The other harness
+## The other harness and the MCP tools
 
-OpenClaw and scripts use the same commands. The MCP server offers the same steps as tools: `roughdraft_start_round` returns the round and `cleanText`, `roughdraft_apply_round` takes the response object and the edited `cleanText`, and `roughdraft_reply_to_comment`, `roughdraft_mark_resolved` and `roughdraft_add_document_comment` take an optional `expectedVersion`. A refusal is an `isError` result with the same error list as the CLI.
+OpenClaw and scripts use the same commands. The MCP server (`roughdraft mcp`) offers the same steps as tools, for a session that has the tools but no shell:
+
+- `roughdraft_wake_routes` with `action: "test"` at the start of the session; `roughdraft_register_session` after opening a file.
+- `roughdraft_get_handoffs` when Jordan says in chat that he is done (it does not wait), then `roughdraft_ack_handoff` once the Done is handled. `roughdraft_start_round` acknowledges the Done itself.
+- `roughdraft_start_round` returns the round and `cleanText`; `roughdraft_apply_round` takes the filled-in response object and the edited `cleanText`.
+- `roughdraft_reply_to_comment`, `roughdraft_mark_resolved` and `roughdraft_add_document_comment` take an optional `expectedVersion` (the `fileVersion` the agent read).
+- `roughdraft_watch_review_events` holds the turn until Done or its `timeoutSeconds`; a cancelled call stops the wait on the server too. Prefer the wake route and `roughdraft_get_handoffs`.
+
+Every `documentPath` is absolute; a relative one is refused, because the MCP process does not share the session's working directory. Any failure, a refusal included, is an `isError` result whose text is the CLI's JSON envelope (`error.code`, `error.message`, `error.hint`, and for a refusal the same error list as the CLI). The tools never start a Roughdraft server; without one they answer `SERVER_UNREACHABLE` with the hint `roughdraft start`.

@@ -51,6 +51,8 @@ roughdraft start
 
 Without the saved copy: `npm i -g roughdraft@0.1.10 yaml@2` (the extra package is what the registry build is missing).
 
+If `~/.claude.json` already points at `roughdraft mcp` directly (see below), put the bridge entry back before rolling back: 0.1.10 only understands Content-Length framing, which Claude Code does not send.
+
 ## Checking what is running
 
 ```bash
@@ -83,3 +85,23 @@ echo '{"tool_name":"Write","tool_input":{"file_path":"/abs/path/reviewed.md","co
 ```
 
 A reviewed file prints a `permissionDecision` of `deny`; any other file prints nothing. Removing the entry from `settings.json` turns it off. Remove it before rolling back: 0.1.10 has no guard command, and Claude Code treats a hook that exits 2 as a block.
+
+## The MCP entry in `~/.claude.json`
+
+Claude Code reaches the Roughdraft tools through `~/.claude/roughdraft-mcp-bridge.mjs`, a small script that translated Claude Code's newline-delimited messages into the Content-Length framing 0.1.10 needed. From batch 6 on, `roughdraft mcp` speaks Claude Code's framing itself (and still accepts Content-Length, so the bridge keeps working), answers `ping`, survives a bad message, stops a cancelled wait, and exits with its session. The bridge can retire.
+
+The change is one entry in `~/.claude.json`, made only when Jordan says so, after the batch 6 build is installed. Before:
+
+```json
+"roughdraft": { "type": "stdio", "command": "node", "args": ["/Users/jordanlam/.claude/roughdraft-mcp-bridge.mjs"], "env": {} }
+```
+
+After:
+
+```json
+"roughdraft": { "type": "stdio", "command": "roughdraft", "args": ["mcp"], "env": {} }
+```
+
+Keep `roughdraft-mcp-bridge.mjs` where it is: putting the old entry back is the rollback. If a session reports that the command was not found, use the absolute path from `which roughdraft` as `command`.
+
+Running sessions keep the process they started with; the new entry applies to sessions started afterwards. To check it, start a new Claude Code session, run `/mcp` and confirm `roughdraft` is connected with 14 tools, then ask the agent to call `roughdraft_get_open_documents`. A second check that nothing doubled: `ps -o pid,ppid,command -ax | grep "roughdraft mcp"` shows one `roughdraft mcp` per session and no `roughdraft-mcp-bridge.mjs` for new sessions.

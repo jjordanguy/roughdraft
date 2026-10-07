@@ -151,6 +151,25 @@ describe("createApp", () => {
     );
   });
 
+  it("creates a missing markdown file when the save asks for it", async () => {
+    const { app } = createApp({ homeDir, staticDirPath: projectDir });
+    const missing = await request(app)
+      .put("/api/markdown-file")
+      .query({ projectPath: projectDir, path: "recreated.md" })
+      .send({ content: "# Back\n\nFrom the draft.\n" });
+    expect(missing.status).toBe(404);
+
+    const created = await request(app)
+      .put("/api/markdown-file")
+      .query({ projectPath: projectDir, path: "recreated.md" })
+      .send({ content: "# Back\n\nFrom the draft.\n", create: true });
+    expect(created.status).toBe(200);
+    expect(created.body.content).toBe("# Back\n\nFrom the draft.\n");
+    expect(fs.readFileSync(path.join(projectDir, "recreated.md"), "utf8")).toBe(
+      "# Back\n\nFrom the draft.\n",
+    );
+  });
+
   it("rejects stale markdown-file writes", async () => {
     const nestedDir = path.join(projectDir, "notes");
     fs.mkdirSync(nestedDir, { recursive: true });

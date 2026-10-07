@@ -1496,7 +1496,11 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   });
 
   app.put("/api/markdown-file", async (req, res) => {
-    const target = markdownTargetFromRequest(req, res);
+    const create =
+      (req.body as { create?: unknown } | undefined)?.create === true;
+    const target = markdownTargetFromRequest(req, res, {
+      allowMissing: create,
+    });
     if (!target) return;
 
     const content = (req.body as { content?: unknown } | undefined)?.content;
@@ -1509,6 +1513,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const result = await documents.write(target.absolutePath, content, {
       expectedHash: expectedHashFromBody(req.body),
       tabId: optionalString(req.body?.tabId),
+      create,
     });
     const { read } = result;
     if (result.status === "missing") {

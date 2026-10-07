@@ -183,4 +183,112 @@ describe("ReviewEventQueue", () => {
     expect(result.events[0]?.sequence).toBe(6);
     expect(result.events.at(-1)?.sequence).toBe(105);
   });
+
+  it("keeps a six hour watch pending past five minutes and resolves at six hours", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    let settled = false;
+    const waiting = queue
+      .wait({ documentPath: "/tmp/project/draft.md", timeoutMs: 6 * 3_600_000 })
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+
+    await vi.advanceTimersByTimeAsync(301_000);
+    expect(settled).toBe(false);
+    expect(queue.waiterCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(6 * 3_600_000);
+    await expect(waiting).resolves.toMatchObject({ timedOut: true });
+    vi.useRealTimers();
+  });
+
+  it("caps a timeout of 2^31 ms instead of letting setTimeout fire at once", async () => {
+    vi.useFakeTimers();
+    const queue = new ReviewEventQueue();
+    let settled = false;
+    void queue
+      .wait({ documentPath: "/tmp/project/draft.md", timeoutMs: 2 ** 31 })
+      .then(() => {
+        settled = true;
+      });
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(settled).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("removes an aborted waiter and leaves the others in place", async () => {
+    const queue = new ReviewEventQueue();
+    const controller = new AbortController();
+    const aborted = queue.wait({
+      documentPath: "/tmp/project/draft.md",
+      signal: controller.signal,
+    });
+    const other = queue.wait({
+      documentPath: "/tmp/project/draft.md",
+      batchWindowMs: 0,
+    });
+    expect(queue.waiterCount()).toBe(2);
+
+    controller.abort();
+
+    await expect(aborted).resolves.toMatchObject({ events: [] });
+    expect(queue.waiterCount()).toBe(1);
+    const emitted = queue.emit(eventInput("/tmp/project/draft.md"));
+    await expect(other).resolves.toMatchObject({ events: [emitted.event] });
+    await expect(emitted.delivery).resolves.toBe(true);
+  });
+
+  it("never registers a waiter whose signal is already aborted", async () => {
+    const queue = new ReviewEventQueue();
+    const controller = new AbortController();
+    controller.abort();
+
+    await queue.wait({
+      documentPath: "/tmp/project/draft.md",
+      signal: controller.signal,
+    });
+
+    expect(queue.waiterCount()).toBe(0);
+  });
+
+  it("reports no delivery when the only subscriber fails to deliver", async () => {
+    const queue = new ReviewEventQueue();
+    queue.subscribe({
+      documentPath: "/tmp/project/draft.md",
+      batchWindowMs: 0,
+      deliver: () => false,
+    });
+
+    const emitted = queue.emit(eventInput("/tmp/project/draft.md"));
+
+    await expect(emitted.delivery).resolves.toBe(false);
+  });
+
+  it("continues sequences from a seeded queue and replays seeded events by key", async () => {
+    const seeded = {
+      ...eventInput("/private/tmp/project/draft.md"),
+      type: "review.completed" as const,
+      sequence: 41,
+      createdAt: "2026-10-01T00:00:00.000Z",
+    };
+    const queue = new ReviewEventQueue({
+      nextSequence: 42,
+      seed: [{ event: seeded, documentKey: "/private/tmp/project/draft.md" }],
+    });
+
+    const replay = await queue.wait({
+      documentKey: "/private/tmp/project/draft.md",
+      afterSequence: 40,
+    });
+    const next = queue.emit(eventInput("/tmp/project/draft.md"), {
+      documentKey: "/private/tmp/project/draft.md",
+    });
+
+    expect(replay.events.map((event) => event.sequence)).toEqual([41]);
+    expect(next.event.sequence).toBe(42);
+    expect(queue.latestSequence()).toBe(42);
+  });
 });

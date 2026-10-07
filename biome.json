@@ -9,7 +9,9 @@
       "!**/playwright-report",
       "!**/test-results",
       "!**/node_modules",
-      "!**/dist"
+      "!**/dist",
+      "!.claude",
+      "!**/.claude"
     ]
   },
   "formatter": {

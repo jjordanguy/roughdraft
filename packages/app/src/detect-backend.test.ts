@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiBackend } from "./api-backend";
 import { detectBackend } from "./detect-backend";
 import { LocalStorageBackend } from "./local-storage-backend";
-import { RemoteBackend } from "./remote-backend";
 
 describe("detectBackend", () => {
   const originalFetch = global.fetch;
@@ -13,83 +12,44 @@ describe("detectBackend", () => {
     vi.restoreAllMocks();
   });
 
-  it("creates a remote backend when the URL has a session and the server supports remote documents", async () => {
+  it("uses the local files backend when the server reports one", async () => {
+    global.fetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ backend: "local-files", projectDir: "/work" }),
+          { status: 200 },
+        ),
+    ) as unknown as typeof fetch;
+
+    const backend = await detectBackend();
+
+    expect(backend).toBeInstanceOf(ApiBackend);
+    expect(backend.info).toMatchObject({
+      kind: "local-files",
+      projectPath: "/work",
+    });
+  });
+
+  it("ignores a leftover remote session link and opens local files", async () => {
+    // Links from the removed remote mode carried ?session=&token=. They must
+    // not break the page now that the remote backend is gone.
     window.history.replaceState(null, "", "/?session=session-1&token=secret");
     global.fetch = vi.fn(
       async () =>
         new Response(
           JSON.stringify({
             backend: "local-files",
+            projectDir: "/work",
             capabilities: { remoteDocuments: true },
           }),
           { status: 200 },
         ),
     ) as unknown as typeof fetch;
-
-    const remoteBackend = new RemoteBackend(
-      {
-        kind: "remote",
-        label: "Remote document",
-        detail: "draft.md",
-        sessionId: "session-1",
-        originPath: "/work/draft.md",
-      },
-      {
-        id: "session-1",
-        originPath: "/work/draft.md",
-        content: "content",
-        version: "version-1",
-      },
-    );
-    const createRemoteBackend = vi
-      .spyOn(RemoteBackend, "create")
-      .mockResolvedValue(remoteBackend);
-
-    await expect(detectBackend()).resolves.toBe(remoteBackend);
-    expect(createRemoteBackend).toHaveBeenCalledWith("session-1", "secret");
-  });
-
-  it("falls back to the API backend when a session URL points at a server without remote-document support", async () => {
-    window.history.replaceState(null, "", "/?session=session-1");
-    global.fetch = vi.fn(
-      async () =>
-        new Response(
-          JSON.stringify({
-            backend: "local-files",
-            projectDir: "/work",
-            capabilities: {},
-          }),
-          { status: 200 },
-        ),
-    ) as unknown as typeof fetch;
-    const createRemoteBackend = vi.spyOn(RemoteBackend, "create");
 
     const backend = await detectBackend();
 
     expect(backend).toBeInstanceOf(ApiBackend);
     expect(backend.info.kind).toBe("local-files");
-    expect(createRemoteBackend).not.toHaveBeenCalled();
-  });
-
-  it("does not hide a broken remote session by falling back to local storage", async () => {
-    window.history.replaceState(null, "", "/?session=missing&token=bad");
-    global.fetch = vi.fn(
-      async () =>
-        new Response(
-          JSON.stringify({
-            backend: "local-files",
-            capabilities: { remoteDocuments: true },
-          }),
-          { status: 200 },
-        ),
-    ) as unknown as typeof fetch;
-    vi.spyOn(RemoteBackend, "create").mockRejectedValue(
-      new Error("Could not load remote document session missing: 404"),
-    );
-
-    await expect(detectBackend()).rejects.toThrow(
-      /Could not load remote document session/,
-    );
   });
 
   it("uses local storage when no server is available", async () => {

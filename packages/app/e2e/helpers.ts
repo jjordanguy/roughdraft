@@ -114,3 +114,10 @@ export function logE2eEvent(event: string, data: Record<string, unknown> = {}) {
     })}\n`,
   );
 }
+
+// The API server Playwright starts (see playwright.config.ts). Tests that
+// must abort a connection talk to it directly instead of through the Vite
+// proxy, so the abort reaches the server and not only the proxy.
+export function apiBaseUrl() {
+  return `http://127.0.0.1:${Number(process.env.API_PORT ?? 4317)}`;
+}

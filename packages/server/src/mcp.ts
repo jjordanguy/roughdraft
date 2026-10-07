@@ -1,11 +1,31 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   appendRoughdraftReply,
   extractRoughdraftReviewIndex,
   markRoughdraftResolved,
 } from "@roughdraft/rfm";
+import { CliError } from "./errors.js";
+import {
+  type ApiContext,
+  ackHandoffs,
+  authHeaders,
+  collectHandoffs,
+  createServerResolver,
+  documentKey,
+  documentViewFromRecord,
+  getStateDir,
+  listDocuments,
+  listWakeRoutes,
+  putWakeRoute,
+  readReviewLogFromDisk,
+  registerSession,
+  removeWakeRoute,
+  type ServerStatus,
+  testWakeRoute,
+  type WatchTuning,
+  watchReviewEvents,
+} from "./review-watch-client.js";
 
 interface JsonRpcRequest {
   jsonrpc?: "2.0";
@@ -27,13 +47,23 @@ interface McpOptions {
   output?: NodeJS.WriteStream;
 }
 
+export interface CallToolOptions {
+  /** Watch timing overrides (tests shorten polls and backoff). */
+  watchTuning?: Partial<WatchTuning>;
+}
+
 const protocolVersion = "2025-06-18";
+
+const documentPathProperty = {
+  type: "string",
+  description: "Absolute path to a .md file.",
+};
 
 const tools: ToolDefinition[] = [
   {
     name: "roughdraft_get_open_documents",
     description:
-      "Return Roughdraft documents known to the MCP server. This first version is stateless and may return an empty list.",
+      "List the documents in Roughdraft's session log: path, link, open tabs, listening agents, the session that opened each one, and its handoffs. Reads the log on disk when the server is not running (server.running is then false).",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -69,7 +99,7 @@ const tools: ToolDefinition[] = [
   {
     name: "roughdraft_watch_review_events",
     description:
-      "Block until Roughdraft receives Done Reviewing for a Markdown file. Overall handoff comments are persisted as document-level YAML endmatter comments before the event is emitted. Omit timeoutSeconds to wait indefinitely.",
+      "Block until Roughdraft receives Done Reviewing for a Markdown file. A Done no agent has acknowledged yet comes back at once (includePending, default true) and is acknowledged after it is returned (ack, default true). Survives server restarts. Overall handoff comments are persisted as document-level YAML endmatter comments before the event is emitted. Omit timeoutSeconds to wait indefinitely; for long reviews prefer `roughdraft open` in a background shell.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -79,6 +109,18 @@ const tools: ToolDefinition[] = [
         projectPath: { type: "string" },
         timeoutSeconds: { type: "number" },
         batchWindowSeconds: { type: "number" },
+        afterSequence: {
+          type: "number",
+          description: "Only return Dones with a higher sequence number.",
+        },
+        includePending: {
+          type: "boolean",
+          description: "Return an unacknowledged Done at once. Default true.",
+        },
+        ack: {
+          type: "boolean",
+          description: "Acknowledge the returned Done. Default true.",
+        },
       },
     },
   },
@@ -110,6 +152,74 @@ const tools: ToolDefinition[] = [
         documentPath: { type: "string" },
         targetId: { type: "string" },
         summary: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_get_handoffs",
+    description:
+      "List Done Reviewing handoffs no agent has acknowledged, for one document or all of them. Use it when the user says in chat that they are done. Non-blocking; reads the session log on disk when the server is down.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        documentPath: {
+          type: "string",
+          description: "Absolute path to a .md file. Omit for every document.",
+        },
+        includeAcked: {
+          type: "boolean",
+          description:
+            "Also list acknowledged handoffs from the last 7 days. Default false.",
+        },
+      },
+    },
+  },
+  {
+    name: "roughdraft_ack_handoff",
+    description:
+      "Acknowledge Done Reviewing handoffs by id once you have acted on them.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["handoffIds"],
+      properties: {
+        handoffIds: { type: "array", items: { type: "string" } },
+      },
+    },
+  },
+  {
+    name: "roughdraft_register_session",
+    description:
+      "Record which harness and chat session opened a document, so Done can wake that session through the harness's wake route.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["documentPath", "harness", "label"],
+      properties: {
+        documentPath: documentPathProperty,
+        harness: { type: "string" },
+        label: { type: "string" },
+        link: { type: "string" },
+        sessionId: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "roughdraft_wake_routes",
+    description:
+      "List, add, remove or test the wake route for a harness. A command route runs through the shell with {message}, {file}, {link} and {sessionId} replaced; a url route receives a JSON POST. Test your harness's route at the start of a session.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["action"],
+      properties: {
+        action: { type: "string", enum: ["list", "add", "remove", "test"] },
+        harness: { type: "string" },
+        kind: { type: "string", enum: ["command", "url"] },
+        command: { type: "string" },
+        url: { type: "string" },
+        label: { type: "string" },
       },
     },
   },
@@ -223,20 +333,56 @@ async function handleMessage(
       id: request.id,
       error: {
         code: -32000,
-        message: error instanceof Error ? error.message : "MCP tool failed.",
+        message: describeToolError(error),
       },
     });
   }
+}
+
+function describeToolError(error: unknown): string {
+  if (error instanceof CliError) {
+    return error.hint
+      ? `${error.code}: ${error.message} ${error.hint}`
+      : `${error.code}: ${error.message}`;
+  }
+  return error instanceof Error ? error.message : "MCP tool failed.";
 }
 
 export async function callTool(
   name: string,
   args: Record<string, unknown>,
   env: NodeJS.ProcessEnv,
-  fetchImpl: typeof fetch,
+  fetchImpl: typeof fetch = fetch,
+  options: CallToolOptions = {},
 ): Promise<unknown> {
   if (name === "roughdraft_get_open_documents") {
-    return { documents: [] };
+    const server = await resolveServer(env, fetchImpl);
+    if (server && server.capabilities.documentRegistry === true) {
+      const listed = await listDocuments(api(env, fetchImpl, server));
+      return {
+        documents: listed.documents,
+        server: {
+          running: true,
+          url: server.publicUrl,
+          version: server.version,
+          instanceId: listed.instanceId ?? server.instanceId,
+        },
+      };
+    }
+    const disk = readReviewLogFromDisk(server?.stateDir ?? getStateDir(env));
+    return {
+      documents: disk.documents.map((record) =>
+        documentViewFromRecord(record, null),
+      ),
+      server: server
+        ? {
+            running: true,
+            url: server.publicUrl,
+            version: server.version,
+            instanceId: server.instanceId,
+          }
+        : { running: false, url: null, version: null, instanceId: null },
+    };
   }
 
   if (name === "roughdraft_get_review_index") {
@@ -266,42 +412,57 @@ export async function callTool(
       typeof args.projectPath === "string"
         ? path.resolve(args.projectPath)
         : path.dirname(documentPath);
-    const server = readServerState(env);
+    const resolve = createServerResolver({ env, fetchImpl });
+    const server = await resolve();
     if (!server) {
-      throw new Error("Roughdraft is not running. Start it before watching.");
+      throw new CliError(
+        "SERVER_UNREACHABLE",
+        "Roughdraft is not running. Start it with `roughdraft start` before watching.",
+      );
     }
 
-    const body: {
-      projectPath: string;
-      path: string;
-      timeoutSeconds?: number;
-      batchWindowSeconds: number;
-      fromNow: boolean;
-    } = {
+    const result = await watchReviewEvents({
+      fetchImpl,
+      resolveServer: resolve,
+      initialServer: server,
       projectPath,
-      path: path.relative(projectPath, documentPath),
+      relativePath: path.relative(projectPath, documentPath),
+      afterSequence:
+        typeof args.afterSequence === "number" ? args.afterSequence : undefined,
+      includePending: args.includePending !== false,
+      timeoutMs:
+        typeof args.timeoutSeconds === "number"
+          ? args.timeoutSeconds * 1000
+          : undefined,
       batchWindowSeconds:
         typeof args.batchWindowSeconds === "number"
           ? args.batchWindowSeconds
           : 0.25,
-      fromNow: true,
-    };
-    if (typeof args.timeoutSeconds === "number") {
-      body.timeoutSeconds = args.timeoutSeconds;
+      client: "roughdraft-mcp",
+      headers: authHeaders(env),
+      tuning: options.watchTuning,
+    });
+
+    const handoffIds = result.handoffs
+      .filter((handoff) => handoff.state !== "acknowledged")
+      .map((handoff) => handoff.handoffId);
+    if (args.ack !== false && handoffIds.length > 0) {
+      try {
+        await ackHandoffs(
+          { fetchImpl, baseUrl: result.server.url, headers: authHeaders(env) },
+          handoffIds,
+          "roughdraft-mcp",
+        );
+      } catch {}
     }
 
-    const response = await fetchImpl(
-      new URL("/api/review-events/watch", server.url),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-    if (!response.ok) {
-      throw new Error(`Review watch failed: ${response.status}`);
-    }
-    return response.json();
+    return {
+      status: result.status,
+      events: result.events,
+      timedOut: result.timedOut,
+      nextSequence: result.nextSequence,
+      ...(result.handoff ? { handoff: result.handoff } : {}),
+    };
   }
 
   if (name === "roughdraft_reply_to_comment") {
@@ -328,6 +489,94 @@ export async function callTool(
     });
     fs.writeFileSync(documentPath, updated);
     return { ok: true, documentPath };
+  }
+
+  if (name === "roughdraft_get_handoffs") {
+    const documentPath =
+      typeof args.documentPath === "string" && args.documentPath.trim()
+        ? requireDocumentPath(args)
+        : null;
+    const server = await resolveServer(env, fetchImpl);
+    const live =
+      server !== null && server.capabilities.documentRegistry === true;
+    const documents =
+      server && live
+        ? (await listDocuments(api(env, fetchImpl, server))).documents
+        : readReviewLogFromDisk(server?.stateDir ?? getStateDir(env)).documents;
+    return {
+      source: live ? "server" : "disk",
+      handoffs: collectHandoffs(documents, {
+        key: documentPath ? documentKey(documentPath) : undefined,
+        includeAcked: args.includeAcked === true,
+      }),
+    };
+  }
+
+  if (name === "roughdraft_ack_handoff") {
+    const handoffIds = Array.isArray(args.handoffIds)
+      ? args.handoffIds.filter(
+          (id): id is string => typeof id === "string" && id.trim() !== "",
+        )
+      : [];
+    if (handoffIds.length === 0) {
+      throw new Error("handoffIds is required.");
+    }
+    const server = await requireServer(env, fetchImpl);
+    const result = await ackHandoffs(
+      api(env, fetchImpl, server),
+      handoffIds,
+      "roughdraft-mcp",
+    );
+    return { acked: result.acked, unknown: result.unknown };
+  }
+
+  if (name === "roughdraft_register_session") {
+    const documentPath = requireDocumentPath(args);
+    const harness = requireString(args, "harness");
+    const label = requireString(args, "label");
+    const server = await requireServer(env, fetchImpl);
+    const session = await registerSession(api(env, fetchImpl, server), {
+      projectPath: path.dirname(documentPath),
+      path: path.basename(documentPath),
+      harness,
+      label,
+      link: typeof args.link === "string" ? args.link : null,
+      sessionId: typeof args.sessionId === "string" ? args.sessionId : null,
+    });
+    return { ok: true, session };
+  }
+
+  if (name === "roughdraft_wake_routes") {
+    const action = requireString(args, "action");
+    if (!["list", "add", "remove", "test"].includes(action)) {
+      throw new Error(`Unknown action: ${action}`);
+    }
+    const harness = action === "list" ? null : requireString(args, "harness");
+    const server = await requireServer(env, fetchImpl);
+    const ctx = api(env, fetchImpl, server);
+    if (action === "list" || harness === null) {
+      return { routes: await listWakeRoutes(ctx) };
+    }
+    if (action === "add") {
+      const kind =
+        args.kind === "url" || args.kind === "command"
+          ? args.kind
+          : typeof args.url === "string"
+            ? "url"
+            : "command";
+      const route = await putWakeRoute(ctx, harness, {
+        kind,
+        ...(typeof args.command === "string" ? { command: args.command } : {}),
+        ...(typeof args.url === "string" ? { url: args.url } : {}),
+        label: typeof args.label === "string" ? args.label : null,
+      });
+      return { ok: true, route };
+    }
+    if (action === "remove") {
+      return { ok: true, removed: await removeWakeRoute(ctx, harness) };
+    }
+    const tested = await testWakeRoute(ctx, harness, "roughdraft-mcp");
+    return { ok: tested.sent, ...tested };
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -365,29 +614,32 @@ function requireString(args: Record<string, unknown>, key: string): string {
   return value;
 }
 
-function readServerState(
+/** Finds the running server from server.json; never starts one. */
+async function resolveServer(
   env: NodeJS.ProcessEnv,
-): { url: string; port: number } | null {
-  const stateFile = getServerStateFilePath(env);
-  try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
-      url?: unknown;
-      port?: unknown;
-    };
-    if (typeof parsed.url === "string" && typeof parsed.port === "number") {
-      return { url: parsed.url, port: parsed.port };
-    }
-  } catch {}
-
-  return null;
+  fetchImpl: typeof fetch,
+): Promise<ServerStatus | null> {
+  return createServerResolver({ env, fetchImpl })();
 }
 
-function getServerStateFilePath(env: NodeJS.ProcessEnv): string {
-  const explicitFile = env.ROUGHDRAFT_STATE_FILE?.trim();
-  if (explicitFile) return path.resolve(explicitFile);
+async function requireServer(
+  env: NodeJS.ProcessEnv,
+  fetchImpl: typeof fetch,
+): Promise<ServerStatus> {
+  const server = await resolveServer(env, fetchImpl);
+  if (!server) {
+    throw new CliError(
+      "SERVER_UNREACHABLE",
+      "Roughdraft is not running. Start it with `roughdraft start`.",
+    );
+  }
+  return server;
+}
 
-  const explicitDir = env.ROUGHDRAFT_STATE_DIR?.trim();
-  if (explicitDir) return path.join(path.resolve(explicitDir), "server.json");
-
-  return path.join(os.homedir(), ".roughdraft", "server.json");
+function api(
+  env: NodeJS.ProcessEnv,
+  fetchImpl: typeof fetch,
+  server: ServerStatus,
+): ApiContext {
+  return { fetchImpl, baseUrl: server.url, headers: authHeaders(env) };
 }

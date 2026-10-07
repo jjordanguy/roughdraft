@@ -844,7 +844,7 @@ describe("cli watch, handoffs and wake routes", () => {
         label: "test session",
         sessionId: "local_x",
         link: "https://example.test/session/1",
-        routeId: null,
+        routeId: "claude-code",
       },
     });
     const sessionIndex = calls.indexOf("/api/documents/session");
@@ -864,11 +864,17 @@ describe("cli watch, handoffs and wake routes", () => {
     expect(text).toContain(
       "Session: test session (claude-code, id local_x) https://example.test/session/1",
     );
-    expect(text).toContain("Wake route: none registered");
+    // The built-in claude-code route ran on the Done and found no session
+    // with that id; the log says so.
+    expect(text).toContain(
+      "Wake route: claude-code (claude-session the Claude Code session that opened the file), last test failed: No running Claude Code session has the id local_x",
+    );
     expect(text).toMatch(
       /Latest Done: .* \(1 comment, 0 suggestions, 1 unresolved\), waiting/,
     );
-    expect(text).toContain("Wake: no wake route");
+    expect(text).toContain(
+      "Wake: failed (claude-code): No running Claude Code session has the id local_x",
+    );
 
     const logJson = harness();
     expect(await runCli(["log", "--json"], logJson.deps)).toBe(0);
@@ -882,7 +888,7 @@ describe("cli watch, handoffs and wake routes", () => {
           pendingHandoffs: 1,
         },
       ],
-      routes: [],
+      routes: [{ harness: "claude-code", kind: "claude-session" }],
     });
   });
 
@@ -986,6 +992,7 @@ describe("cli watch, handoffs and wake routes", () => {
     const list = harness();
     expect(await runCli(["route", "list", "--json"], list.deps)).toBe(0);
     expect(onlyEnvelope(list.logs).routes).toMatchObject([
+      { harness: "claude-code", kind: "claude-session" },
       { harness: "test-harness", verifiedBy: "roughdraft-cli route test" },
     ]);
 
@@ -1025,6 +1032,111 @@ describe("cli watch, handoffs and wake routes", () => {
   });
 
   // --- Token ------------------------------------------------------------------
+
+  it("inside Claude Code, open registers the session by itself and Done lands in it as a message", async () => {
+    // A fake Claude Code session: its record and key under a config dir,
+    // and a socket that keeps the lines it receives.
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "rd-cc-"));
+    fs.mkdirSync(path.join(configDir, "sessions"));
+    const socketPath = path.join(configDir, "s.sock");
+    const received: string[] = [];
+    const inbox = net.createServer((socket) => {
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
+      });
+      socket.on("end", () => {
+        received.push(...buffer.split("\n").filter(Boolean));
+        socket.end();
+      });
+    });
+    await new Promise<void>((resolve) => inbox.listen(socketPath, resolve));
+    fs.writeFileSync(
+      path.join(configDir, "sessions", `${process.pid}.json`),
+      JSON.stringify({
+        pid: process.pid,
+        sessionId: "conv-1",
+        name: "Plan the launch",
+        messagingSocketPath: socketPath,
+      }),
+    );
+    fs.writeFileSync(
+      path.join(configDir, "sessions", `${process.pid}.k.key`),
+      JSON.stringify({ peerToken: "tok-1" }),
+    );
+    const server = await startServer({ claudeConfigDir: configDir });
+    const inClaude = (overrides: Partial<CliDependencies> = {}) =>
+      harness({
+        env: {
+          PATH: process.env.PATH,
+          HOME: tempDir,
+          ROUGHDRAFT_STATE_DIR: stateDir,
+          ROUGHDRAFT_PORT: String(unusedPort),
+          ROUGHDRAFT_DEV_FRONTEND_STATE_FILE: path.join(tempDir, "dev.json"),
+          CLAUDE_CODE_SESSION_ID: "conv-1",
+          CLAUDE_CONFIG_DIR: configDir,
+        },
+        ...overrides,
+      });
+
+    try {
+      const tested = inClaude();
+      expect(
+        await runCli(["route", "test", "claude-code", "--json"], tested.deps),
+      ).toBe(0);
+      expect(onlyEnvelope(tested.logs)).toMatchObject({ ok: true, sent: true });
+      expect(received.map((line) => JSON.parse(line))).toEqual([
+        { type: "auth", token: "tok-1" },
+        {
+          type: "user",
+          message: {
+            role: "user",
+            content: expect.stringContaining(
+              "Roughdraft wake route test for claude-code.",
+            ),
+          },
+        },
+      ]);
+      received.length = 0;
+
+      const opened = inClaude();
+      expect(
+        await runCli(
+          ["open", documentPath, "--no-watch", "--no-open", "--json"],
+          opened.deps,
+        ),
+      ).toBe(0);
+      expect(onlyEnvelope(opened.logs).session).toMatchObject({
+        harness: "claude-code",
+        label: "Plan the launch",
+        sessionId: "conv-1",
+        routeId: "claude-code",
+      });
+
+      await postDone(server, { overallComment: "Ship it." });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const turn = received.map((line) => JSON.parse(line)).at(-1);
+      expect(turn.message.content).toBe(
+        `I'm done reviewing plan.md. Please check my comments. (1 comments, 0 suggestions)\nShip it.\n\nFile: ${documentPath}\nLink: http://localhost:${server.port}/?path=${encodeURIComponent(documentPath)}\nNext: roughdraft round '${documentPath}'`,
+      );
+      const log = inClaude();
+      expect(await runCli(["log", "--json"], log.deps)).toBe(0);
+      expect(onlyEnvelope(log.logs)).toMatchObject({
+        documents: [
+          {
+            documentPath,
+            session: { label: "Plan the launch" },
+            latestHandoff: { wake: { routeId: "claude-code", state: "sent" } },
+          },
+        ],
+        routes: [{ harness: "claude-code", verifiedAt: expect.any(String) }],
+      });
+    } finally {
+      await new Promise<void>((resolve) => inbox.close(() => resolve()));
+      fs.rmSync(configDir, { recursive: true, force: true });
+      await server.close();
+    }
+  });
 
   it("sends Authorization: Bearer on every request when ROUGHDRAFT_TOKEN is set", async () => {
     const token = "s3cret-token";

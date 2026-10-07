@@ -178,6 +178,34 @@ describe("mcp", () => {
     expect(pending.handoffs).toHaveLength(1);
   });
 
+  it("registers the Claude Code session it runs inside when no harness is given", async () => {
+    const server = await startServer();
+    const session = (await callTool(
+      "roughdraft_register_session",
+      { documentPath, label: "planning chat" },
+      { ...env(), CLAUDE_CODE_SESSION_ID: "conv-7" },
+      fetch,
+    )) as Json;
+    expect(session).toMatchObject({
+      ok: true,
+      session: {
+        harness: "claude-code",
+        label: "planning chat",
+        sessionId: "conv-7",
+        routeId: "claude-code",
+      },
+    });
+    await expect(
+      callTool(
+        "roughdraft_register_session",
+        { documentPath, label: "no harness, not in Claude Code" },
+        env(),
+        fetch,
+      ),
+    ).rejects.toThrow(/harness/);
+    await server.close();
+  });
+
   it("reports a server that is not running instead of fetch failed", async () => {
     await expect(
       callTool(
@@ -308,6 +336,7 @@ describe("mcp", () => {
       fetch,
     )) as Json;
     expect(listed.routes).toMatchObject([
+      { harness: "claude-code", kind: "claude-session" },
       { harness: "codex", verifiedBy: "roughdraft-mcp" },
     ]);
 

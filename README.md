@@ -30,16 +30,15 @@ While an agent has a round open on the document (from `roughdraft round` until `
 [docs/fork/agent-procedure.md](docs/fork/agent-procedure.md) is the procedure an agent follows (the paragraph for `~/.claude/CLAUDE.md`, why each step is there, and the optional guard hook). The Claude Code skill in [packages/skill/SKILL.md](packages/skill/SKILL.md) carries the same procedure. In short:
 
 ```bash
-roughdraft route test claude-code                      # once per session
-roughdraft open "/abs/path.md" --no-watch --harness claude-code \
-  --session-label "what this session is doing" --session-id <session id>
-# ... Done wakes the session, or Jordan says "done" in chat ...
+roughdraft route test claude-code                      # once per session; the test lands in the session
+roughdraft open "/abs/path.md" --no-watch --session-label "what this session is doing"
+# ... Done arrives in the session as a message, or Jordan says "done" in chat ...
 roughdraft round "/abs/path.md"                        # prints the round folder
 # edit clean.md with the Edit tool, fill in response.json
 roughdraft apply "<round folder>/response.json"
 ```
 
-The session log (`review-log.json` in the state directory, `~/.roughdraft` by default) keeps every Done until an agent acknowledges it, so a Done nobody was waiting for is not lost: `roughdraft pending "/abs/path.md" --json --ack` returns it. Wake routes, one per harness, tell Roughdraft how to reach a chat session when you click Done; [docs/fork/routes.md](docs/fork/routes.md) covers the commands, the placeholders, the payload and the HTTP routes behind them.
+The session log (`review-log.json` in the state directory, `~/.roughdraft` by default) keeps every Done until an agent acknowledges it, so a Done nobody was waiting for is not lost: `roughdraft pending "/abs/path.md" --json --ack` returns it. Wake routes, one per harness, tell Roughdraft how to reach a chat session when you click Done. Claude Code's is built in: the Done is posted into the session that opened the file, over the socket every Claude Code session listens on for messages from other sessions. [docs/fork/routes.md](docs/fork/routes.md) covers the commands, the other route kinds, the payload and the HTTP routes behind them.
 
 `roughdraft guard --claude-hook` is an optional Claude Code PreToolUse hook that keeps the Edit, MultiEdit and Write tools off review markup and off a file with an open round.
 

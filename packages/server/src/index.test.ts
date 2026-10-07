@@ -713,6 +713,7 @@ describe("createApp", () => {
       instanceId: expect.stringMatching(/^srv_/),
       stateless: true,
       stateDir: null,
+      peerUrl: null,
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
@@ -721,6 +722,7 @@ describe("createApp", () => {
         handoffLog: true,
         wakeRoutes: true,
         reviewRounds: true,
+        openDocuments: true,
         tokenRequired: false,
       },
       warnings: [],

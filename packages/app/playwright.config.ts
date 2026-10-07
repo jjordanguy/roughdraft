@@ -20,6 +20,15 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      testIgnore: /\.exclusive\.spec\.ts$/,
+    },
+    // Specs that act on every document the shared server knows ("Close all
+    // finished") run after the rest, so they never close another test's tab.
+    {
+      name: "chromium-exclusive",
+      use: { ...devices["Desktop Chrome"] },
+      testMatch: /\.exclusive\.spec\.ts$/,
+      dependencies: ["chromium"],
     },
   ],
   webServer: [

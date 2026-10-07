@@ -1,12 +1,17 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { documentTitleFromMarkdown } from "@roughdraft/rfm";
 import {
   type DocumentIdentity,
   type DocumentRecord,
+  HANDOFF_RETENTION,
+  type HandoffRecord,
   isUnacknowledged,
   type ReviewLog,
+  type SessionRecord,
 } from "./handoff-log.js";
+import type { SessionState, SessionStateOf } from "./session-state.js";
 
 export interface TabPresence {
   tabId: string;
@@ -24,7 +29,7 @@ export type TabPresenceUpdate = Partial<
   Pick<TabPresence, "visible" | "dirty" | "conflict" | "baseHash">
 >;
 
-export type RegistryChange = "tabs" | "watchers" | "round";
+export type RegistryChange = "tabs" | "watchers" | "round" | "session";
 
 /**
  * The "AI editing" flag of a document: `roughdraft round` opens it, `apply`
@@ -53,7 +58,40 @@ export interface WatcherPresence {
   afterSequence: number;
 }
 
+/** The latest Done of a document, as the open documents list shows it. */
+export interface LatestHandoffSummary {
+  handoffId: string;
+  sequence: number;
+  state: HandoffRecord["state"];
+  createdAt: string;
+  comments: number;
+  wakeState: HandoffRecord["wake"]["state"];
+  ackedAt: string | null;
+  droppedAt: string | null;
+}
+
+export function summarizeHandoff(
+  handoff: HandoffRecord | undefined,
+): LatestHandoffSummary | null {
+  if (!handoff) return null;
+  return {
+    handoffId: handoff.handoffId,
+    sequence: handoff.sequence,
+    state: handoff.state,
+    createdAt: handoff.createdAt,
+    comments: handoff.summary.comments,
+    wakeState: handoff.wake.state,
+    ackedAt: handoff.ackedAt,
+    droppedAt: handoff.droppedAt ?? null,
+  };
+}
+
 export interface DocumentView extends DocumentRecord {
+  /** The file's first heading; null when it has none or cannot be read. */
+  title?: string | null;
+  /** Whether the session that opened it still runs (claude-code only). */
+  sessionState?: SessionState;
+  latestHandoff?: LatestHandoffSummary | null;
   tabs: number;
   /**
    * Tabs that reported unsaved text. Always set by the registry; optional so
@@ -87,6 +125,17 @@ export interface RegistryOptions {
   tabGraceMs?: number;
   documentIdleMs?: number;
   roundStallMs?: number;
+  /** Session liveness for views; every session is "unknown" without it. */
+  sessionStates?: () => SessionStateOf;
+}
+
+const TITLE_READ_BYTES = 256 * 1024;
+
+/** Today's local midnight, as epoch milliseconds. */
+export function localMidnight(nowMs: number): number {
+  const date = new Date(nowMs);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
 }
 
 export const ROUND_STALL_MS = 30 * 60 * 1000;
@@ -150,6 +199,15 @@ export class DocumentRegistry {
     string,
     { flag: RoundFlag; timer: NodeJS.Timeout | null }
   >();
+  private readonly sessionStates: () => SessionStateOf;
+  private readonly titles = new Map<
+    string,
+    { stamp: string; title: string | null }
+  >();
+  /** Every tab id seen per document while this server runs. */
+  private readonly knownTabs = new Map<string, Set<string>>();
+  /** The tabs a document had when it was closed from the list. */
+  private readonly closedTabs = new Map<string, Set<string>>();
 
   constructor(options: RegistryOptions) {
     this.log = options.log;
@@ -158,6 +216,78 @@ export class DocumentRegistry {
     this.tabGraceMs = options.tabGraceMs ?? TAB_GRACE_MS;
     this.documentIdleMs = options.documentIdleMs ?? DOCUMENT_IDLE_MS;
     this.roundStallMs = options.roundStallMs ?? ROUND_STALL_MS;
+    this.sessionStates = options.sessionStates ?? (() => () => "unknown");
+  }
+
+  setSession(
+    identity: DocumentIdentity,
+    session: Omit<SessionRecord, "registeredAt">,
+  ): SessionRecord {
+    const record = this.log.setSession(identity, session);
+    this.closedTabs.delete(identity.key);
+    this.emit(identity.key, "session");
+    return record;
+  }
+
+  /**
+   * Closed from the open documents list. The tabs it has now are remembered,
+   * so one that reconnects later (a hidden tab wakes up) is told to close
+   * instead of opening the document again.
+   */
+  close(key: string): DocumentRecord | null {
+    const document = this.log.close(key);
+    if (!document) return null;
+    this.closedTabs.set(key, new Set(this.knownTabs.get(key) ?? []));
+    this.emit(key, "session");
+    return document;
+  }
+
+  /** True when `tabId` was open on the document when it was closed. */
+  isClosedTab(key: string, tabId: string): boolean {
+    return (
+      (this.log.get(key)?.closedAt ?? null) !== null &&
+      (this.closedTabs.get(key)?.has(tabId) ?? false)
+    );
+  }
+
+  private reopen(key: string): void {
+    if (!this.log.reopen(key)) return;
+    this.closedTabs.delete(key);
+    this.emit(key, "session");
+  }
+
+  /** Marks documents closed before today's local midnight with no Done waiting. */
+  sweepClosed(): void {
+    this.log.sweepClosed(localMidnight(this.now()));
+  }
+
+  private titleFor(document: DocumentRecord): string | null {
+    const cached = this.titles.get(document.key);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(document.documentPath);
+    } catch {
+      return cached?.title ?? null;
+    }
+    const stamp = `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+    if (cached?.stamp === stamp) return cached.title;
+    let title: string | null = null;
+    try {
+      const handle = fs.openSync(document.documentPath, "r");
+      try {
+        const buffer = Buffer.alloc(Math.min(stat.size, TITLE_READ_BYTES));
+        const read = fs.readSync(handle, buffer, 0, buffer.length, 0);
+        title = documentTitleFromMarkdown(
+          buffer.subarray(0, read).toString("utf8"),
+        );
+      } finally {
+        fs.closeSync(handle);
+      }
+    } catch {
+      return cached?.title ?? null;
+    }
+    this.titles.set(document.key, { stamp, title });
+    return title;
   }
 
   /**
@@ -241,6 +371,7 @@ export class DocumentRegistry {
   recordOpenRequest(identity: DocumentIdentity): void {
     const document = this.touch(identity, { keepExistingIdentity: true });
     document.lastOpenRequestAt = new Date(this.now()).toISOString();
+    this.reopen(identity.key);
   }
 
   connectTab(
@@ -248,6 +379,17 @@ export class DocumentRegistry {
     tab: { tabId: string; visible: boolean },
   ): () => void {
     this.touch(identity, { keepExistingIdentity: true });
+    let known = this.knownTabs.get(identity.key);
+    if (!known) {
+      known = new Set();
+      this.knownTabs.set(identity.key, known);
+    }
+    known.add(tab.tabId);
+    // A window the document did not have when it was closed (a Reopen link,
+    // a reload) opens it again.
+    if (!this.closedTabs.get(identity.key)?.has(tab.tabId)) {
+      this.reopen(identity.key);
+    }
     const tabs = this.presenceFor(identity.key).tabs;
     const at = new Date(this.now()).toISOString();
     const existing = tabs.get(tab.tabId);
@@ -364,11 +506,17 @@ export class DocumentRegistry {
     return this.presence.get(key)?.watchers.size ?? 0;
   }
 
-  view(key: string): DocumentView | null {
+  view(
+    key: string,
+    sessionStateOf: SessionStateOf = this.sessionStates(),
+  ): DocumentView | null {
     const document = this.log.get(key);
     if (!document) return null;
     return {
       ...structuredClone(document),
+      title: this.titleFor(document),
+      sessionState: sessionStateOf(document.session),
+      latestHandoff: summarizeHandoff(document.handoffs.at(-1)),
       tabs: this.tabCount(key),
       tabsDirty: this.tabsDirty(key),
       tabsConflict: this.tabsConflict(key),
@@ -380,9 +528,11 @@ export class DocumentRegistry {
   }
 
   list(): DocumentView[] {
+    this.sweepClosed();
+    const sessionStateOf = this.sessionStates();
     return this.log
       .all()
-      .map((document) => this.view(document.key))
+      .map((document) => this.view(document.key, sessionStateOf))
       .filter((view): view is DocumentView => view !== null)
       .sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt));
   }
@@ -400,11 +550,19 @@ export class DocumentRegistry {
         }
       }
     }
+    this.sweepClosed();
     for (const document of this.log.all()) {
       if (!this.isIdle(document, now)) continue;
       this.presence.delete(document.key);
-      if (document.session === null && document.handoffs.length === 0) {
+      if (
+        document.session === null &&
+        document.handoffs.length === 0 &&
+        this.historyExpired(document, now)
+      ) {
         this.log.remove(document.key);
+        this.titles.delete(document.key);
+        this.knownTabs.delete(document.key);
+        this.closedTabs.delete(document.key);
       }
     }
   }
@@ -415,6 +573,18 @@ export class DocumentRegistry {
         listener(key, change);
       } catch {}
     }
+  }
+
+  /**
+   * A closed document stays for the Earlier list until the midnight sweep,
+   * then as history for as long as an acknowledged Done would.
+   */
+  private historyExpired(document: DocumentRecord, now: number): boolean {
+    if (document.closedAt === null) return true;
+    return (
+      document.sweptAt !== null &&
+      now - Date.parse(document.closedAt) >= HANDOFF_RETENTION.acknowledgedMs
+    );
   }
 
   private isIdle(document: DocumentRecord, now: number): boolean {

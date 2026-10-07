@@ -40,6 +40,20 @@ After installing, run `roughdraft route test claude-code` from inside a Claude C
 
 Copy the tarball to the VPS (for example with `scp`), then run the same stop, install, restart sequence there. The Tailscale link keeps its address; only the server behind it changes.
 
+## The other Roughdraft
+
+The open documents page (the root address of each Roughdraft) lists the documents of that machine only. Set `ROUGHDRAFT_PEER_URL` where the server starts and the page shows "Open documents on <host>" at the top, linking to the other list. On the Mac it is the VPS's Tailscale address, on the VPS the Mac's:
+
+```bash
+# Mac (in the shell profile the server starts from)
+export ROUGHDRAFT_PEER_URL="http://<vps-tailscale-name>:7373/"
+# VPS
+export ROUGHDRAFT_PEER_URL="http://<mac-tailscale-name>:7373/"
+roughdraft restart
+```
+
+The server reads it when it starts and reports it as `peerUrl` in `GET /api/status`. Only an `http` or `https` address is used.
+
 ## Roll back
 
 ```bash

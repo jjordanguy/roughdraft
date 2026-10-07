@@ -71,20 +71,6 @@ export function getRequestedPathState(): RequestedPathState {
   return { rawPath, projectPath, documentPath };
 }
 
-export function formatWorkspacePathForDisplay(path?: string | null) {
-  const value = path?.trim();
-  if (!value) return null;
-
-  const normalizedPath = normalizePathSeparators(value);
-  const collapsedHomePath = normalizedPath.replace(
-    /^\/Users\/[^/]+(?=\/|$)/,
-    "~",
-  );
-  return value.includes("\\")
-    ? collapsedHomePath.replace(/\//g, "\\")
-    : collapsedHomePath;
-}
-
 export function getPathLeaf(path?: string | null) {
   const value = path?.trim();
   if (!value) return null;

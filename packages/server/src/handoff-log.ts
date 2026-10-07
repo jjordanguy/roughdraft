@@ -30,7 +30,9 @@ export type HandoffState =
   | "pending"
   | "delivered"
   | "acknowledged"
-  | "superseded";
+  | "superseded"
+  /** Jordan dropped it from the open documents list; read like acknowledged. */
+  | "dropped";
 
 export interface HandoffRecord {
   sequence: number;
@@ -43,6 +45,8 @@ export interface HandoffRecord {
   deliveredTo: string[];
   ackedAt: string | null;
   ackedBy: string | null;
+  /** When it was dropped from the open documents list. Absent on older records. */
+  droppedAt?: string | null;
   wake: WakeResult;
 }
 
@@ -60,6 +64,15 @@ export interface DocumentRecord extends DocumentIdentity {
   lastKnownVersion: string | null;
   session: SessionRecord | null;
   handoffs: HandoffRecord[];
+  /** Closed from the open documents list; null while open. */
+  closedAt: string | null;
+  /** The session the document had when it was closed, for the Earlier list. */
+  lastSession: SessionRecord | null;
+  /**
+   * Set by the midnight sweep: closed before today's local midnight with no
+   * Done waiting. The record stays in the log; the list leaves it out.
+   */
+  sweptAt: string | null;
 }
 
 export interface NewHandoff {
@@ -135,6 +148,9 @@ export class ReviewLog {
         lastKnownVersion: null,
         session: null,
         handoffs: [],
+        closedAt: null,
+        lastSession: null,
+        sweptAt: null,
       };
       this.documents.set(identity.key, created);
       return created;
@@ -163,8 +179,52 @@ export class ReviewLog {
     const at = this.timestamp();
     document.session = { ...session, registeredAt: at };
     document.lastOpenRequestAt = at;
+    markOpen(document);
     this.save();
     return document.session;
+  }
+
+  /**
+   * Closed from the open documents list: the session ends here (kept as
+   * `lastSession` for the Earlier list), handoffs stay.
+   */
+  close(key: string): DocumentRecord | null {
+    const document = this.documents.get(key);
+    if (!document) return null;
+    document.closedAt = this.timestamp();
+    document.sweptAt = null;
+    if (document.session) document.lastSession = document.session;
+    document.session = null;
+    this.save();
+    return document;
+  }
+
+  /** Open again (a session registered, an open request, a new window). True when it was closed. */
+  reopen(key: string): boolean {
+    const document = this.documents.get(key);
+    if (!document || document.closedAt === null) return false;
+    markOpen(document);
+    this.save();
+    return true;
+  }
+
+  /** Marks closed documents from before `midnightMs` with no Done waiting as swept. Returns how many. */
+  sweepClosed(midnightMs: number): number {
+    let swept = 0;
+    for (const document of this.documents.values()) {
+      if (
+        document.closedAt === null ||
+        document.sweptAt !== null ||
+        Date.parse(document.closedAt) >= midnightMs ||
+        document.handoffs.some(isUnacknowledged)
+      ) {
+        continue;
+      }
+      document.sweptAt = this.timestamp();
+      swept += 1;
+    }
+    if (swept > 0) this.save();
+    return swept;
   }
 
   findHandoff(query: {
@@ -221,6 +281,16 @@ export class ReviewLog {
     }
     if (handoff.state === "pending") handoff.state = "delivered";
     this.save();
+    return handoff;
+  }
+
+  /** Dropped from the open documents list: no tool returns it as waiting any more. */
+  drop(handoff: HandoffRecord): HandoffRecord {
+    if (isUnacknowledged(handoff)) {
+      handoff.state = "dropped";
+      handoff.droppedAt = this.timestamp();
+      this.save();
+    }
     return handoff;
   }
 
@@ -290,6 +360,9 @@ export class ReviewLog {
         this.documents.set(document.key, {
           ...document,
           lastOpenRequestAt: document.lastOpenRequestAt ?? null,
+          closedAt: document.closedAt ?? null,
+          lastSession: document.lastSession ?? null,
+          sweptAt: document.sweptAt ?? null,
         });
       }
     }
@@ -359,12 +432,24 @@ function withinRetention(handoff: HandoffRecord, nowMs: number): boolean {
       HANDOFF_RETENTION.unacknowledgedMs
     );
   }
-  const settledAt = Date.parse(handoff.ackedAt ?? handoff.createdAt);
+  const settledAt = Date.parse(
+    handoff.ackedAt ?? handoff.droppedAt ?? handoff.createdAt,
+  );
   return nowMs - settledAt <= HANDOFF_RETENTION.acknowledgedMs;
 }
 
 function isPersisted(document: DocumentRecord): boolean {
-  return document.session !== null || document.handoffs.length > 0;
+  return (
+    document.session !== null ||
+    document.handoffs.length > 0 ||
+    document.closedAt !== null
+  );
+}
+
+function markOpen(document: DocumentRecord): void {
+  document.closedAt = null;
+  document.sweptAt = null;
+  document.lastSession = null;
 }
 
 function isLogFile(value: unknown): value is LogFile {

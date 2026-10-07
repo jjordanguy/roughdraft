@@ -3,38 +3,6 @@
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/inter";
 
-@font-face {
-  font-family: "Die Grotesk A";
-  src: url("./assets/fonts/die-grotesk-a-bold.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Die Grotesk B";
-  src: url("./assets/fonts/die-grotesk-b-bold.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Die Grotesk C";
-  src: url("./assets/fonts/die-grotesk-c-bold.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "Die Grotesk D";
-  src: url("./assets/fonts/die-grotesk-d-bold.woff2") format("woff2");
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-}
-
 @custom-variant dark (&:is(.dark *));
 
 @layer base {
@@ -638,10 +606,6 @@
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: "Inter Variable", sans-serif;
-  --font-die-grotesk-a: "Die Grotesk A", sans-serif;
-  --font-die-grotesk-b: "Die Grotesk B", sans-serif;
-  --font-die-grotesk-c: "Die Grotesk C", sans-serif;
-  --font-die-grotesk-d: "Die Grotesk D", sans-serif;
   --color-emerald-850: rgb(6 83 61);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);

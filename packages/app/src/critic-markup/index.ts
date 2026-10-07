@@ -584,6 +584,12 @@ function endmatterEntryForComment(
     delete next.re;
   }
 
+  // A new global comment says so in its entry, as rfm's writer does; an
+  // existing entry keeps its keys as they are.
+  if (!existing && !isReply && comment.scope === "document") {
+    next.scope = "document";
+  }
+
   applyResolution(next, comment);
   return next;
 }

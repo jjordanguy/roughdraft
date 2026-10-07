@@ -10,6 +10,7 @@ import {
   type CompleteReviewOptions,
   type CompleteReviewResult,
   type HandoffRecord,
+  type RoundFlag,
   MarkdownFileConflictError,
   MarkdownFileNotFoundError,
   type MarkdownFileState,
@@ -56,6 +57,9 @@ export interface DocumentSyncView {
   watchers: number;
   session: SessionRecord | null;
   handoff: HandoffRecord | null;
+  // The agent's round on this document ("AI editing..." badge); null when
+  // the server never reported one.
+  round: RoundFlag | null;
   latestSequence: number | null;
   lastError: string | null;
 }
@@ -278,6 +282,7 @@ export class DocumentSync {
   private watchers = 0;
   private session: SessionRecord | null = null;
   private handoff: HandoffRecord | null = null;
+  private round: RoundFlag | null = null;
   private latestSequence: number | null = null;
 
   private presenceKey: string | null = null;
@@ -1047,6 +1052,7 @@ export class DocumentSync {
         this.watchers = message.watchers;
         this.session = message.session;
         this.handoff = message.handoff;
+        this.round = message.round;
         this.latestSequence = message.latestSequence;
         this.notify();
         for (const listener of [...this.helloListeners]) listener();
@@ -1072,6 +1078,10 @@ export class DocumentSync {
         return;
       case "handoff":
         this.handoff = message.handoff;
+        this.notify();
+        return;
+      case "round":
+        this.round = message.round;
         this.notify();
         return;
       case "open-request":
@@ -1224,6 +1234,7 @@ export class DocumentSync {
       watchers: this.watchers,
       session: this.session,
       handoff: this.handoff,
+      round: this.round,
       latestSequence: this.latestSequence,
       lastError: this.lastError,
     };

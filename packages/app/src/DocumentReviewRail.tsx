@@ -40,6 +40,12 @@ import {
   normalizeCommentMeasurement,
   resolveAnchoredRailLayouts,
 } from "./document-comments";
+import { Badge } from "./components/ui/badge";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "./components/ui/collapsible";
 import { SUGGESTED_PARAGRAPH_SENTINEL } from "./editor-extensions";
 import { cn } from "./lib/utils";
 import type { DraftSuggestionState } from "./PageCard";
@@ -86,6 +92,7 @@ interface DocumentReviewRailProps {
   pendingFocusCommentId?: string | null;
   newCommentDraftIds?: string[];
   onAutoFocusComment?: (commentId: string) => void;
+  onDraftChange?: (commentId: string, text: string) => void;
   draftSuggestion?: DraftSuggestionState | null;
   onDraftSuggestionTextChange?: (text: string) => void;
   onApplyDraftSuggestion?: () => void;
@@ -212,6 +219,7 @@ export interface CommentThreadHandlers {
   pendingFocusCommentId?: string | null;
   newCommentDraftIds?: string[];
   onAutoFocusComment?: (commentId: string) => void;
+  onDraftChange?: (commentId: string, text: string) => void;
 }
 
 function sortNewestFirst(comments: CriticComment[]) {
@@ -225,19 +233,39 @@ function sortNewestFirst(comments: CriticComment[]) {
   });
 }
 
-/** Roots shown in the global section: open ones newest first, resolved ones folded. */
-export function getGlobalThreadRoots(
+/**
+ * Whether a root's card lives in the global section: comments on the whole
+ * document, comments whose anchor is gone, replies whose parent is missing,
+ * and comments on code blocks (D10), which carry their quoted lines.
+ */
+export function isGlobalSectionRoot(
+  comment: CriticComment,
   comments: ReadonlyMap<string, CriticComment>,
 ) {
+  if (comment.literal) return false;
+  if (isGlobalThreadRoot(comment, comments)) return true;
+  return comment.scope === "code" && !comment.parentCommentId;
+}
+
+/**
+ * Roots shown in the global section: open ones newest first (an open draft
+ * on top), resolved ones folded.
+ */
+export function getGlobalThreadRoots(
+  comments: ReadonlyMap<string, CriticComment>,
+  draftIds: readonly string[] = [],
+) {
   const roots = sortNewestFirst(
-    [...comments.values()].filter(
-      (comment) => !comment.literal && isGlobalThreadRoot(comment, comments),
+    [...comments.values()].filter((comment) =>
+      isGlobalSectionRoot(comment, comments),
     ),
   );
+  const drafts = roots.filter((root) => draftIds.includes(root.id));
+  const saved = roots.filter((root) => !draftIds.includes(root.id));
 
   return {
-    open: roots.filter((root) => !isResolvedComment(root)),
-    resolved: roots.filter((root) => isResolvedComment(root)),
+    open: [...drafts, ...saved.filter((root) => !isResolvedComment(root))],
+    resolved: saved.filter((root) => isResolvedComment(root)),
   };
 }
 
@@ -261,12 +289,24 @@ function ThreadRootContent({
       {comment.scope === "code" && comment.quote ? (
         <span
           data-testid={`comment-code-quote-${comment.id}`}
-          className="mb-1 block truncate rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600 dark:bg-slate-800 dark:text-slate-300"
+          className="mb-1.5 block overflow-hidden rounded-md border border-stone-200 bg-stone-50 dark:border-slate-700 dark:bg-slate-900"
         >
-          {comment.codeLines
-            ? `Lines ${comment.codeLines[0]}-${comment.codeLines[1]}: `
-            : ""}
-          {comment.quote.split("\n")[0]}
+          {comment.codeLines ? (
+            <span
+              data-testid={`comment-code-lines-${comment.id}`}
+              className="block border-b border-stone-200 px-2 py-0.5 text-[10px] font-medium tracking-[0.04em] text-stone-500 uppercase dark:border-slate-700 dark:text-slate-400"
+            >
+              {comment.codeLines[0] === comment.codeLines[1]
+                ? `Line ${comment.codeLines[0]}`
+                : `Lines ${comment.codeLines[0]}–${comment.codeLines[1]}`}
+            </span>
+          ) : null}
+          <code
+            data-testid={`comment-code-quote-text-${comment.id}`}
+            className="block max-h-32 overflow-auto px-2 py-1.5 font-mono text-[11px] leading-4 whitespace-pre text-stone-700 dark:text-slate-300"
+          >
+            {comment.quote}
+          </code>
         </span>
       ) : null}
       {defaultContent}
@@ -318,6 +358,7 @@ export function CommentThreadCard({
       threadComments.map((comment) => comment.id),
       handlers.selectedCommentId,
     ) ?? rootId;
+  const root = threadComments[0];
 
   return (
     <div
@@ -325,6 +366,7 @@ export function CommentThreadCard({
       data-testid={testId}
       data-comment-thread-container="true"
       data-thread-root-id={rootId}
+      data-author={root?.authorType === "ai" ? "ai" : "user"}
       className={cn(
         "rounded-xl border border-transparent bg-transparent shadow-none transition-all duration-200 ease-out",
         selected
@@ -357,6 +399,7 @@ export function CommentThreadCard({
         pendingFocusCommentId={handlers.pendingFocusCommentId}
         newCommentDraftIds={handlers.newCommentDraftIds}
         onAutoFocusComment={handlers.onAutoFocusComment}
+        onDraftChange={handlers.onDraftChange}
         renderCommentContent={({ comment, depth, defaultContent }) =>
           depth === 0 ? (
             <ThreadRootContent
@@ -431,16 +474,16 @@ function ResolvedThreadsFold({
   if (rootIds.length === 0) return null;
 
   return (
-    <div data-comment-thread-container="true" className="grid gap-2">
-      <button
-        type="button"
+    <Collapsible
+      open={expanded}
+      onOpenChange={(nextOpen) => setOpen(nextOpen)}
+      data-comment-thread-container="true"
+      className="grid gap-2"
+    >
+      <CollapsibleTrigger
         data-testid={testId}
-        aria-expanded={expanded}
         className="flex w-full items-center gap-1.5 rounded-lg px-3 py-1.5 text-left text-xs font-medium text-stone-500 transition hover:bg-stone-100 hover:text-stone-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-stone-300 dark:text-stone-400 dark:hover:bg-slate-800 dark:hover:text-stone-200"
-        onClick={(event) => {
-          event.stopPropagation();
-          setOpen(!expanded);
-        }}
+        onClick={(event) => event.stopPropagation()}
       >
         <ChevronRight
           className={cn(
@@ -450,43 +493,52 @@ function ResolvedThreadsFold({
           aria-hidden="true"
         />
         {rootIds.length} resolved
-      </button>
-      {expanded
-        ? rootIds.map((rootId) => (
-            <CommentThreadCard
-              key={rootId}
-              rootId={rootId}
-              comments={comments}
-              handlers={handlers}
-              variant={variant}
-              testId={`resolved-comment-thread-${rootId}`}
-              selected={activeRootThreadId === rootId}
-              muted
-            />
-          ))
-        : null}
-    </div>
+      </CollapsibleTrigger>
+      <CollapsibleContent className="grid gap-2">
+        {rootIds.map((rootId) => (
+          <CommentThreadCard
+            key={rootId}
+            rootId={rootId}
+            comments={comments}
+            handlers={handlers}
+            variant={variant}
+            testId={`resolved-comment-thread-${rootId}`}
+            selected={activeRootThreadId === rootId}
+            muted
+          />
+        ))}
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
-// The global section: document-level comments, comments whose anchor is
-// gone and replies whose parent is missing, newest first, resolved ones
-// folded into one row at the bottom.
+// The global section: comments on the whole document (an open draft on
+// top), comments on code blocks, comments whose anchor is gone and replies
+// whose parent is missing, newest first, resolved ones folded into one row
+// at the bottom.
 export function GlobalCommentsSection({
   comments,
   handlers,
   activeRootThreadId,
   variant = "rail",
-  testId = "document-comments-section",
+  testId = "global-comments-section",
+  resolvedToggleTestId = "global-comments-resolved-toggle",
 }: {
   comments: ReadonlyMap<string, CriticComment>;
   handlers: CommentThreadHandlers;
   activeRootThreadId: string | null;
   variant?: "rail" | "banner";
   testId?: string;
+  resolvedToggleTestId?: string;
 }) {
-  const { open, resolved } = getGlobalThreadRoots(comments);
+  const { open, resolved } = getGlobalThreadRoots(
+    comments,
+    handlers.newCommentDraftIds,
+  );
   if (open.length === 0 && resolved.length === 0) return null;
+  const openCount = open.filter(
+    (root) => root.content.trim().length > 0,
+  ).length;
 
   return (
     <section
@@ -497,13 +549,14 @@ export function GlobalCommentsSection({
       <div className="flex items-center gap-1.5 px-3 text-[11px] font-semibold tracking-[0.08em] text-stone-500 uppercase dark:text-stone-400">
         <FileText className="size-3.5" aria-hidden="true" />
         Global comments
-        {open.length > 0 ? (
-          <span
-            data-testid="document-comments-open-count"
-            className="rounded-full bg-stone-200/70 px-1.5 text-[10px] tracking-normal text-stone-600 dark:bg-slate-700 dark:text-slate-300"
+        {openCount > 0 ? (
+          <Badge
+            variant="secondary"
+            data-testid="global-comments-open-count"
+            className="h-4 px-1.5 tracking-normal text-stone-600 dark:text-slate-300"
           >
-            {open.length}
-          </span>
+            {openCount}
+          </Badge>
         ) : null}
       </div>
       {open.map((root) => (
@@ -513,7 +566,7 @@ export function GlobalCommentsSection({
           comments={comments}
           handlers={handlers}
           variant={variant}
-          testId={`document-comment-thread-${root.id}`}
+          testId={`global-comment-thread-${root.id}`}
           selected={activeRootThreadId === root.id}
         />
       ))}
@@ -523,7 +576,7 @@ export function GlobalCommentsSection({
         handlers={handlers}
         activeRootThreadId={activeRootThreadId}
         variant={variant}
-        testId="document-comments-resolved-toggle"
+        testId={resolvedToggleTestId}
       />
     </section>
   );
@@ -558,6 +611,7 @@ export function DocumentReviewRail({
   pendingFocusCommentId = null,
   newCommentDraftIds = [],
   onAutoFocusComment,
+  onDraftChange,
   draftSuggestion = null,
   onDraftSuggestionTextChange,
   onApplyDraftSuggestion,
@@ -578,12 +632,15 @@ export function DocumentReviewRail({
     [suggestions],
   );
 
-  const globalRoots = useMemo(() => getGlobalThreadRoots(comments), [comments]);
+  const globalRoots = useMemo(
+    () => getGlobalThreadRoots(comments, newCommentDraftIds),
+    [comments, newCommentDraftIds],
+  );
 
   const visibleCommentThreads = useMemo(() => {
     const excludeRootIds = new Set<string>(suggestionCommentIds);
     for (const comment of comments.values()) {
-      if (comment.literal || isGlobalThreadRoot(comment, comments)) {
+      if (comment.literal || isGlobalSectionRoot(comment, comments)) {
         excludeRootIds.add(comment.id);
       }
     }
@@ -772,6 +829,7 @@ export function DocumentReviewRail({
     pendingFocusCommentId,
     newCommentDraftIds,
     onAutoFocusComment,
+    onDraftChange,
   };
 
   const setItemRef = useCallback((key: string, node: HTMLDivElement | null) => {

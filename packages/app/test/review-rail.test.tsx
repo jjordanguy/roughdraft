@@ -247,16 +247,16 @@ describe("review rail from the comment map", () => {
       fixture("canonical-document-comments"),
     );
 
-    const section = byTestId(rail(container), "document-comments-section");
+    const section = byTestId(rail(container), "global-comments-section");
     expect(section?.textContent).toContain("Global comments");
     const threads = [
       ...(section?.querySelectorAll<HTMLElement>(
-        '[data-testid^="document-comment-thread-"]',
+        '[data-testid^="global-comment-thread-"]',
       ) ?? []),
     ];
     expect(threads.map((thread) => thread.dataset.testid)).toEqual([
-      "document-comment-thread-a2",
-      "document-comment-thread-c2",
+      "global-comment-thread-a2",
+      "global-comment-thread-c2",
     ]);
     // `<br>` in a body is a line break.
     expect(threads[1]?.textContent).toContain(
@@ -318,16 +318,16 @@ describe("review rail from the comment map", () => {
       ].join("\n"),
     );
 
-    const section = byTestId(rail(container), "document-comments-section");
+    const section = byTestId(rail(container), "global-comments-section");
     expect(
-      byTestId(section as HTMLElement, "document-comment-thread-c1"),
+      byTestId(section as HTMLElement, "global-comment-thread-c1"),
     ).not.toBeNull();
     expect(
-      byTestId(section as HTMLElement, "document-comment-thread-c2"),
+      byTestId(section as HTMLElement, "global-comment-thread-c2"),
     ).toBeNull();
     const toggle = byTestId(
       section as HTMLElement,
-      "document-comments-resolved-toggle",
+      "global-comments-resolved-toggle",
     );
     expect(toggle?.textContent).toBe("1 resolved");
     await click(toggle);
@@ -352,14 +352,55 @@ describe("review rail from the comment map", () => {
     );
     expect(c3?.textContent).toBe('import { start } from "./server";');
 
-    const thread = byTestId(rail(container), "comment-thread-c1");
+    // Code comments live in the global section (D10), not at their lines.
+    const section = byTestId(
+      rail(container),
+      "global-comments-section",
+    ) as HTMLElement;
+    const thread = byTestId(section, "global-comment-thread-c1");
     expect(thread?.textContent).toContain(
       "Read the port from the environment instead.",
     );
     expect(thread?.textContent).toContain("Changed both.");
-    expect(byTestId(rail(container), "comment-thread-c3")).not.toBeNull();
+    expect(byTestId(section, "global-comment-thread-c3")).not.toBeNull();
+    expect(byTestId(rail(container), "comment-thread-c1")).toBeNull();
+    expect(byTestId(rail(container), "comment-thread-c3")).toBeNull();
+    // The prose comment stays at its anchor.
+    expect(byTestId(rail(container), "comment-thread-c2")).not.toBeNull();
     // The code itself carries no review markup.
     expect(getEditor().getText()).not.toContain("{#");
+  });
+
+  it("shows a code comment's quoted lines in a small code block and highlights them when selected", async () => {
+    const { container, getEditor } = await renderDocument(
+      fixture("canonical-code-block"),
+    );
+    const thread = byTestId(rail(container), "global-comment-thread-c1");
+    const quote = byTestId(thread as HTMLElement, "comment-code-quote-c1");
+    expect(
+      byTestId(quote as HTMLElement, "comment-code-lines-c1")?.textContent,
+    ).toBe("Lines 3\u20134");
+    expect(
+      byTestId(quote as HTMLElement, "comment-code-quote-text-c1")?.textContent,
+    ).toBe("const port = 3000;\nstart({ port });");
+    expect(
+      byTestId(
+        byTestId(rail(container), "global-comment-thread-c3") as HTMLElement,
+        "comment-code-lines-c3",
+      )?.textContent,
+    ).toBe("Line 1");
+
+    const anchor = () =>
+      getEditor().view.dom.querySelector(
+        '[data-testid="comment-code-anchor-c1"]',
+      );
+    expect(anchor()?.classList.contains("comment-decoration-active")).toBe(
+      false,
+    );
+    await click(thread);
+    expect(anchor()?.classList.contains("comment-decoration-active")).toBe(
+      true,
+    );
   });
 
   it("blocks a file whose review block cannot be read and never saves it", async () => {
@@ -399,9 +440,9 @@ describe("review rail from the comment map", () => {
       fixture("canonical-document-comments"),
     );
 
-    const fallback = byTestId(container, "document-comment-fallback-global");
+    const fallback = byTestId(container, "global-comments-fallback");
     expect(
-      byTestId(fallback as HTMLElement, "document-comment-thread-c2")
+      byTestId(fallback as HTMLElement, "global-comment-thread-c2")
         ?.textContent,
     ).toContain("Shortened the intro and added the table.");
   });
@@ -411,7 +452,7 @@ describe("review rail from the comment map", () => {
       fixture("canonical-document-comments"),
     );
 
-    const thread = byTestId(rail(container), "document-comment-thread-a2");
+    const thread = byTestId(rail(container), "global-comment-thread-a2");
     await click(thread);
     await click(
       byTestId(thread as HTMLElement, "comment-rail-a2-action-reply"),
@@ -499,7 +540,7 @@ describe("DocumentReviewRail", () => {
 
     const railElement = byTestId(container, "rail");
     expect(railElement?.getAttribute("aria-hidden")).toBeNull();
-    const thread = byTestId(container, "document-comment-thread-c1");
+    const thread = byTestId(container, "global-comment-thread-c1");
     expect(thread?.textContent).toContain("Overall: tighten the intro.");
     expect(
       byTestId(thread as HTMLElement, "comment-rail-a1")?.textContent,

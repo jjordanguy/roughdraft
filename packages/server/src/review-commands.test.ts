@@ -546,6 +546,95 @@ describe("review commands", () => {
     });
   });
 
+  describe("the round flag around a quick command", () => {
+    function roundMessages(tab: Tab) {
+      return tab.messages
+        .map((message, index) => ({ message, index }))
+        .filter(({ message }) => message.type === "round");
+    }
+
+    it("opens the flag before the write and closes it after", async () => {
+      const server = await startServer();
+      const tab = await openTab(server);
+
+      const result = await run(["reply", doc, "c1", "Cited.", "--json"]);
+      expect(result.exitCode).toBe(0);
+      expect(result.json.writtenVia).toBe("server");
+
+      const rounds = await waitFor(
+        () => roundMessages(tab),
+        (list) => list.at(-1)?.message.round?.state === "closed",
+      );
+      expect(rounds.map(({ message }) => message.round.state)).toEqual([
+        "open",
+        "closed",
+      ]);
+      const [opened, closed] = rounds;
+      expect(opened?.message.round.roundId).toMatch(/^quick-reply-/);
+      expect(closed?.message.round.roundId).toBe(opened?.message.round.roundId);
+      // The file change reaches the tab while the flag is open.
+      const change = tab.messages.findIndex(
+        (message) => message.type === "change",
+      );
+      expect(change).toBeGreaterThan(opened?.index ?? -1);
+      expect(change).toBeLessThan(closed?.index ?? -1);
+      expect((await documentView(server)).body.round.state).toBe("closed");
+    });
+
+    it("closes the flag when the command is refused", async () => {
+      const server = await startServer();
+      const tab = await openTab(server);
+
+      const result = await run(["reply", doc, "c9", "Cited.", "--json"]);
+      expect(result.exitCode).toBe(1);
+      const rounds = await waitFor(
+        () => roundMessages(tab),
+        (list) => list.at(-1)?.message.round?.state === "closed",
+      );
+      expect(rounds.map(({ message }) => message.round.state)).toEqual([
+        "open",
+        "closed",
+      ]);
+    });
+
+    it("leaves an open round's flag alone", async () => {
+      const server = await startServer();
+      const tab = await openTab(server);
+      await fetch(`${server.url}/api/documents/round`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectPath: projectDir,
+          path: "plan.md",
+          roundId: "r-1",
+          state: "open",
+        }),
+      });
+      await waitFor(
+        () => roundMessages(tab),
+        (list) => list.length === 1,
+      );
+
+      const result = await run(["resolve", doc, "c1", "--json"]);
+      expect(result.exitCode).toBe(0);
+      await waitFor(
+        () => tab.messages.some((message) => message.type === "change"),
+        Boolean,
+      );
+      expect(roundMessages(tab)).toHaveLength(1);
+      expect((await documentView(server)).body.round).toMatchObject({
+        roundId: "r-1",
+        state: "open",
+      });
+    });
+
+    it("does nothing with no server", async () => {
+      const result = await run(["note", doc, "Round 1: cited.", "--json"]);
+      expect(result.exitCode).toBe(0);
+      expect(result.json.writtenVia).toBe("disk");
+    });
+  });
+
   // ---------------------------------------------------------------- feedback
 
   it("lists every thread once with context, without starting a round", async () => {

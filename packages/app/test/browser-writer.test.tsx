@@ -1048,8 +1048,8 @@ describe("browser writer", () => {
 
     const rendered = await renderDocument(withDone);
     const global =
-      byTestId(rendered.container, "document-comments-section") ??
-      byTestId(rendered.container, "document-comment-fallback-global");
+      byTestId(rendered.container, "global-comments-section") ??
+      byTestId(rendered.container, "global-comments-fallback");
     expect(global?.textContent).toContain(
       "Left comments, please review.\nTwo of them are urgent.",
     );

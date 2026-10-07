@@ -42,6 +42,9 @@ interface CommentEditorListProps {
   pendingFocusCommentId?: string | null;
   newCommentDraftIds?: string[];
   onAutoFocusComment?: (commentId: string) => void;
+  // The text in an open composer, on every keystroke (Done saves an open
+  // global comment draft from it).
+  onDraftChange?: (commentId: string, text: string) => void;
   renderCommentContent?: (context: CommentContentRenderContext) => ReactNode;
   getCommentActions?: (
     context: CommentActionsRenderContext,
@@ -109,11 +112,19 @@ export function CommentEditorList({
   pendingFocusCommentId = null,
   newCommentDraftIds = [],
   onAutoFocusComment,
+  onDraftChange,
   renderCommentContent,
   getCommentActions,
 }: CommentEditorListProps) {
   const textareaRefs = useRef(new Map<string, HTMLTextAreaElement>());
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // What each comment said when its composer opened, so a save made from
+  // outside the composer (Done saving an open draft) closes it.
+  const editStartContentRef = useRef(new Map<string, string>());
+  // The drafts of the render that brought new comments (read by the effect
+  // below, which runs only when the comments change).
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
   // Why a draft could not be saved (a review-markup close delimiter).
   const [draftErrors, setDraftErrors] = useState<Record<string, string>>({});
   const [editingCommentIds, setEditingCommentIds] = useState<string[]>([]);
@@ -146,16 +157,40 @@ export function CommentEditorList({
 
   useEffect(() => {
     const validCommentIds = new Set(comments.map((comment) => comment.id));
+    // A composer whose text was saved from outside (its comment now holds
+    // exactly the typed text) is done.
+    const savedElsewhere = new Set<string>();
+    for (const comment of comments) {
+      const startContent = editStartContentRef.current.get(comment.id);
+      if (startContent === undefined || comment.content === startContent) {
+        continue;
+      }
+      const draft = draftsRef.current[comment.id];
+      // Saved from this composer's text, or from another view of the same
+      // thread while this one was left untouched.
+      if (
+        draft === undefined ||
+        draft === startContent ||
+        draft.trim() === comment.content
+      ) {
+        savedElsewhere.add(comment.id);
+        editStartContentRef.current.delete(comment.id);
+      }
+    }
 
     setDrafts((current) =>
       Object.fromEntries(
-        Object.entries(current).filter(([commentId]) =>
-          validCommentIds.has(commentId),
+        Object.entries(current).filter(
+          ([commentId]) =>
+            validCommentIds.has(commentId) && !savedElsewhere.has(commentId),
         ),
       ),
     );
     setEditingCommentIds((current) =>
-      current.filter((commentId) => validCommentIds.has(commentId)),
+      current.filter(
+        (commentId) =>
+          validCommentIds.has(commentId) && !savedElsewhere.has(commentId),
+      ),
     );
   }, [comments]);
 
@@ -171,6 +206,12 @@ export function CommentEditorList({
       [pendingFocusCommentId]:
         current[pendingFocusCommentId] ?? pendingComment.content,
     }));
+    if (!editStartContentRef.current.has(pendingFocusCommentId)) {
+      editStartContentRef.current.set(
+        pendingFocusCommentId,
+        pendingComment.content,
+      );
+    }
     setEditingCommentIds((current) =>
       current.includes(pendingFocusCommentId)
         ? current
@@ -207,6 +248,7 @@ export function CommentEditorList({
       ...current,
       [commentId]: current[commentId] ?? comment.content,
     }));
+    editStartContentRef.current.set(commentId, comment.content);
     setEditingCommentIds((current) =>
       current.includes(commentId) ? current : [...current, commentId],
     );
@@ -214,6 +256,7 @@ export function CommentEditorList({
   };
 
   const stopEditingComment = (commentId: string) => {
+    editStartContentRef.current.delete(commentId);
     setEditingCommentIds((current) =>
       current.filter((currentCommentId) => currentCommentId !== commentId),
     );
@@ -333,6 +376,7 @@ export function CommentEditorList({
               ...current,
               [commentId]: nextContent,
             }));
+            onDraftChange?.(commentId, nextContent);
             if (!findReviewDelimiter(nextContent)) clearDraftError(commentId);
           }}
         />
@@ -742,7 +786,11 @@ function CommentThreadNode({
                   }}
                   value={draftContent}
                   placeholder={
-                    depth === 0 ? "Add your comment" : "Write a reply"
+                    depth > 0
+                      ? "Write a reply"
+                      : comment.scope === "document"
+                        ? "Comment on the whole document"
+                        : "Add your comment"
                   }
                   rows={1}
                   className={cn(

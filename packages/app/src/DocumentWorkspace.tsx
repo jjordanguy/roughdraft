@@ -1,13 +1,13 @@
 import {
   AlertTriangle,
   Check,
-  CheckCheck,
   ChevronDown,
   CodeXml,
   Copy,
   Eye,
   Loader2,
   MessageSquarePlus,
+  MessageSquareText,
   PencilLine,
   RefreshCcw,
   Upload,
@@ -20,6 +20,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { AiRoundBadge } from "./AiRoundBadge";
 import type { DocumentEditorViewMode } from "./app-navigation";
 import { Button } from "./components/ui/button";
 import {
@@ -34,7 +35,6 @@ import {
   SelectItemText,
   SelectTrigger,
 } from "./components/ui/select";
-import { Textarea } from "./components/ui/textarea";
 import {
   Tooltip,
   TooltipContent,
@@ -53,6 +53,7 @@ import {
 import { cn } from "./lib/utils";
 import {
   type DocumentInteractionMode,
+  type DocumentReviewController,
   type DocumentSaveState,
   PageCard,
 } from "./PageCard";
@@ -500,7 +501,12 @@ export function DocumentWorkspace({
   const [fileCopyMenuOpen, setFileCopyMenuOpen] = useState(false);
   const [copiedFileAction, setCopiedFileAction] =
     useState<FileCopyAction | null>(null);
-  const [overallComment, setOverallComment] = useState("");
+  // A press of the Global comment button not yet turned into a draft (the
+  // rich-text surface may still be mounting after a switch from code view).
+  const [globalCommentRequest, setGlobalCommentRequest] = useState<
+    number | null
+  >(null);
+  const reviewControllerRef = useRef<DocumentReviewController | null>(null);
   const [documentChangedSinceOpen, setDocumentChangedSinceOpen] =
     useState(false);
   const sawNoWatcherAfterNotifiedRef = useRef(false);
@@ -547,6 +553,7 @@ export function DocumentWorkspace({
     completedHandoffVersionsRef.current = new Set();
     setReviewHandoffPopoverOpen(false);
     setDocumentChangedSinceOpen(false);
+    setGlobalCommentRequest(null);
     const readyTimer = window.setTimeout(() => {
       documentChangeTrackingReadyRef.current = true;
     }, 0);
@@ -648,51 +655,61 @@ export function DocumentWorkspace({
     };
   }, [documentDiskChangeState, documentPage, sync]);
 
-  const handleCompleteReview = useCallback(
-    async (overallCommentText?: string) => {
-      if (
-        !sync ||
-        !activeDocumentPath ||
-        reviewHandoffPhaseRef.current === "sending"
-      ) {
-        return;
-      }
+  const handleCompleteReview = useCallback(async () => {
+    if (
+      !sync ||
+      !activeDocumentPath ||
+      reviewHandoffPhaseRef.current === "sending"
+    ) {
+      return;
+    }
+    // An open global comment draft is saved first, as if Save were
+    // pressed; the flush below writes it with the rest of the review.
+    if (reviewControllerRef.current?.saveOpenGlobalDrafts() === false) {
+      return;
+    }
 
-      const handoffId = pendingHandoffIdRef.current ?? createClientId();
-      pendingHandoffIdRef.current = handoffId;
-      reviewHandoffPhaseRef.current = "sending";
-      setReviewHandoffPhase("sending");
-      setReviewHandoffErrorKind(null);
-      try {
-        // The controller flushes pending edits first and sends the version
-        // the flush left as expectedVersion; it never saves a second time.
-        const result = await sync.completeReview({
-          ...(overallCommentText ? { overallComment: overallCommentText } : {}),
-          handoffId,
-        });
-        pendingHandoffIdRef.current = null;
-        completedHandoffIdRef.current = result.handoff?.handoffId ?? handoffId;
-        completedHandoffVersionsRef.current = new Set(
-          [sync.getView().base.version, result.handoff?.version].filter(
-            (version): version is string => !!version,
-          ),
-        );
-        setReviewHandoffResult(result);
-        setReviewHandoffRecord(result.handoff ?? null);
-        setOverallComment("");
-        setReviewHandoffPhase("completed");
-        setReviewHandoffPopoverOpen(true);
-      } catch (error) {
-        console.error("Failed to complete review:", error);
-        setReviewHandoffErrorKind(
-          error instanceof HandoffError ? error.kind : "failed",
-        );
-        setReviewHandoffPhase("error");
-        setReviewHandoffPopoverOpen(true);
-      }
+    const handoffId = pendingHandoffIdRef.current ?? createClientId();
+    pendingHandoffIdRef.current = handoffId;
+    reviewHandoffPhaseRef.current = "sending";
+    setReviewHandoffPhase("sending");
+    setReviewHandoffErrorKind(null);
+    // The status popover says "Sending your review" until the answer.
+    setReviewHandoffPopoverOpen(true);
+    try {
+      // The controller flushes pending edits first and sends the version
+      // the flush left as expectedVersion; it never saves a second time.
+      const result = await sync.completeReview({ handoffId });
+      pendingHandoffIdRef.current = null;
+      completedHandoffIdRef.current = result.handoff?.handoffId ?? handoffId;
+      completedHandoffVersionsRef.current = new Set(
+        [sync.getView().base.version, result.handoff?.version].filter(
+          (version): version is string => !!version,
+        ),
+      );
+      setReviewHandoffResult(result);
+      setReviewHandoffRecord(result.handoff ?? null);
+      setReviewHandoffPhase("completed");
+      setReviewHandoffPopoverOpen(true);
+    } catch (error) {
+      console.error("Failed to complete review:", error);
+      setReviewHandoffErrorKind(
+        error instanceof HandoffError ? error.kind : "failed",
+      );
+      setReviewHandoffPhase("error");
+      setReviewHandoffPopoverOpen(true);
+    }
+  }, [activeDocumentPath, sync]);
+
+  const handleReviewControllerChange = useCallback(
+    (controller: DocumentReviewController | null) => {
+      reviewControllerRef.current = controller;
     },
-    [activeDocumentPath, sync],
+    [],
   );
+  const handleGlobalCommentRequestHandled = useCallback(() => {
+    setGlobalCommentRequest(null);
+  }, []);
 
   const handleDocumentDirtyStateChange = useCallback((isDirty: boolean) => {
     if (
@@ -833,6 +850,8 @@ export function DocumentWorkspace({
     sentTitle: reviewCompleteTitle,
   });
   const showReviewHandoffButton = reviewHandoffView.kind !== "hidden";
+  const round = syncView?.round ?? null;
+  const roundBadge = useMemo(() => <AiRoundBadge round={round} />, [round]);
   const reviewHandoffIsReady =
     reviewHandoffView.kind === "ready-listening" ||
     reviewHandoffView.kind === "ready-no-agent";
@@ -847,7 +866,19 @@ export function DocumentWorkspace({
   );
   const reviewHandoffTooltip =
     reviewHandoffView.blockedReason ?? reviewHandoffView.agentStatusText;
-  const trimmedOverallComment = overallComment.trim();
+  // One Global comment button, next to Done, whenever a local document is
+  // open outside Viewing mode.
+  const showGlobalCommentButton =
+    !!documentPage &&
+    !!activeDocumentPath &&
+    backend?.info.kind === "local-files" &&
+    documentInteractionMode !== "viewing";
+  const handleGlobalCommentClick = () => {
+    if (documentEditorViewMode === "code") {
+      onDocumentEditorViewModeChange("rich-text");
+    }
+    setGlobalCommentRequest((current) => (current ?? 0) + 1);
+  };
 
   return (
     <div
@@ -869,13 +900,35 @@ export function DocumentWorkspace({
       ) : null}
       <div
         className={cn(
-          "fixed right-3 z-[60] flex max-w-[min(16rem,calc(100vw-1rem))] flex-col items-end gap-1.5",
-          hasNotice ? "top-[19rem] sm:top-[7rem]" : "top-3",
+          "fixed right-3 z-[60] flex max-w-[min(22rem,calc(100vw-1rem))] flex-col items-end gap-1.5",
+          hasNotice ? "top-[19rem] sm:top-[11rem]" : "top-3",
         )}
         data-testid="document-status-stack"
         data-document-status-stack="true"
       >
-        <div className="flex max-w-full items-center justify-end gap-1.5">
+        <div className="flex max-w-full flex-wrap items-center justify-end gap-1.5">
+          {showGlobalCommentButton ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="lg"
+                    data-testid="global-comment-add"
+                    className="h-9 gap-1.5 rounded-[7px] border-[#DCD6CC] bg-[#FFFDFC] px-3 text-sm font-semibold text-stone-800 shadow-[0_10px_28px_rgba(0,0,0,0.12)] hover:bg-[#F3EFE8] dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
+                    onClick={handleGlobalCommentClick}
+                  >
+                    <MessageSquareText className="size-4" aria-hidden="true" />
+                    Global comment
+                  </Button>
+                }
+              />
+              <TooltipContent side="bottom">
+                Comment on the whole document
+              </TooltipContent>
+            </Tooltip>
+          ) : null}
           {showReviewHandoffButton ? (
             <Popover
               open={reviewHandoffPopoverOpen}
@@ -917,7 +970,7 @@ export function DocumentWorkspace({
                         return;
                       }
 
-                      void handleCompleteReview(trimmedOverallComment);
+                      void handleCompleteReview();
                     }}
                   >
                     {ReviewHandoffButtonIcon ? (
@@ -935,11 +988,11 @@ export function DocumentWorkspace({
                     render={
                       <Button
                         type="button"
-                        data-testid="review-handoff-comment-trigger"
+                        data-testid="review-handoff-status-trigger"
                         size="icon-lg"
                         className="h-9 w-8 rounded-l-none rounded-r-[7px] border-0 bg-[#2B2420] text-white hover:bg-[#3a322b] focus-visible:ring-slate-300 disabled:opacity-100 dark:bg-slate-700 dark:text-slate-100 dark:hover:bg-slate-600 dark:focus-visible:ring-slate-600"
                         disabled={reviewHandoffView.triggerDisabled}
-                        aria-label="Overall comment options"
+                        aria-label="Review status"
                       >
                         <ChevronDown className="size-4" />
                       </Button>
@@ -966,61 +1019,23 @@ export function DocumentWorkspace({
               </Tooltip>
               <PopoverContent
                 className={reviewHandoffIsReady ? undefined : "pt-0"}
-                aria-label={
-                  reviewHandoffIsReady
-                    ? "Review handoff comment"
-                    : "Review handoff status"
-                }
-                data-testid={
-                  reviewHandoffIsReady
-                    ? "review-handoff-comment-popover"
-                    : "review-handoff-status"
-                }
+                aria-label="Review handoff status"
+                data-testid="review-handoff-status"
               >
                 {reviewHandoffIsReady ? (
-                  <form
-                    className="space-y-3"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      void handleCompleteReview(trimmedOverallComment);
-                    }}
-                  >
-                    <div>
-                      <Textarea
-                        id="review-handoff-overall-comment"
-                        data-testid="review-handoff-overall-comment"
-                        aria-label="Overall comment"
-                        placeholder="Overall comment"
-                        value={overallComment}
-                        onChange={(event) =>
-                          setOverallComment(event.currentTarget.value)
-                        }
-                        maxLength={4000}
-                        rows={4}
-                        className="min-h-24 resize-none"
-                      />
-                    </div>
-                    <div className="space-y-1 text-xs leading-5 text-stone-500 dark:text-slate-400">
-                      <p data-testid="review-handoff-agent-status">
-                        {reviewHandoffView.agentStatusText}
-                      </p>
-                      {reviewHandoffView.sessionText ? (
-                        <p data-testid="review-handoff-session-label">
-                          {reviewHandoffView.sessionText}
-                        </p>
-                      ) : null}
-                    </div>
-                    <Button
-                      type="submit"
-                      data-testid="review-handoff-submit-comment"
-                      size="lg"
-                      className="w-full rounded-[7px] bg-black text-sm font-bold text-white hover:bg-black/85 focus-visible:ring-black/25 dark:bg-white dark:text-black dark:hover:bg-white/90"
-                      disabled={!trimmedOverallComment}
+                  <div className="space-y-1 text-xs leading-5 text-stone-500 dark:text-slate-400">
+                    <p
+                      data-testid="review-handoff-agent-status"
+                      className="text-sm leading-5 text-stone-800 dark:text-slate-200"
                     >
-                      <CheckCheck className="size-4" />
-                      Submit with comment
-                    </Button>
-                  </form>
+                      {reviewHandoffView.agentStatusText}
+                    </p>
+                    {reviewHandoffView.sessionText ? (
+                      <p data-testid="review-handoff-session-label">
+                        {reviewHandoffView.sessionText}
+                      </p>
+                    ) : null}
+                  </div>
                 ) : reviewHandoffView.kind === "sent" ? (
                   <div>
                     <div className="mb-3 flex h-[170px] items-center justify-center overflow-hidden">
@@ -1114,9 +1129,7 @@ export function DocumentWorkspace({
                             size="lg"
                             className="w-full rounded-[7px] bg-black text-sm font-bold text-white hover:bg-black/85 focus-visible:ring-black/25 dark:bg-white dark:text-black dark:hover:bg-white/90"
                             disabled={reviewHandoffView.retryDisabled}
-                            onClick={() =>
-                              void handleCompleteReview(trimmedOverallComment)
-                            }
+                            onClick={() => void handleCompleteReview()}
                           >
                             <RefreshCcw className="size-4" />
                             Retry
@@ -1383,6 +1396,7 @@ export function DocumentWorkspace({
                     </div>
                   </PopoverContent>
                 </Popover>
+                {roundBadge}
                 <div className="ml-auto inline-flex h-[1.25rem] shrink-0 items-center">
                   <Select<DocumentInteractionMode>
                     value={documentInteractionMode}
@@ -1438,6 +1452,9 @@ export function DocumentWorkspace({
               onCommentRailPresenceChange={setDocumentHasComments}
               onDirtyStateChange={handleDocumentDirtyStateChange}
               sync={sync}
+              globalCommentRequest={globalCommentRequest}
+              onGlobalCommentRequestHandled={handleGlobalCommentRequestHandled}
+              onReviewControllerChange={handleReviewControllerChange}
             />
           ) : null
         ) : (

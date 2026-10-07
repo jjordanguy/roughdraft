@@ -86,8 +86,10 @@ test.describe("review format readers @batch3a", () => {
       const cardTestId = (rootId: string) => {
         const root = itemById.get(rootId);
         if (root?.kind === "suggestion") return `suggestion-thread-${rootId}`;
-        return root?.scope === "document"
-          ? `document-comment-thread-${rootId}`
+        // Comments on the whole document and on code blocks (batch 4)
+        // live in the global section.
+        return root?.scope === "document" || root?.scope === "code"
+          ? `global-comment-thread-${rootId}`
           : `comment-thread-${rootId}`;
       };
 
@@ -116,7 +118,7 @@ test.describe("review format readers @batch3a", () => {
       }
 
       const allCards = rail.locator(
-        '[data-testid^="comment-thread-"], [data-testid^="document-comment-thread-"], [data-testid^="suggestion-thread-"]',
+        '[data-testid^="comment-thread-"], [data-testid^="global-comment-thread-"], [data-testid^="suggestion-thread-"]',
       );
       // A thread whose highlight cannot be shown may still get one card
       // from a ref it carries; never more than one.

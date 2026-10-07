@@ -62,11 +62,12 @@ describe("validateRoughdraftMarkdown", () => {
   it("does not validate CriticMarkup-looking text inside YAML endmatter bodies", () => {
     const result = validateRoughdraftMarkdown(
       [
-        "Please revisit {==this sentence==}{>>Needs a source.<<}{#c1}.",
+        "Please revisit {==this sentence==}{#c1}.",
         "",
         "---",
         "comments:",
         "  c1:",
+        '    body: "Needs a source."',
         "    by: user",
         '    at: "2026-04-28T12:00:00.000Z"',
         "  c2:",
@@ -177,10 +178,14 @@ describe("validateRoughdraftMarkdown", () => {
     );
 
     expect(result.ok).toBe(true);
-    expect(result.diagnostics).toEqual([]);
+    // 3a: the block is reported as ignored instead of passing silently.
+    expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      "endmatter-ignored",
+    ]);
     expect(result.summary).toMatchObject({
       comments: 0,
       suggestions: 0,
+      endmatter: "ignored",
     });
   });
 
@@ -261,7 +266,9 @@ describe("validateRoughdraftMarkdown", () => {
     );
 
     expect(result.ok).toBe(true);
+    // 3a: an inline comment body is the legacy form and is reported too.
     expect(result.warnings.map((diagnostic) => diagnostic.code)).toEqual([
+      "legacy-inline-body",
       "legacy-metadata",
     ]);
     expect(result.summary.legacyMetadata).toBe(1);
@@ -472,9 +479,120 @@ describe("extractRoughdraftReviewIndex", () => {
       author: "user",
     });
   });
+
+  it("gives items scope, anchors, lines, quote and continues", () => {
+    const markdown = [
+      "{==First block==}{#c1}",
+      "",
+      "{==Second block==}{#c1}",
+      "",
+      "```ts {#c2}",
+      "const a = 1;",
+      "```",
+      "",
+      "{--One--}{#s1}",
+      "",
+      "{--Two--}{#s2}",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      '    body: "Across two blocks."',
+      "    by: user",
+      '    at: "2026-10-05T09:00:00.000Z"',
+      "  c2:",
+      '    body: "On code."',
+      "    by: user",
+      '    at: "2026-10-05T09:01:00.000Z"',
+      "    lines: [1, 1]",
+      '    quote: "const a = 1;"',
+      "  c3:",
+      '    body: "Global."',
+      "    by: user",
+      '    at: "2026-10-05T09:02:00.000Z"',
+      "    scope: document",
+      "suggestions:",
+      "  s1:",
+      "    by: user",
+      '    at: "2026-10-05T09:03:00.000Z"',
+      "  s2:",
+      "    by: user",
+      '    at: "2026-10-05T09:03:00.000Z"',
+      "    continues: s1",
+      "",
+    ].join("\n");
+
+    const index = extractRoughdraftReviewIndex(markdown);
+
+    expect(index.diagnostics).toEqual([]);
+    expect(
+      index.items.map((item) => [
+        item.id,
+        item.kind,
+        item.scope,
+        item.anchorText,
+        item.anchors.map((anchor) => anchor.text),
+      ]),
+    ).toEqual([
+      [
+        "c1",
+        "comment",
+        "inline",
+        "First block",
+        ["First block", "Second block"],
+      ],
+      ["c2", "comment", "code", "const a = 1;", ["const a = 1;"]],
+      ["s1", "suggestion", "inline", undefined, ["One"]],
+      ["s2", "suggestion", "inline", undefined, ["Two"]],
+      ["c3", "comment", "document", undefined, []],
+    ]);
+    expect(index.items[1]).toMatchObject({
+      lines: [1, 1],
+      quote: "const a = 1;",
+    });
+    expect(index.items[3]).toMatchObject({ continues: "s1" });
+    expect(index.summary).toMatchObject({
+      comments: 3,
+      roots: 2,
+      documentComments: 1,
+      replies: 0,
+      suggestions: 2,
+      endmatter: "recognized",
+    });
+  });
 });
 
 describe("RFM mutation helpers", () => {
+  it("writes a reply to a new-format root into the endmatter", () => {
+    const markdown = [
+      "Keep {==this claim==}{#c1} as written.",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      '    body: "Needs proof."',
+      "    by: user",
+      '    at: "2026-10-05T09:00:00.000Z"',
+      "",
+    ].join("\n");
+
+    const updated = appendRoughdraftReply(markdown, {
+      parentId: "c1",
+      id: "c2",
+      author: "AI",
+      at: "2026-10-05T10:00:00.000Z",
+      message: "Added a citation.",
+    });
+
+    expect(
+      updated.startsWith("Keep {==this claim==}{#c1} as written.\n\n---\n"),
+    ).toBe(true);
+    expect(extractRoughdraftReviewIndex(updated).items).toEqual([
+      expect.objectContaining({ id: "c1", kind: "comment", scope: "inline" }),
+      expect.objectContaining({ id: "c2", kind: "reply", parentId: "c1" }),
+    ]);
+  });
+
   it("appends a reply without rewriting unrelated Markdown", () => {
     const markdown =
       '# Plan\n\nKeep {==this claim==}{>>Needs proof<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"} as written.\n';
@@ -528,6 +646,85 @@ describe("RFM mutation helpers", () => {
         }),
       ]),
     );
+  });
+
+  it("writes a reply to an endmatter-only comment into the endmatter, never inline above the block", () => {
+    // Format review W1: a reply to a document-level comment used to land as an
+    // inline attribute block directly above `---`, where Markdown renders it
+    // as a setext heading and the review block stops being the only store.
+    const body = [
+      "# Plan",
+      "",
+      "Please revisit this sentence.{>>Needs a source.<<}{#c1}",
+      "",
+    ].join("\n");
+    const markdown = [
+      body,
+      "---",
+      "comments:",
+      "  c1:",
+      "    by: user",
+      '    at: "2026-10-03T12:00:00.000Z"',
+      "  c2:",
+      "    body: Overall the intro is long.",
+      "    by: user",
+      '    at: "2026-10-03T12:01:00.000Z"',
+      "",
+    ].join("\n");
+
+    const updated = appendRoughdraftReply(markdown, {
+      parentId: "c2",
+      id: "c3",
+      author: "AI",
+      at: "2026-10-03T13:00:00.000Z",
+      message: "Trimmed the intro.",
+    });
+
+    expect(updated.startsWith(`${body}\n---\n`)).toBe(true);
+    expect(updated).not.toContain("{>>Trimmed the intro.<<}");
+    expect(updated).toContain(
+      [
+        "  c3:",
+        "    body: Trimmed the intro.",
+        "    by: AI",
+        "    at: 2026-10-03T13:00:00.000Z",
+        "    re: c2",
+      ].join("\n"),
+    );
+    expect(extractRoughdraftReviewIndex(updated).items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "c3", kind: "reply", parentId: "c2" }),
+      ]),
+    );
+  });
+
+  it("writes a reply to an endmatter reply into the endmatter", () => {
+    const markdown = [
+      "Keep this.{>>Root<<}{#c1}",
+      "",
+      "---",
+      "comments:",
+      "  c1:",
+      "    by: user",
+      '    at: "2026-10-03T12:00:00.000Z"',
+      "  c2:",
+      "    body: First reply.",
+      "    by: AI",
+      '    at: "2026-10-03T12:01:00.000Z"',
+      "    re: c1",
+      "",
+    ].join("\n");
+
+    const updated = appendRoughdraftReply(markdown, {
+      parentId: "c2",
+      id: "c3",
+      author: "user",
+      at: "2026-10-03T13:00:00.000Z",
+      message: "Thanks.",
+    });
+
+    expect(updated.startsWith("Keep this.{>>Root<<}{#c1}\n\n---\n")).toBe(true);
+    expect(updated).toContain("    re: c2");
   });
 
   it("appends a document-level comment to YAML endmatter with the next comment id", () => {

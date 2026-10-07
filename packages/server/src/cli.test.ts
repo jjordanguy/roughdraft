@@ -3,7 +3,10 @@ import { createServer as createHttpServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateRoughdraftMarkdown } from "@roughdraft/rfm";
+import {
+  extractRoughdraftReviewIndex,
+  validateRoughdraftMarkdown,
+} from "@roughdraft/rfm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createCliDependencies,
@@ -122,11 +125,13 @@ describe("cli", () => {
     expect(startIndex).toBeGreaterThanOrEqual(0);
     expect(stopIndex).toBeGreaterThan(startIndex);
 
+    // Blank lines inside the example are kept (the review block needs the
+    // blank line before `---`); leading and trailing ones are dropped.
     return `${logs
       .slice(startIndex + 1, stopIndex)
-      .filter((line) => line.length > 0)
       .map((line) => line.replace(/^ {2}/, ""))
-      .join("\n")}\n`;
+      .join("\n")
+      .trim()}\n`;
   }
 
   async function noUpdateStatus() {
@@ -1380,56 +1385,98 @@ describe("cli", () => {
     );
   });
 
-  it("documents extended review syntax in criticmarkup help", async () => {
+  it("describes the canonical review format in criticmarkup help", async () => {
     const test = createTestDependencies();
 
     const exitCode = await runCli(["help", "criticmarkup"], test.deps);
+    const text = test.logs.join("\n");
 
     expect(exitCode).toBe(0);
-    expect(test.logs).toContain("When adding new review feedback:");
     expect(test.logs).toContain(
-      "  Prefer compact references like {>>Comment<<}{#c1} with metadata in final YAML endmatter.",
+      "  A comment is an anchor in the prose plus an entry in the review block at the end of the file.",
     );
     expect(test.logs).toContain(
-      "  Use `c1`, `c2`, etc. for comment ids and `s1`, `s2`, etc. for suggested-change ids.",
-    );
-    expect(test.logs).toContain("Suggested changes with ids:");
-    expect(test.logs).toContain("  Add {++one concrete example++}{#s1}.");
-    expect(test.logs).toContain(
-      "  Replace {~~vague phrasing~>specific wording~~}{#s2}.",
-    );
-    expect(test.logs).toContain("Reply to an existing comment:");
-    expect(test.logs).toContain(
-      "  Existing inline attribute metadata is still accepted for compatibility.",
+      "  Comment text never sits in the prose. The prose keeps only the anchor: {==the highlighted words==}{#c1}.",
     );
     expect(test.logs).toContain(
-      "  Comment ids are document-local and usually look like `c1`, `c2`, `c3`.",
+      "  Replies live only in the review block, as entries with `re: <parent id>`. Never write a reply in the prose.",
     );
-    expect(test.logs).toContain(
-      "  Treat CriticMarkup inside fenced code blocks as literal example text.",
-    );
+    expect(text).toContain("A file has one review block");
+    expect(text).toContain("<br>");
+    expect(text).toContain("`a1`, `a2` for every entry an agent writes");
+    expect(text).toContain("opening fence line");
+    expect(text).toContain("`lines: [start, end]`");
+    expect(text).toContain("`quote`");
+    expect(text).toContain("`scope: document`");
+    expect(test.logs).toContain("Older forms (read, never write):");
+    expect(text).toContain("{>>text<<}{#c1}");
+    expect(text).toContain('{id="c1" by="user" at="..."}');
+    expect(text).toContain("{@id:c1; by:AI; at:...@}");
+    expect(text).not.toContain("Prefer compact references like {>>Comment<<}");
     expect(test.logs).toContain(
       "  https://roughdraft.md/spec/roughdraft-flavored-markdown.md",
     );
   });
 
-  it("prints copyable criticmarkup suggestion examples with required YAML metadata", async () => {
+  it.each([
+    {
+      start: "Comment with a reply:",
+      stop: "Comment on a code block:",
+      summary: { roots: 1, documentComments: 0, replies: 1, suggestions: 0 },
+    },
+    {
+      start: "Comment on a code block:",
+      stop: "Document-level comments:",
+      summary: { roots: 1, documentComments: 0, replies: 0, suggestions: 0 },
+    },
+    {
+      start: "Document-level comments:",
+      stop: "Suggested changes:",
+      summary: { roots: 0, documentComments: 2, replies: 0, suggestions: 0 },
+    },
+    {
+      start: "Suggested changes:",
+      stop: "Older forms (read, never write):",
+      summary: { roots: 0, documentComments: 0, replies: 0, suggestions: 2 },
+    },
+  ])("prints a copyable '$start' example that passes doctor with no diagnostics", async ({
+    start,
+    stop,
+    summary,
+  }) => {
     const test = createTestDependencies();
 
     const exitCode = await runCli(["help", "criticmarkup"], test.deps);
-    const example = extractHelpExample(
-      test.logs,
-      "Suggested changes with ids:",
-      "Reply to an existing comment:",
-    );
+    const example = extractHelpExample(test.logs, start, stop);
     const validation = validateRoughdraftMarkdown(example);
 
     expect(exitCode).toBe(0);
-    expect(example).toContain("suggestions:");
-    expect(example).toContain("  s1:");
-    expect(example).toContain("  s2:");
     expect(validation.diagnostics).toEqual([]);
-    expect(validation.summary.suggestions).toBe(2);
+    expect(validation.summary).toMatchObject({
+      ...summary,
+      endmatter: "recognized",
+    });
+  });
+
+  it("prints a code block example whose lines and quote match the block", async () => {
+    const test = createTestDependencies();
+
+    await runCli(["help", "criticmarkup"], test.deps);
+    const example = extractHelpExample(
+      test.logs,
+      "Comment on a code block:",
+      "Document-level comments:",
+    );
+    const index = extractRoughdraftReviewIndex(example);
+
+    expect(index.items).toEqual([
+      expect.objectContaining({
+        id: "c1",
+        scope: "code",
+        lines: [1, 1],
+        quote: "const port = 3000;",
+      }),
+    ]);
   });
 
   it("points general help to agent setup", async () => {
@@ -1462,6 +1509,25 @@ describe("cli", () => {
     expect(test.logs).toContain(
       "This command only prints setup text. It does not edit agent instruction files.",
     );
+  });
+
+  it("describes the review format in the agent setup text", async () => {
+    const test = createTestDependencies();
+
+    const exitCode = await runCli(["help", "agent"], test.deps);
+    const text = test.logs.join(" ");
+
+    expect(exitCode).toBe(0);
+    expect(text).toContain("Comment text never sits in the prose.");
+    expect(text).toContain("{==highlighted words==}{#c1}");
+    expect(text).toContain("opening fence line");
+    expect(text).toContain("`lines` and `quote`");
+    expect(text).toContain("`scope: document`");
+    expect(text).toContain("Replies live only in the review block");
+    expect(text).toContain("`a1`, `a2`");
+    expect(text).toContain("<br>");
+    expect(text).toContain("roughdraft doctor <file>");
+    expect(text).toContain("roughdraft help criticmarkup");
   });
 
   it("keeps CLAUDE.md as a short compatibility shim to AGENTS.md", () => {
@@ -1593,9 +1659,22 @@ describe("cli", () => {
   it("validates a conforming markdown file from doctor path", async () => {
     const test = createTestDependencies();
     const documentPath = path.join(projectDir, "draft.md");
+    // Batch 3a: an inline comment body is the legacy form and now carries a
+    // `legacy-inline-body` warning, so a conforming file uses the current
+    // format (anchor in the text, comment text in the review block).
     fs.writeFileSync(
       documentPath,
-      'Please revisit {==this sentence==}{>>Needs a source.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.\n',
+      [
+        "Please revisit {==this sentence==}{#c1}.",
+        "",
+        "---",
+        "comments:",
+        "  c1:",
+        '    body: "Needs a source."',
+        "    by: user",
+        '    at: "2026-04-28T12:00:00.000Z"',
+        "",
+      ].join("\n"),
     );
 
     const exitCode = await runCli(["doctor", documentPath], test.deps);
@@ -1680,6 +1759,226 @@ describe("cli", () => {
     expect(test.errors).toContain(
       `roughdraft: Roughdraft doctor can only validate .md files: ${documentPath}`,
     );
+  });
+
+  describe("doctor <file> counts and breakdown", () => {
+    const fixturesDir = path.join(serverRoot, "docs", "spec", "fixtures");
+
+    function copyFixture(name: string): string {
+      const target = path.join(projectDir, name);
+      fs.copyFileSync(path.join(fixturesDir, name), target);
+      return target;
+    }
+
+    /** A final `---` section that looks like a review block, in a file with no review markup. */
+    function writeIgnoredBlockFile(): string {
+      const target = path.join(projectDir, "ignored.md");
+      fs.writeFileSync(
+        target,
+        [
+          "# Notes",
+          "",
+          "Plain prose, no review markup.",
+          "",
+          "---",
+          "comments:",
+          "  c1:",
+          '    by: "user"',
+          "",
+        ].join("\n"),
+      );
+      return target;
+    }
+
+    it("prints the count line and the breakdown when warnings are present", async () => {
+      const test = createTestDependencies();
+      const documentPath = copyFixture("legacy-at-block.md");
+
+      const exitCode = await runCli(["doctor", documentPath], test.deps);
+
+      expect(exitCode).toBe(0);
+      expect(test.logs).toContain("Status: passed");
+      expect(test.logs).toContain("Warnings:");
+      expect(test.logs).toContain("Found 1 comment(s) and 0 suggestion(s).");
+      expect(test.logs).toContain(
+        "Breakdown: roots 1, documentComments 0, replies 0, suggestions 0, endmatter absent",
+      );
+    });
+
+    it("prints the breakdown for a canonical file with document comments and replies", async () => {
+      const test = createTestDependencies();
+      const documentPath = copyFixture("canonical-document-comments.md");
+
+      const exitCode = await runCli(["doctor", documentPath], test.deps);
+
+      expect(exitCode).toBe(0);
+      expect(test.logs).toContain("Found 4 comment(s) and 0 suggestion(s).");
+      expect(test.logs).toContain(
+        "Breakdown: roots 1, documentComments 2, replies 1, suggestions 0, endmatter recognized",
+      );
+      expect(test.logs).not.toContain("Warnings:");
+    });
+
+    it("prints each diagnostic with its line and column, plus the counts, for an invalid file", async () => {
+      const test = createTestDependencies();
+      const documentPath = copyFixture("probe-R13-two-endmatter-blocks.md");
+
+      const exitCode = await runCli(["doctor", documentPath], test.deps);
+
+      expect(exitCode).toBe(1);
+      expect(test.logs).toContain("Status: failed");
+      expect(test.logs).toContain("Errors:");
+      expect(test.logs.some((line) => /^ {2}\d+:\d+ {2}\S/.test(line))).toBe(
+        true,
+      );
+      expect(test.logs).toContain(
+        "Breakdown: roots 1, documentComments 0, replies 0, suggestions 0, endmatter invalid",
+      );
+    });
+
+    it("fails on a warning with --strict (exit 1) and passes the same file without it", async () => {
+      const documentPath = copyFixture("legacy-at-block.md");
+
+      const lenient = createTestDependencies();
+      expect(await runCli(["doctor", documentPath], lenient.deps)).toBe(0);
+
+      const strict = createTestDependencies();
+      const exitCode = await runCli(
+        ["doctor", documentPath, "--strict"],
+        strict.deps,
+      );
+
+      expect(exitCode).toBe(1);
+      expect(strict.logs).toContain("Status: failed (--strict: 2 warning(s))");
+      expect(strict.logs).toContain("Warnings:");
+      expect(strict.logs).toContain("Found 1 comment(s) and 0 suggestion(s).");
+    });
+
+    it("passes a clean canonical file with --strict", async () => {
+      const test = createTestDependencies();
+      const documentPath = copyFixture("canonical-code-block.md");
+
+      const exitCode = await runCli(
+        ["doctor", documentPath, "--strict", "--json"],
+        test.deps,
+      );
+      const payload = parseOnlyJsonLog<Record<string, unknown>>(test.logs);
+
+      expect(exitCode).toBe(0);
+      expect(payload).toMatchObject({ ok: true, status: "ok", strict: true });
+    });
+
+    it("reports a strict warning failure in the JSON envelope", async () => {
+      const test = createTestDependencies();
+      const documentPath = copyFixture("legacy-at-block.md");
+
+      const exitCode = await runCli(
+        ["doctor", documentPath, "--strict", "--json"],
+        test.deps,
+      );
+      const payload = parseOnlyJsonLog<Record<string, unknown>>(test.logs);
+
+      expect(exitCode).toBe(1);
+      expect(payload).toMatchObject({
+        ok: false,
+        status: "error",
+        exitCode: 1,
+        strict: true,
+        errors: [],
+      });
+      expect(payload.warnings).toHaveLength(2);
+    });
+
+    it("rejects --strict without a file as a usage error", async () => {
+      const test = createTestDependencies();
+
+      const exitCode = await runCli(["doctor", "--strict"], test.deps);
+
+      expect(exitCode).toBe(2);
+      expect(test.errors.join("\n")).toContain("--strict");
+    });
+
+    it.each([
+      {
+        label: "canonical",
+        file: "canonical-document-comments.md",
+        exitCode: 0,
+        summary: {
+          comments: 4,
+          roots: 1,
+          documentComments: 2,
+          replies: 1,
+          suggestions: 0,
+          endmatter: "recognized",
+        },
+      },
+      {
+        label: "legacy",
+        file: "probe-R14-doclevel.md",
+        exitCode: 0,
+        summary: {
+          comments: 2,
+          roots: 1,
+          documentComments: 1,
+          replies: 0,
+          suggestions: 0,
+          endmatter: "recognized",
+        },
+      },
+      {
+        label: "ignored",
+        file: null,
+        exitCode: 0,
+        summary: {
+          comments: 0,
+          roots: 0,
+          documentComments: 0,
+          replies: 0,
+          suggestions: 0,
+          endmatter: "ignored",
+        },
+      },
+      {
+        label: "invalid",
+        file: "probe-R02-duplicate-endmatter-key.md",
+        exitCode: 1,
+        summary: {
+          comments: 1,
+          roots: 1,
+          documentComments: 0,
+          replies: 0,
+          suggestions: 0,
+          endmatter: "invalid",
+        },
+      },
+    ])("emits the breakdown and endmatter status in JSON for a $label file", async ({
+      file,
+      exitCode: expectedExit,
+      summary,
+    }) => {
+      const test = createTestDependencies();
+      const documentPath = file ? copyFixture(file) : writeIgnoredBlockFile();
+
+      const exitCode = await runCli(
+        ["doctor", documentPath, "--json"],
+        test.deps,
+      );
+      const payload = parseOnlyJsonLog<Record<string, unknown>>(test.logs);
+
+      expect(exitCode).toBe(expectedExit);
+      expect(payload).toMatchObject({
+        kind: "markdown",
+        path: documentPath,
+        ok: expectedExit === 0,
+        exitCode: expectedExit,
+        strict: false,
+        endmatter: summary.endmatter,
+        summary,
+      });
+      expect(summary.comments).toBe(
+        summary.roots + summary.documentComments + summary.replies,
+      );
+    });
   });
 
   it("starts a new server when the preferred port belongs to another checkout", async () => {

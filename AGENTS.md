@@ -214,27 +214,25 @@ Useful commands:
 
 ## CriticMarkup
 
-Use CriticMarkup when reading or writing inline review feedback in markdown:
+Review markup in this fork keeps comment text out of the prose. The prose carries only anchors; every comment body, reply and status lives in one YAML block at the end of the file.
 
-- Comment: `{>>comment<<}`
-- Insertion: `{++new text++}`
-- Deletion: `{--old text--}`
-- Substitution: `{~~old~>new~~}`
-- Highlight: `{==text==}`
-
-When adding new review feedback, prefer compact inline references plus final YAML endmatter:
+- Highlight with an id: `{==selected text==}{#c1}`
+- Insertion, deletion, substitution (suggestions stay inline): `{++new text++}{#s1}`, `{--old text--}{#s1}`, `{~~old~>new~~}{#s1}`
+- A comment on a code block puts the id on the fence line: ```` ```ts {#c2} ```` and the entry records `lines` and `quote`
+- A comment on the whole document is an entry with a body and no anchor
+- Replies are entries with `re`; agent-written entries use `aN` ids; a line break inside a body is `<br>`
 
 ```markdown
-{==selected text==}{>>Comment text<<}{#c1}
-{++new text++}{#s1}
+Please revisit {==this sentence==}{#c1}.
 
 ---
 comments:
   c1:
-    by: AI
+    body: "Needs a source."
+    by: user
     at: "2026-04-28T12:00:00.000Z"
-  c2:
-    body: I can make that edit.
+  a1:
+    body: "Added one from the intro."
     by: AI
     at: "2026-04-28T12:05:00.000Z"
     re: c1
@@ -244,4 +242,4 @@ suggestions:
     at: "2026-04-28T12:10:00.000Z"
 ```
 
-Older inline attribute blocks such as `{id="c1" by="AI" at="2026-04-28T12:00:00.000Z"}` may appear in existing documents. Preserve them unless you are intentionally rewriting that review item.
+Never type review markup or the YAML block by hand. Use the CLI (`roughdraft reply`, `resolve`, `accept`, `reject`, `note`, or `round` and `apply`) or the MCP tools; they place and validate everything. Older files may carry inline comment bodies, inline attribute blocks such as `{id="c1" by="AI" at="..."}`, or legacy `{@...@}` blocks. The fork reads all of them and never writes them; `roughdraft doctor --fix <file>` converts a file after a dry run. Run `roughdraft doctor --strict <file>` before handing a document back.

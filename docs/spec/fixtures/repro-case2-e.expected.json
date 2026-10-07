@@ -1,0 +1,34 @@
+{
+  "status": "absent",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body"],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Split these checks by owner; ops has been two people since May.",
+      "status": null,
+      "anchors": [
+        "The creator confirms the caption with ops before scheduling."
+      ]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reconciled both sections with the timeline doc and moved the date to June.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "status": "absent",
+  "ok": true,
+  "diagnostics": ["warning legacy-inline-body", "warning replicated-comment"],
+  "summary": {
+    "comments": 1,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 0,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "The handoff between these two sentences is abrupt.",
+      "status": null,
+      "anchors": [
+        "a closing clause that runs on.",
+        "Second paragraph starts with a lead phrase"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": [],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Split these checks by owner; ops has been two people since May.",
+      "status": null,
+      "anchors": [
+        "Pre-flight",
+        "The creator confirms the caption with ops before scheduling.",
+        "Caption matches the approved copy deck"
+      ]
+    },
+    {
+      "id": "a1",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Split into creator and ops checks.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

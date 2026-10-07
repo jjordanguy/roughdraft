@@ -1,0 +1,50 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": [],
+  "summary": {
+    "comments": 4,
+    "roots": 1,
+    "documentComments": 2,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Needs a source.",
+      "status": "resolved",
+      "anchors": ["this claim"]
+    },
+    {
+      "id": "c2",
+      "kind": "comment",
+      "scope": "document",
+      "parent": null,
+      "text": "Overall this reads well.\n\nTwo things before Friday:\n- shorten the intro\n- add the budget table",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "a1",
+      "kind": "reply",
+      "scope": "document",
+      "parent": "c2",
+      "text": "Shortened the intro and added the table.",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "a2",
+      "kind": "comment",
+      "scope": "document",
+      "parent": null,
+      "text": "Round 1 done: 2 comments answered.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

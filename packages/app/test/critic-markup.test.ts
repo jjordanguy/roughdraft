@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
+import { describe, expect, it } from "vitest";
 import {
   createCriticChange,
   createNextChangeId,
@@ -413,17 +413,22 @@ describe("CriticMarkup comments", () => {
     const { doc, comments } = criticMarkdownToEditorState(input);
     const output = editorStateToCriticMarkdown(doc, comments);
 
+    // rfm reads `c3` as a reply to `s1` (its entry has `re: s1`) whose text is
+    // the inline one; the browser follows the model, so the reply moves to
+    // the review block with that text.
     expect(comments.get("c3")).toMatchObject({
       id: "c3",
       content:
         "Consider whether this belongs in the executive summary instead.",
-      parentCommentId: null,
+      parentCommentId: "s1",
     });
+    expect(output).toContain("This paragraph has an unanchored note.\n");
+    expect(output).not.toContain("{>>Consider");
     expect(output).toContain(
-      "This paragraph has an unanchored note.{>>Consider whether this belongs in the executive summary instead.<<}{#c3}",
+      "body: Consider whether this belongs in the executive summary instead.",
     );
+    expect(output).toContain("re: s1");
     expect(output).not.toContain("body: reply to suggestion");
-    expect(output).not.toContain("re: s1");
     expect(createNextCommentId(comments.values())).toBe("c4");
   });
 
@@ -586,7 +591,7 @@ Use CriticMarkup for inline review feedback in markdown.`,
     expect(editorStateToCriticMarkdown(doc, new Map())).toBe(input);
   });
 
-  it("creates a comment anchor when a selection is inside a fenced code block", () => {
+  it("does not put a comment mark inside a fenced code block", () => {
     const input = `\`\`\`ts
 const command = "roughdraft open";
 \`\`\`
@@ -607,57 +612,18 @@ const command = "roughdraft open";
       const end = start + "roughdraft open".length;
 
       editor.commands.setTextSelection({ from: start + 1, to: end + 1 });
-      const added = editor.commands.setCommentRef({ commentIds: ["c1"] });
+      editor.commands.setCommentRef({ commentIds: ["c1"] });
 
-      expect(added).toBe(true);
-      expect(editor.getJSON().content?.[0]).toMatchObject({
-        type: "codeBlock",
-        attrs: { language: "ts" },
-        content: [
-          {
-            type: "text",
-            text: 'const command = "',
-          },
-          {
-            type: "text",
-            text: "roughdraft open",
-            marks: [
-              {
-                type: "commentRef",
-                attrs: { commentIds: ["c1"] },
-              },
-            ],
-          },
-          {
-            type: "text",
-            text: '";',
-          },
-        ],
-      });
-      expect(
-        editorStateToCriticMarkdown(
-          editor.getJSON(),
-          new Map([
-            [
-              "c1",
-              {
-                id: "c1",
-                content: "test",
-                createdAt: "2026-04-25T22:14:08.827Z",
-              },
-            ],
-          ]),
-        ),
-      ).toBe(`\`\`\`ts
-const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-25T22:14:08.827Z"}";
-\`\`\`
-`);
+      expect(JSON.stringify(editor.getJSON())).not.toContain("commentRef");
+      expect(editorStateToCriticMarkdown(editor.getJSON(), new Map())).toBe(
+        input,
+      );
     } finally {
       editor.destroy();
     }
   });
 
-  it("round-trips comment anchors inside fenced code blocks", () => {
+  it("keeps review markup inside fenced code blocks as literal code", () => {
     const input = `\`\`\`ts
 const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-25T22:14:08.827Z"}";
 \`\`\`
@@ -671,28 +637,11 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
       content: [
         {
           type: "text",
-          text: 'const command = "',
-        },
-        {
-          type: "text",
-          text: "roughdraft open",
-          marks: [
-            {
-              type: "commentRef",
-              attrs: { commentIds: ["c1"] },
-            },
-          ],
-        },
-        {
-          type: "text",
-          text: '";',
+          text: 'const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-25T22:14:08.827Z"}";',
         },
       ],
     });
-    expect(comments.get("c1")).toMatchObject({
-      id: "c1",
-      content: "test",
-    });
+    expect(comments.size).toBe(0);
     expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
@@ -879,7 +828,7 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
     expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
-  it("round-trips a comment whose parent points to a suggestion id", () => {
+  it("keeps a reply to a suggestion off the marks and writes it after the suggestion", () => {
     const input =
       '{==New wording==}{>>Why this wording?<<}{id="c1" by="user" at="2024-01-15T10:31:00.000Z" re="s1"} follows {++new text++}{id="s1" by="AI" at="2024-01-15T10:30:00.000Z"}.\n';
 
@@ -888,7 +837,10 @@ const command = "{==roughdraft open==}{>>test<<}{id="c1" by="user" at="2026-04-2
     expect(comments.get("c1")).toMatchObject({
       parentCommentId: "s1",
     });
-    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+    expect(JSON.stringify(doc)).not.toContain('"c1"');
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(
+      'New wording follows {++new text++}{id="s1" by="AI" at="2024-01-15T10:30:00.000Z"}{>>Why this wording?<<}{id="c1" by="user" at="2024-01-15T10:31:00.000Z" re="s1"}.\n',
+    );
   });
 
   it("round-trips a comment attached directly to a suggestion", () => {

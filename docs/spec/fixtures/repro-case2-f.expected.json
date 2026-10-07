@@ -1,0 +1,42 @@
+{
+  "status": "absent",
+  "ok": true,
+  "diagnostics": [
+    "warning legacy-inline-body",
+    "warning replicated-comment",
+    "warning replicated-comment"
+  ],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Split these checks by owner; ops has been two people since May.",
+      "status": null,
+      "anchors": [
+        "Pre-flight",
+        "The creator confirms the caption with ops before scheduling.",
+        "Caption matches the approved copy deck",
+        "Tracking link is the campaign short link",
+        "Pin window is agreed with the brand"
+      ]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reconciled both sections with the timeline doc and moved the date to June.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "status": "absent",
+  "ok": false,
+  "diagnostics": [
+    "error inline-comment-blank-line",
+    "warning legacy-inline-body"
+  ],
+  "summary": {
+    "comments": 2,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 1,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "First point about scope.\n\nSecond point about timing.",
+      "status": null,
+      "anchors": ["two week pilot with three customers"]
+    },
+    {
+      "id": "c2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "Reconciled both sections with the timeline doc and moved the date to June.",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

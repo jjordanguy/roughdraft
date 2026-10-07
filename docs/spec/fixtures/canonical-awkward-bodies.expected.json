@@ -1,0 +1,50 @@
+{
+  "status": "recognized",
+  "ok": true,
+  "diagnostics": [],
+  "summary": {
+    "comments": 4,
+    "roots": 1,
+    "documentComments": 0,
+    "replies": 3,
+    "suggestions": 0
+  },
+  "items": [
+    {
+      "id": "c1",
+      "kind": "comment",
+      "scope": "inline",
+      "parent": null,
+      "text": "Fixed: added the citation. See issue #42 for \"quoted\" text.",
+      "status": null,
+      "anchors": ["this claim"]
+    },
+    {
+      "id": "a1",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "true",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "a2",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "tab\there, it's fine: café",
+      "status": null,
+      "anchors": []
+    },
+    {
+      "id": "a3",
+      "kind": "reply",
+      "scope": "inline",
+      "parent": "c1",
+      "text": "- leading dash\nsecond line ",
+      "status": null,
+      "anchors": []
+    }
+  ]
+}

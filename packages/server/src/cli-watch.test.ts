@@ -888,7 +888,10 @@ describe("cli watch, handoffs and wake routes", () => {
           pendingHandoffs: 1,
         },
       ],
-      routes: [{ harness: "claude-code", kind: "claude-session" }],
+      routes: [
+        { harness: "claude-code", kind: "claude-session" },
+        { harness: "codex", kind: "codex-queue" },
+      ],
     });
   });
 
@@ -993,6 +996,7 @@ describe("cli watch, handoffs and wake routes", () => {
     expect(await runCli(["route", "list", "--json"], list.deps)).toBe(0);
     expect(onlyEnvelope(list.logs).routes).toMatchObject([
       { harness: "claude-code", kind: "claude-session" },
+      { harness: "codex", kind: "codex-queue" },
       { harness: "test-harness", verifiedBy: "roughdraft-cli route test" },
     ]);
 
@@ -1029,6 +1033,237 @@ describe("cli watch, handoffs and wake routes", () => {
       await runCli(["route", "remove", "broken", "--json"], removed.deps),
     ).toBe(0);
     expect(onlyEnvelope(removed.logs)).toMatchObject({ removed: true });
+  });
+
+  it("a url route sends its header and body template, and every list shows header names only", async () => {
+    const received: { authorization: unknown; raw: string }[] = [];
+    const hook = createHttpServer((req, res) => {
+      let raw = "";
+      req.on("data", (chunk) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        received.push({ authorization: req.headers.authorization, raw });
+        res.writeHead(200).end("{}");
+      });
+    });
+    await new Promise<void>((resolve) =>
+      hook.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const hookUrl = `http://127.0.0.1:${(hook.address() as AddressInfo).port}/hooks/wake`;
+    await startServer();
+
+    try {
+      const add = harness();
+      expect(
+        await runCli(
+          [
+            "route",
+            "add",
+            "openclaw",
+            "--url",
+            hookUrl,
+            "--header",
+            "Authorization: Bearer hooks-secret",
+            "--header=X-Source: roughdraft",
+            "--body",
+            '{"text": {message}, "mode": "now", "agentId": "main"}',
+            "--label",
+            "Mike",
+            "--json",
+          ],
+          add.deps,
+        ),
+      ).toBe(0);
+      expect(onlyEnvelope(add.logs).route).toMatchObject({
+        headers: { Authorization: "<set>", "X-Source": "<set>" },
+        body: '{"text": {message}, "mode": "now", "agentId": "main"}',
+      });
+
+      const tested = harness();
+      expect(
+        await runCli(["route", "test", "openclaw", "--json"], tested.deps),
+      ).toBe(0);
+      expect(received).toEqual([
+        {
+          authorization: "Bearer hooks-secret",
+          raw: '{"text": "Roughdraft wake route test for openclaw.", "mode": "now", "agentId": "main"}',
+        },
+      ]);
+
+      const human = harness();
+      expect(await runCli(["route", "list"], human.deps)).toBe(0);
+      expect(human.logs).toContain(
+        `openclaw (url ${hookUrl}, headers Authorization, X-Source, body template), verified ${human.logs.join("\n").match(/body template\), verified (.+)/)?.[1]}`,
+      );
+      const listJson = harness();
+      expect(await runCli(["route", "list", "--json"], listJson.deps)).toBe(0);
+      const logJson = harness();
+      expect(await runCli(["log", "--json"], logJson.deps)).toBe(0);
+      for (const output of [
+        human.logs,
+        listJson.logs,
+        logJson.logs,
+        add.logs,
+      ]) {
+        expect(output.join("\n")).not.toContain("hooks-secret");
+      }
+      expect(
+        onlyEnvelope(listJson.logs).routes.find(
+          (route: Json) => route.harness === "openclaw",
+        ).headers,
+      ).toEqual({ Authorization: "<set>", "X-Source": "<set>" });
+
+      // The token is on disk only, in a file only this user can read.
+      const routesFile = path.join(stateDir, "wake-routes.json");
+      expect(fs.statSync(routesFile).mode & 0o777).toBe(0o600);
+      expect(fs.readFileSync(routesFile, "utf8")).toContain(
+        "Bearer hooks-secret",
+      );
+
+      const badBody = harness();
+      expect(
+        await runCli(
+          [
+            "route",
+            "add",
+            "openclaw",
+            "--url",
+            hookUrl,
+            "--body",
+            '{"text": "{message}"}',
+          ],
+          badBody.deps,
+        ),
+      ).toBe(2);
+      expect(badBody.errors[0]).toContain("body is not JSON");
+
+      const headerWithoutUrl = harness();
+      expect(
+        await runCli(
+          ["route", "add", "x", "--command", "true", "--header", "A: b"],
+          headerWithoutUrl.deps,
+        ),
+      ).toBe(2);
+    } finally {
+      await new Promise<void>((resolve) => hook.close(() => resolve()));
+    }
+  });
+
+  it("inside Codex, open registers the session with its thread name and Done is queued for it", async () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "rd-codex-"));
+    fs.writeFileSync(
+      path.join(codexHome, "session_index.jsonl"),
+      `${JSON.stringify({ id: "thread-1", thread_name: "Draft the launch post", updated_at: "2026-10-06T10:00:00Z" })}\n`,
+    );
+    const codexBin = path.join(codexHome, "codex");
+    const calls = path.join(codexHome, "calls");
+    fs.writeFileSync(
+      codexBin,
+      `#!/bin/sh\nprintf '%s\\0' "$@" >> '${calls}'\nprintf '\\n' >> '${calls}'\n`,
+      { mode: 0o755 },
+    );
+    const readCalls = () =>
+      fs.existsSync(calls)
+        ? fs
+            .readFileSync(calls, "utf8")
+            .split("\0\n")
+            .filter(Boolean)
+            .map((call) => call.split("\0"))
+        : [];
+    const server = await startServer({ codexBin });
+    const inCodex = (extra: NodeJS.ProcessEnv = {}) =>
+      harness({
+        env: {
+          PATH: process.env.PATH,
+          HOME: tempDir,
+          ROUGHDRAFT_STATE_DIR: stateDir,
+          ROUGHDRAFT_PORT: String(unusedPort),
+          ROUGHDRAFT_DEV_FRONTEND_STATE_FILE: path.join(tempDir, "dev.json"),
+          CODEX_THREAD_ID: "thread-1",
+          CODEX_HOME: codexHome,
+          ...extra,
+        },
+      });
+
+    try {
+      const tested = inCodex();
+      expect(
+        await runCli(["route", "test", "codex", "--json"], tested.deps),
+      ).toBe(0);
+      expect(readCalls()).toEqual([
+        [
+          "queue",
+          "--thread",
+          "thread-1",
+          "--message",
+          "Roughdraft wake route test for codex. It reached this session, so a Done will too. Nothing to do.",
+        ],
+      ]);
+
+      // Claude Code wins when a shell has both.
+      const both = inCodex({ CLAUDE_CODE_SESSION_ID: "conv-9" });
+      expect(
+        await runCli(
+          ["open", documentPath, "--no-watch", "--no-open", "--json"],
+          both.deps,
+        ),
+      ).toBe(0);
+      expect(onlyEnvelope(both.logs).session).toMatchObject({
+        harness: "claude-code",
+        sessionId: "conv-9",
+      });
+
+      const opened = inCodex();
+      expect(
+        await runCli(
+          ["open", documentPath, "--no-watch", "--no-open", "--json"],
+          opened.deps,
+        ),
+      ).toBe(0);
+      expect(onlyEnvelope(opened.logs).session).toMatchObject({
+        harness: "codex",
+        label: "Draft the launch post",
+        sessionId: "thread-1",
+        routeId: "codex",
+      });
+
+      await postDone(server);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(readCalls().at(-1)).toEqual([
+        "queue",
+        "--thread",
+        "thread-1",
+        "--message",
+        `I'm done reviewing plan.md. Please check my comments. (0 comments, 0 suggestions)\n\nFile: ${documentPath}\nLink: http://localhost:${server.port}/?path=${encodeURIComponent(documentPath)}\nNext: roughdraft round '${documentPath}'`,
+      ]);
+      const log = inCodex();
+      expect(await runCli(["log", "--json"], log.deps)).toBe(0);
+      expect(onlyEnvelope(log.logs)).toMatchObject({
+        documents: [
+          {
+            session: { harness: "codex", label: "Draft the launch post" },
+            latestHandoff: { wake: { routeId: "codex", state: "sent" } },
+          },
+        ],
+      });
+
+      // Explicit form: route add <harness> --codex-queue.
+      const add = inCodex();
+      expect(
+        await runCli(
+          ["route", "add", "codex-mac", "--codex-queue", "--json"],
+          add.deps,
+        ),
+      ).toBe(0);
+      expect(onlyEnvelope(add.logs).route).toMatchObject({
+        harness: "codex-mac",
+        kind: "codex-queue",
+      });
+    } finally {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+      await server.close();
+    }
   });
 
   // --- Token ------------------------------------------------------------------
@@ -1129,7 +1364,10 @@ describe("cli watch, handoffs and wake routes", () => {
             latestHandoff: { wake: { routeId: "claude-code", state: "sent" } },
           },
         ],
-        routes: [{ harness: "claude-code", verifiedAt: expect.any(String) }],
+        routes: [
+          { harness: "claude-code", verifiedAt: expect.any(String) },
+          { harness: "codex", verifiedAt: null },
+        ],
       });
     } finally {
       await new Promise<void>((resolve) => inbox.close(() => resolve()));

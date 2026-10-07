@@ -34,6 +34,8 @@ roughdraft restart
 
 Close Roughdraft windows that were open on the old server and open the documents again with their links; the links do not change.
 
+After installing, run `roughdraft route test claude-code` from inside a Claude Code session (and `roughdraft route test codex` from inside a Codex session) to confirm Done reaches the session.
+
 ## On the VPS
 
 Copy the tarball to the VPS (for example with `scp`), then run the same stop, install, restart sequence there. The Tailscale link keeps its address; only the server behind it changes.

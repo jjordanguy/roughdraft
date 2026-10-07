@@ -8,6 +8,7 @@ import {
   validateRoughdraftMarkdown,
 } from "@roughdraft/rfm";
 import { currentClaudeSessionId } from "./claude-session.js";
+import { currentCodexSessionId } from "./codex-session.js";
 import {
   createCliDependencies,
   findReusableServer,
@@ -45,6 +46,10 @@ import {
   type WatchTuning,
   watchReviewEvents,
 } from "./review-watch-client.js";
+import {
+  currentHarnessSession,
+  currentSessionIdForRoute,
+} from "./wake-route-defaults.js";
 
 // Roughdraft's stdio MCP server: one process per agent session. It never
 // starts a Roughdraft server; tools that need one report SERVER_UNREACHABLE.
@@ -418,7 +423,7 @@ export const TOOLS: ToolDefinition[] = [
         harness: {
           type: "string",
           description:
-            "Harness name, for example claude-code or openclaw. It picks the wake route. Default: claude-code when this MCP server runs inside Claude Code.",
+            "Harness name, for example claude-code, codex or openclaw. It picks the wake route. Default: claude-code when this MCP server runs inside Claude Code, else codex when it runs inside Codex.",
         },
         label: {
           type: "string",
@@ -433,7 +438,7 @@ export const TOOLS: ToolDefinition[] = [
         sessionId: {
           type: "string",
           description:
-            "The harness's id for this session, passed to the wake route as {sessionId}. Default: the Claude Code session this MCP server runs inside.",
+            "The harness's id for this session, passed to the wake route as {sessionId}. Default: the Claude Code or Codex session this MCP server runs inside.",
         },
       },
     },
@@ -442,7 +447,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "roughdraft_wake_routes",
     description:
-      "List, add, remove or test the wake route for a harness. A command route runs through the shell with {message}, {file}, {link} and {sessionId} replaced; a url route receives a JSON POST; a claude-session route posts the Done into the Claude Code session that opened the file (claude-code has one built in). Test your harness's route at the start of a session.",
+      "List, add, remove or test the wake route for a harness. A command route runs through the shell with {message}, {file}, {link} and {sessionId} replaced; a url route receives a JSON POST, with optional headers and a body template; a claude-session route posts the Done into the Claude Code session that opened the file, and a codex-queue route queues it for the Codex session that opened the file (claude-code and codex have one built in). List shows header names only. Test your harness's route at the start of a session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -461,14 +466,14 @@ export const TOOLS: ToolDefinition[] = [
         },
         kind: {
           type: "string",
-          enum: ["command", "url", "claude-session"],
+          enum: ["command", "url", "claude-session", "codex-queue"],
           description:
-            "command, url or claude-session. Default: url when url is given, command when command is given, else claude-session.",
+            "command, url, claude-session or codex-queue. Default: url when url is given, command when command is given, codex-queue for harness codex, else claude-session.",
         },
         sessionId: {
           type: "string",
           description:
-            "For test of a claude-session route: the Claude Code session to deliver the test into. Default: the session this MCP server runs inside.",
+            "For test of a claude-session or codex-queue route: the session to deliver the test into. Default: the session this MCP server runs inside.",
         },
         command: {
           type: "string",
@@ -479,6 +484,16 @@ export const TOOLS: ToolDefinition[] = [
           type: "string",
           description:
             "For kind url: the http or https address that receives the JSON POST.",
+        },
+        headers: {
+          type: "object",
+          description:
+            'For kind url: request headers as names to values, for example {"Authorization": "Bearer <token>"}. Stored in wake-routes.json (mode 0600); list shows the names only.',
+        },
+        body: {
+          type: "string",
+          description:
+            'For kind url: a JSON body template. {message}, {file}, {link}, {sessionId}, {event} and {handoffId} become JSON strings, quotes included, so write them bare: {"text": {message}, "mode": "now"}. Without it the fixed Roughdraft body is sent.',
         },
         label: {
           type: "string",
@@ -1328,10 +1343,11 @@ export async function callTool(
 
   if (name === "roughdraft_register_session") {
     const documentPath = requireDocumentPath(args);
-    const claudeSessionId = currentClaudeSessionId(env);
+    const current = currentHarnessSession(env);
     const harness =
       optionalArg(args, "harness") ??
-      (claudeSessionId ? "claude-code" : requireString(args, "harness"));
+      current?.harness ??
+      requireString(args, "harness");
     const label = requireString(args, "label");
     const server = await requireServer(
       env,
@@ -1347,7 +1363,11 @@ export async function callTool(
       link: typeof args.link === "string" ? args.link : null,
       sessionId:
         optionalArg(args, "sessionId") ??
-        (harness === "claude-code" ? claudeSessionId : null),
+        (harness === "claude-code"
+          ? currentClaudeSessionId(env)
+          : harness === "codex"
+            ? currentCodexSessionId(env)
+            : null),
     });
     return { ok: true, session };
   }
@@ -1369,17 +1389,24 @@ export async function callTool(
       const kind =
         args.kind === "url" ||
         args.kind === "command" ||
-        args.kind === "claude-session"
+        args.kind === "claude-session" ||
+        args.kind === "codex-queue"
           ? args.kind
           : typeof args.url === "string"
             ? "url"
             : typeof args.command === "string"
               ? "command"
-              : "claude-session";
+              : harness === "codex"
+                ? "codex-queue"
+                : "claude-session";
       const route = await putWakeRoute(ctx, harness, {
         kind,
         ...(typeof args.command === "string" ? { command: args.command } : {}),
         ...(typeof args.url === "string" ? { url: args.url } : {}),
+        ...(args.headers && typeof args.headers === "object"
+          ? { headers: args.headers as Record<string, string> }
+          : {}),
+        ...(typeof args.body === "string" ? { body: args.body } : {}),
         label: typeof args.label === "string" ? args.label : null,
       });
       return { ok: true, route };
@@ -1387,11 +1414,14 @@ export async function callTool(
     if (action === "remove") {
       return { ok: true, removed: await removeWakeRoute(ctx, harness) };
     }
+    const kind =
+      (await listWakeRoutes(ctx)).find((route) => route.harness === harness)
+        ?.kind ?? null;
     const tested = await testWakeRoute(
       ctx,
       harness,
       "roughdraft-mcp",
-      optionalArg(args, "sessionId") ?? currentClaudeSessionId(env),
+      optionalArg(args, "sessionId") ?? currentSessionIdForRoute(kind, env),
     );
     return { ok: tested.sent, ...tested };
   }

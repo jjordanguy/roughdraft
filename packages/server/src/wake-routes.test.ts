@@ -4,8 +4,10 @@ import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { redactRoute } from "./wake-route-defaults";
 import {
   doneMessage,
+  fillBodyTemplate,
   parseWakeRouteBody,
   runWakeRoute,
   shellQuote,
@@ -110,10 +112,13 @@ describe("wake routes", () => {
       server = null;
     });
 
-    async function listen(
-      status: number,
-    ): Promise<{ url: string; bodies: unknown[] }> {
+    async function listen(status: number): Promise<{
+      url: string;
+      bodies: unknown[];
+      requests: { headers: Record<string, unknown>; raw: string }[];
+    }> {
       const bodies: unknown[] = [];
+      const requests: { headers: Record<string, unknown>; raw: string }[] = [];
       server = createServer((req, res) => {
         let raw = "";
         req.on("data", (chunk) => {
@@ -121,6 +126,7 @@ describe("wake routes", () => {
         });
         req.on("end", () => {
           bodies.push(JSON.parse(raw));
+          requests.push({ headers: req.headers, raw });
           res.writeHead(status).end();
         });
       });
@@ -128,7 +134,7 @@ describe("wake routes", () => {
         server?.listen(0, "127.0.0.1", resolve),
       );
       const { port } = server.address() as AddressInfo;
-      return { url: `http://127.0.0.1:${port}/hook`, bodies };
+      return { url: `http://127.0.0.1:${port}/hook`, bodies, requests };
     }
 
     it("posts the Done body to a url route", async () => {
@@ -149,6 +155,47 @@ describe("wake routes", () => {
           counts: donePayload.counts,
           handoffId: "h-123",
           session: donePayload.session,
+        },
+      ]);
+    });
+
+    it("sends a url route's headers and fills its body template (the OpenClaw wake hook)", async () => {
+      const hook = await listen(200);
+      const parsed = parseWakeRouteBody("openclaw", {
+        kind: "url",
+        url: hook.url,
+        headers: ["Authorization: Bearer hooks-token-1"],
+        body: '{"text": {message}, "mode": "now", "agentId": "main"}',
+        label: "Mike",
+      });
+      if (!("route" in parsed)) throw new Error(parsed.error);
+
+      const done = await runWakeRoute(parsed.route, {
+        ...donePayload,
+        message:
+          'I\'m done reviewing plan.md. Please check my comments. (4 comments, 2 suggestions)\nSay "ship it".',
+      });
+      const tested = await runWakeRoute(parsed.route, testPayload("openclaw"));
+
+      expect(done).toMatchObject({ sent: true, error: null });
+      expect(tested).toMatchObject({ sent: true, error: null });
+      expect(hook.requests[0]?.headers).toMatchObject({
+        authorization: "Bearer hooks-token-1",
+        "content-type": "application/json",
+      });
+      expect(hook.requests[0]?.raw).toBe(
+        '{"text": "I\'m done reviewing plan.md. Please check my comments. (4 comments, 2 suggestions)\\nSay \\"ship it\\".", "mode": "now", "agentId": "main"}',
+      );
+      expect(hook.bodies).toEqual([
+        {
+          text: 'I\'m done reviewing plan.md. Please check my comments. (4 comments, 2 suggestions)\nSay "ship it".',
+          mode: "now",
+          agentId: "main",
+        },
+        {
+          text: "Roughdraft wake route test for openclaw.",
+          mode: "now",
+          agentId: "main",
         },
       ]);
     });
@@ -193,12 +240,13 @@ describe("wake routes", () => {
     fs.writeFileSync(path.join(dir, WAKE_ROUTES_FILE), "[]");
     const fresh = new WakeRouteStore({ stateDir: dir });
 
-    // Nothing stored: only the built-in claude-code route is left.
+    // Nothing stored: only the built-in routes are left.
     expect(fresh.list()).toEqual([
       expect.objectContaining({
         harness: "claude-code",
         kind: "claude-session",
       }),
+      expect.objectContaining({ harness: "codex", kind: "codex-queue" }),
     ]);
     expect(fresh.warnings[0]).toContain("Moved it to");
   });
@@ -354,8 +402,162 @@ describe("wake routes", () => {
         route: route({ kind: "claude-session" }),
       });
       expect(parseWakeRouteBody("x", { kind: "other" })).toEqual({
-        error: 'kind must be "command", "url" or "claude-session"',
+        error:
+          'kind must be "command", "url", "claude-session" or "codex-queue"',
       });
+    });
+  });
+
+  it("fills every template placeholder with a JSON string and leaves other braces alone", () => {
+    expect(
+      JSON.parse(
+        fillBodyTemplate(
+          '{"m": {message}, "f": {file}, "l": {link}, "s": {sessionId}, "e": {event}, "h": {handoffId}, "x": "{other}", "n": {"k": 1}}',
+          donePayload,
+        ),
+      ),
+    ).toEqual({
+      m: donePayload.message,
+      f: "/docs/it's plan.md",
+      l: donePayload.link,
+      s: "s-9",
+      e: "done",
+      h: "h-123",
+      x: "{other}",
+      n: { k: 1 },
+    });
+    // A test has no file, link, handoff or session: each becomes "".
+    expect(
+      JSON.parse(
+        fillBodyTemplate(
+          "[{file}, {link}, {handoffId}, {sessionId}, {event}]",
+          testPayload("openclaw"),
+        ),
+      ),
+    ).toEqual(["", "", "", "", "test"]);
+  });
+
+  it("validates url headers and body templates", () => {
+    const url = "https://hooks.example/wake";
+    expect(
+      parseWakeRouteBody("openclaw", {
+        kind: "url",
+        url,
+        headers: { Authorization: " Bearer x ", "X-Mode": "now" },
+        body: ' {"text": {message}} ',
+      }),
+    ).toEqual({
+      route: route({
+        harness: "openclaw",
+        kind: "url",
+        url,
+        headers: { Authorization: "Bearer x", "X-Mode": "now" },
+        body: '{"text": {message}}',
+      }),
+    });
+    // Without headers or a body the route keeps the fixed body.
+    expect(
+      parseWakeRouteBody("openclaw", { kind: "url", url, body: "" }),
+    ).toEqual({
+      route: route({ harness: "openclaw", kind: "url", url }),
+    });
+
+    const problem = (input: Record<string, unknown>) => {
+      const parsed = parseWakeRouteBody("openclaw", {
+        kind: "url",
+        url,
+        ...input,
+      });
+      return "error" in parsed ? parsed.error : null;
+    };
+    expect(problem({ headers: ["Authorization Bearer x"] })).toBe(
+      'header "Authorization Bearer x" must be written "Name: value"',
+    );
+    expect(problem({ headers: ["Bad Name: x"] })).toContain(
+      'header name "Bad Name" must be a token',
+    );
+    expect(problem({ headers: { "X-Empty": " " } })).toBe(
+      "header X-Empty has no value",
+    );
+    expect(problem({ headers: { "X-Two": "a\nb" } })).toBe(
+      "header X-Two must have a one-line value",
+    );
+    expect(problem({ body: '{"text": "{message}"}' })).toMatch(
+      /^body is not JSON once its placeholders are filled in \(.+\)\. Placeholders become quoted JSON strings, so write them bare/,
+    );
+    expect(problem({ body: "{text: {message}}" })).toContain(
+      "body is not JSON",
+    );
+    expect(
+      parseWakeRouteBody("x", {
+        kind: "command",
+        command: "true",
+        headers: ["A: b"],
+      }),
+    ).toEqual({ error: "headers and body apply only to kind url" });
+  });
+
+  it("redacts header values and keeps the routes file private", () => {
+    const tokenRoute = route({
+      harness: "openclaw",
+      kind: "url",
+      url: "https://hooks.example/wake",
+      headers: { Authorization: "Bearer secret" },
+      body: '{"text": {message}}',
+    });
+    expect(redactRoute(tokenRoute).headers).toEqual({
+      Authorization: "<set>",
+    });
+    expect(tokenRoute.headers?.Authorization).toBe("Bearer secret");
+
+    // A file written before this change (0644) becomes 0600 on the next save.
+    const filePath = path.join(dir, WAKE_ROUTES_FILE);
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({ schemaVersion: 1, routes: {} }),
+      { mode: 0o644 },
+    );
+    fs.chmodSync(filePath, 0o644);
+    const store = new WakeRouteStore({ stateDir: dir });
+    store.put(tokenRoute);
+    expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+    expect(new WakeRouteStore({ stateDir: dir }).get("openclaw")).toEqual(
+      tokenRoute,
+    );
+  });
+
+  it("queues a Done for the Codex session through a codex-queue route", async () => {
+    const bin = path.join(dir, "codex");
+    const argsFile = path.join(dir, "args");
+    fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\0' "$@" > '${argsFile}'\n`, {
+      mode: 0o755,
+    });
+    const codexDone = {
+      ...donePayload,
+      session: { ...donePayload.session, harness: "codex", sessionId: "t-7" },
+    };
+
+    const outcome = await runWakeRoute(
+      route({ harness: "codex", kind: "codex-queue" }),
+      codexDone,
+      { codexBin: bin },
+    );
+
+    expect(outcome).toMatchObject({ sent: true, error: null });
+    expect(fs.readFileSync(argsFile, "utf8").split("\0").slice(0, -1)).toEqual([
+      "queue",
+      "--thread",
+      "t-7",
+      "--message",
+      "I'm done reviewing it's plan.md. Please check my comments.\n\nFile: /docs/it's plan.md\nLink: http://localhost:7373/?path=%2Fdocs%2Fplan.md\nNext: roughdraft round '/docs/it'\\''s plan.md'",
+    ]);
+
+    const store = new WakeRouteStore({ stateDir: dir });
+    expect(store.get("codex")).toMatchObject({ kind: "codex-queue" });
+    expect(
+      parseWakeRouteBody("codex", { kind: "codex-queue", label: "mine" }),
+    ).toEqual({
+      route: route({ harness: "codex", kind: "codex-queue", label: "mine" }),
     });
   });
 

@@ -438,10 +438,22 @@ export function readJsonState<T>(
   };
 }
 
-export function writeJsonAtomic(filePath: string, value: unknown): void {
+/**
+ * Writes JSON through a temp file and a rename. With `mode`, the temp file is
+ * created with those permission bits (and chmodded, in case the umask took
+ * some away), so the file that replaces the old one has them too.
+ */
+export function writeJsonAtomic(
+  filePath: string,
+  value: unknown,
+  options: { mode?: number } = {},
+): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, {
+    ...(options.mode !== undefined ? { mode: options.mode } : {}),
+  });
+  if (options.mode !== undefined) fs.chmodSync(tempPath, options.mode);
   fs.renameSync(tempPath, filePath);
 }
 

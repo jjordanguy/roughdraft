@@ -2,20 +2,33 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import express, { type Request, type Response, type Router } from "express";
 import { wakeClaudeSession } from "./claude-session.js";
+import { wakeCodexSession } from "./codex-session.js";
 import {
   errorMessage,
   type HandoffSummary,
   readJsonState,
   writeJsonAtomic,
 } from "./handoff-log.js";
-import { builtInRoute, withBuiltInRoutes } from "./wake-route-defaults.js";
+import {
+  builtInRoute,
+  redactRoute,
+  withBuiltInRoutes,
+} from "./wake-route-defaults.js";
 
 export interface WakeRoute {
   harness: string;
-  /** command: a shell command; url: a JSON POST; claude-session: a user turn in the Claude Code session that opened the file. */
-  kind: "command" | "url" | "claude-session";
+  /**
+   * command: a shell command; url: a JSON POST; claude-session: a user turn
+   * in the Claude Code session that opened the file; codex-queue: a message
+   * queued for the Codex session that opened the file.
+   */
+  kind: "command" | "url" | "claude-session" | "codex-queue";
   command?: string;
   url?: string;
+  /** For kind url: extra request headers. They can hold a token, so lists show only their names. */
+  headers?: Record<string, string>;
+  /** For kind url: a JSON body template (see `fillBodyTemplate`). Null or absent sends the fixed body. */
+  body?: string | null;
   label: string | null;
   verifiedAt: string | null;
   verifiedBy: string | null;
@@ -44,6 +57,8 @@ export interface RunWakeOptions {
   env?: NodeJS.ProcessEnv;
   /** Where Claude Code keeps its session records (default: CLAUDE_CONFIG_DIR, else ~/.claude). */
   claudeConfigDir?: string;
+  /** The codex executable for codex-queue routes (default: ROUGHDRAFT_CODEX_BIN, else codex on PATH). */
+  codexBin?: string;
 }
 
 interface RoutesFile {
@@ -54,6 +69,8 @@ interface RoutesFile {
 export const WAKE_ROUTES_FILE = "wake-routes.json";
 export const WAKE_TIMEOUT_MS = 10_000;
 const HARNESS_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+/** An HTTP header name: an RFC 9110 token. */
+const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const OUTPUT_TAIL_CHARS = 500;
 
 export function isValidHarness(harness: string): boolean {
@@ -131,7 +148,8 @@ export class WakeRouteStore {
       routes: Object.fromEntries(this.routes),
     };
     try {
-      writeJsonAtomic(this.filePath, file);
+      // A url route's headers can hold a token: only this user may read the file.
+      writeJsonAtomic(this.filePath, file, { mode: 0o600 });
     } catch (error) {
       const message = `Could not write ${this.filePath}: ${errorMessage(error)}`;
       if (!this.warnings.includes(message)) this.warnings.push(message);
@@ -162,6 +180,15 @@ export function parseWakeRouteBody(
     lastError: null,
   };
 
+  const hasHeaders =
+    input.headers !== undefined &&
+    input.headers !== null &&
+    !(Array.isArray(input.headers) && input.headers.length === 0);
+  const hasBody = typeof input.body === "string" && input.body.trim() !== "";
+  if (input.kind !== "url" && (hasHeaders || hasBody)) {
+    return { error: "headers and body apply only to kind url" };
+  }
+
   if (input.kind === "command") {
     const command =
       typeof input.command === "string" ? input.command.trim() : "";
@@ -171,12 +198,137 @@ export function parseWakeRouteBody(
   if (input.kind === "url") {
     const url = typeof input.url === "string" ? input.url.trim() : "";
     if (!isHttpUrl(url)) return { error: "url must be an http or https URL" };
-    return { route: { ...base, kind: "url", url } };
+    const parsedHeaders = hasHeaders
+      ? parseHeaders(input.headers)
+      : { headers: {} };
+    if ("error" in parsedHeaders) return parsedHeaders;
+    const { headers } = parsedHeaders;
+    if (
+      input.body !== undefined &&
+      input.body !== null &&
+      typeof input.body !== "string"
+    ) {
+      return { error: "body must be a string (a JSON template)" };
+    }
+    const body = hasBody ? (input.body as string).trim() : null;
+    if (body !== null) {
+      const problem = bodyTemplateProblem(body);
+      if (problem) return { error: problem };
+    }
+    return {
+      route: {
+        ...base,
+        kind: "url",
+        url,
+        ...(Object.keys(headers).length > 0 ? { headers } : {}),
+        ...(body !== null ? { body } : {}),
+      },
+    };
   }
   if (input.kind === "claude-session") {
     return { route: { ...base, kind: "claude-session" } };
   }
-  return { error: 'kind must be "command", "url" or "claude-session"' };
+  if (input.kind === "codex-queue") {
+    return { route: { ...base, kind: "codex-queue" } };
+  }
+  return {
+    error: 'kind must be "command", "url", "claude-session" or "codex-queue"',
+  };
+}
+
+/**
+ * Headers for a url route, from `Name: value` lines (the CLI's --header) or
+ * an object of names to values (the MCP tool). A name must be a token; a
+ * value must be one line.
+ */
+function parseHeaders(
+  input: unknown,
+): { headers: Record<string, string> } | { error: string } {
+  const pairs: [string, unknown][] = [];
+  if (Array.isArray(input)) {
+    for (const line of input) {
+      if (typeof line !== "string") {
+        return { error: 'each header must be a "Name: value" line' };
+      }
+      const colon = line.indexOf(":");
+      if (colon === -1) {
+        return {
+          error: `header "${line.trim()}" must be written "Name: value"`,
+        };
+      }
+      pairs.push([line.slice(0, colon), line.slice(colon + 1)]);
+    }
+  } else if (typeof input === "object" && input !== null) {
+    pairs.push(...Object.entries(input));
+  } else {
+    return {
+      error:
+        'headers must be "Name: value" lines or an object of names to values',
+    };
+  }
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of pairs) {
+    const name = rawName.trim();
+    if (!HEADER_NAME_PATTERN.test(name)) {
+      return {
+        error: `header name "${name}" must be a token: letters, digits and !#$%&'*+.^_\`|~-, no spaces`,
+      };
+    }
+    if (typeof rawValue !== "string") {
+      return { error: `header ${name} must have a string value` };
+    }
+    const value = rawValue.trim();
+    if (/[\r\n\0]/.test(value)) {
+      return { error: `header ${name} must have a one-line value` };
+    }
+    if (!value) return { error: `header ${name} has no value` };
+    headers[name] = value;
+  }
+  return { headers };
+}
+
+const TEMPLATE_PLACEHOLDER =
+  /\{(message|file|link|sessionId|event|handoffId)\}/g;
+
+/**
+ * Fills a url route's body template: each of {message}, {file}, {link},
+ * {sessionId}, {event} and {handoffId} becomes a JSON string literal, quotes
+ * included, and a missing value becomes "". Nothing else is replaced.
+ */
+export function fillBodyTemplate(
+  template: string,
+  payload: WakePayload,
+): string {
+  const values: Record<string, string> = {
+    message: payload.message,
+    file: payload.documentPath ?? "",
+    link: payload.link ?? "",
+    sessionId: payload.session.sessionId ?? "",
+    event: payload.event,
+    handoffId: payload.handoffId ?? "",
+  };
+  return template.replace(TEMPLATE_PLACEHOLDER, (_match, name: string) =>
+    JSON.stringify(values[name] ?? ""),
+  );
+}
+
+/** Why a body template would not produce JSON, or null when it does. */
+function bodyTemplateProblem(template: string): string | null {
+  const sample: WakePayload = {
+    event: "done",
+    message: "I'm done reviewing plan.md.",
+    documentPath: "/notes/plan.md",
+    link: "http://localhost:7373/?path=%2Fnotes%2Fplan.md",
+    counts: { comments: 1, suggestions: 0, unresolved: 1 },
+    handoffId: "h-1",
+    session: { harness: "sample", label: null, sessionId: "s-1" },
+  };
+  try {
+    JSON.parse(fillBodyTemplate(template, sample));
+    return null;
+  } catch (error) {
+    return `body is not JSON once its placeholders are filled in (${errorMessage(error)}). Placeholders become quoted JSON strings, so write them bare: {"text": {message}}`;
+  }
 }
 
 export function doneMessage(
@@ -209,7 +361,7 @@ export function testPayload(
  */
 export function sessionMessage(payload: WakePayload): string {
   if (payload.event === "test") {
-    return `${payload.message} It reached this session over its messaging socket, so a Done will too. Nothing to do.`;
+    return `${payload.message} It reached this session, so a Done will too. Nothing to do.`;
   }
   const lines = [payload.message];
   if (payload.documentPath) {
@@ -235,23 +387,28 @@ export async function runWakeRoute(
       route.kind === "command"
         ? await runCommand(route.command ?? "", payload, timeoutMs, options.env)
         : route.kind === "url"
-          ? await postUrl(
-              route.url ?? "",
-              payload,
-              timeoutMs,
-              options.fetchImpl,
-            )
-          : await wakeClaudeSession(
-              payload.session.sessionId,
-              sessionMessage(payload),
-              {
-                timeoutMs,
-                ...(options.claudeConfigDir
-                  ? { configDir: options.claudeConfigDir }
-                  : {}),
-                ...(options.env ? { env: options.env } : {}),
-              },
-            );
+          ? await postUrl(route, payload, timeoutMs, options.fetchImpl)
+          : route.kind === "codex-queue"
+            ? await wakeCodexSession(
+                payload.session.sessionId,
+                sessionMessage(payload),
+                {
+                  timeoutMs,
+                  ...(options.codexBin ? { codexBin: options.codexBin } : {}),
+                  ...(options.env ? { env: options.env } : {}),
+                },
+              )
+            : await wakeClaudeSession(
+                payload.session.sessionId,
+                sessionMessage(payload),
+                {
+                  timeoutMs,
+                  ...(options.claudeConfigDir
+                    ? { configDir: options.claudeConfigDir }
+                    : {}),
+                  ...(options.env ? { env: options.env } : {}),
+                },
+              );
     return { sent: error === null, error, durationMs: Date.now() - startedAt };
   } catch (error) {
     return {
@@ -336,18 +493,25 @@ function runCommand(
 }
 
 async function postUrl(
-  url: string,
+  route: WakeRoute,
   payload: WakePayload,
   timeoutMs: number,
   fetchImpl: typeof fetch = fetch,
 ): Promise<string | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // The route's own headers win over the default Content-Type.
+  const headers = new Headers({ "Content-Type": "application/json" });
+  for (const [name, value] of Object.entries(route.headers ?? {})) {
+    headers.set(name, value);
+  }
   try {
-    const response = await fetchImpl(url, {
+    const response = await fetchImpl(route.url ?? "", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(urlBody(payload)),
+      headers,
+      body: route.body
+        ? fillBodyTemplate(route.body, payload)
+        : JSON.stringify(urlBody(payload)),
       signal: controller.signal,
     });
     await response.body?.cancel().catch(() => {});
@@ -432,7 +596,7 @@ export function wakeRouteRouter(deps: {
   };
 
   router.get("/", (_req, res) => {
-    res.json({ routes: store.list() });
+    res.json({ routes: store.list().map(redactRoute) });
   });
 
   router.put("/:harness", (req, res) => {
@@ -442,7 +606,7 @@ export function wakeRouteRouter(deps: {
       res.status(400).json({ error: parsed.error, code: "USAGE" });
       return;
     }
-    res.json({ ok: true, route: store.put(parsed.route) });
+    res.json({ ok: true, route: redactRoute(store.put(parsed.route)) });
   });
 
   router.delete("/:harness", (req, res) => {

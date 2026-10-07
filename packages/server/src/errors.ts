@@ -38,6 +38,7 @@ export type CliErrorCode =
   | "VERSION_CONFLICT"
   | "TAB_DIRTY"
   | "ROUND_NOT_FOUND"
+  | "DOCUMENT_NOT_FOUND"
   | "INTERNAL";
 
 const EXIT_BY_CODE: Record<CliErrorCode, number> = {
@@ -64,6 +65,7 @@ const EXIT_BY_CODE: Record<CliErrorCode, number> = {
   VERSION_CONFLICT: EXIT_INTERNAL,
   TAB_DIRTY: EXIT_TIMEOUT,
   ROUND_NOT_FOUND: EXIT_USAGE,
+  DOCUMENT_NOT_FOUND: EXIT_USAGE,
   INTERNAL: EXIT_INTERNAL,
 };
 

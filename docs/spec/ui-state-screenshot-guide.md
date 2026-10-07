@@ -10,10 +10,10 @@ mkdir -p .context/ui-state-screenshots/$(date +%Y%m%d-%H%M%S)
 Use filenames that sort by product area, viewport, and state:
 
 ```text
-01-home-desktop.png
-01-home-mobile.png
-02-home-install-dialog.png
-03-home-workflow-stage-1.png
+01-open-documents-desktop.png
+01-open-documents-mobile.png
+02-open-documents-earlier.png
+03-document-closed-from-list.png
 04-preview-rich-review-rail.png
 ```
 ## Starting The App
@@ -26,7 +26,7 @@ pnpm --filter @roughdraft/app dev -- --host 127.0.0.1 --port 5173
 Useful URLs:
 
 ```text
-http://127.0.0.1:5173/
+http://127.0.0.1:5173/                               (open documents; needs the API server)
 http://127.0.0.1:5173/roughdraft-flavored-markdown
 http://127.0.0.1:5173/preview
 http://127.0.0.1:5173/preview?editor=code
@@ -96,20 +96,17 @@ suggestions:
 | Area | State | How to reach it | Useful selectors | Notes |
 | --- | --- | --- | --- | --- |
 | App shell | Initial loading | Load any route and capture before backend initialization completes, usually with a route/mock delay | none | Transient; easiest in a mocked route or component harness. |
-| Homepage | Desktop | `/` at desktop viewport | `homepage-workflow-storyboard` | Capture first viewport and a lower scroll position where the storyboard is active. |
-| Homepage | Mobile | `/` at mobile viewport | `homepage-workflow-storyboard`, `homepage-workflow-scene-list` | Sticky visual is hidden until the workflow heading has scrolled past. |
-| Homepage | Install dialog | Click the install CTA | Base UI dialog content | Include the terminal command and close affordance. |
-| Homepage | Workflow stage 1 | Scroll storyboard to first scene | `homepage-workflow-terminal`, `homepage-workflow-scene` | User request visible; agent work and popup are hidden. |
-| Homepage | Workflow stage 2 | Scroll to second scene | `homepage-workflow-agent-work` | Agent work becomes visible. |
-| Homepage | Workflow stage 3 | Scroll to third scene | `homepage-workflow-terminal-command`, `homepage-workflow-popup` | Roughdraft command and document popup are visible. |
-| Homepage | Workflow stage 4 | Scroll to fourth scene | `homepage-workflow-review-rail`, `homepage-workflow-comment-highlight` | User feedback appears in the document/review rail. |
-| Homepage | Workflow stage 5 | Scroll to fifth scene | `homepage-workflow-handoff-button` | Done handoff button is visible. |
-| Homepage | Workflow stage 6 | Scroll to final scene | `homepage-workflow-agent-resume` | Agent resume line and incorporated plan are visible; done button is hidden. |
-| Homepage | Update notice | Start app with backend status returning `updateStatus` | update notice component | Best captured with API mocking unless an update is actually available. |
-| RFM guide | Default page | `/roughdraft-flavored-markdown` | `rfm-source-editor` | Capture the source editor plus rendered output. |
-| RFM guide | Plan review example | Click `rfm-format-example-plan-review` | `rfm-format-example-plan-review` | Default example if already selected. |
-| RFM guide | Spec review example | Click `rfm-format-example-spec-review` | `rfm-format-example-spec-review` | Confirms comments/suggestions render in the embedded demo. |
-| RFM guide | Writing edit example | Click `rfm-format-example-writing-edit` | `rfm-format-example-writing-edit` | Useful for prose-focused review states. |
+| Open documents | Desktop | `/` with documents registered under two sessions (`roughdraft open <file> --no-watch --session-label ...`) | `open-documents-page`, `open-documents-count`, `open-documents-group`, `open-documents-harness`, `open-document-row`, `open-document-status` | Header `Open documents` with the `Roughdraft` pill and `Close all finished`; the count `N sessions, M windows`; one bordered group per session (harness tag, session title, `Close session`), rows with the first heading, `file.md · ~/folder`, the state line and Open / Close. Light and dark. |
+| Open documents | Mobile | Same at 375 px wide | `open-documents-page`, `open-document-row` | Rows stack the actions under the text; no sideways scroll. |
+| Open documents | Empty | `/` on a fresh state dir | `open-documents-empty` | `No open documents. Files you open with roughdraft open show up here.` |
+| Open documents | Unsaved text | Type in a document while its saves fail (route the PUT to abort), then open `/` | `open-document-status`, `open-document-close` | State line starts with `unsaved text in a window` (amber dot); Close is disabled. |
+| Open documents | Done waiting and Drop | Post a Done with no agent listening, open `/` | `open-document-status`, `open-document-drop` | `Done waiting since <time>` (amber); Drop turns it into `Done dropped` and the button goes. |
+| Open documents | Earlier today | Close a document from the list, then open `Earlier today` | `open-documents-earlier-trigger`, `open-documents-earlier`, `open-documents-earlier-row`, `open-documents-reopen` | Collapsed by default: `Earlier today: N documents closed`. Rows show `Closed at <time> · <harness> · <session>`, Reopen (the link) and Drop when a Done still waits. |
+| Open documents | Peer link | Start the server with `ROUGHDRAFT_PEER_URL` set | `open-documents-peer-link` | `Open documents on <host>` under the header. |
+| Open documents | Server down | Stop the server with the page open | `open-documents-error` | Amber line `Could not reach the Roughdraft server (...)` with Retry; the last list stays. |
+| Document | Closed from the list (tab) | Open a file in a tab that has navigated before (history longer than one entry), then Close it from `/` | `closed-from-list` | Full-page card `Closed from the open documents list. You can close this tab.` with an `Open documents` link; the window title starts with `Closed · `. A window Roughdraft or the list opened closes itself instead. |
+| Document | File menu: Open documents | Open the file-name menu in the toolbar | `document-file-menu`, `document-file-menu-open-documents` | Below Path, Filename, Markdown and Rich text, after a divider: `Open documents` with `Every open window, by session`. |
+| RFM guide | Default page | `/roughdraft-flavored-markdown` | none | The format reference page. |
 | Preview | Rich text default | `/preview?editor=rich-text` | `page-card-rich-text`, `rich-text-editor` | Uses in-memory preview backend and includes a sample anchored comment. |
 | Preview | Code editor default | `/preview?editor=code` | `page-card-code`, `markdown-code-editor` | Capture line wrapping, code editor chrome, and rail behavior. |
 | Document | Rich/code toggle | Use `document-editor-view-toggle` | `document-editor-view-toggle` | URL changes to `?editor=code` or `?editor=rich-text`. |
@@ -170,8 +167,8 @@ suggestions:
 | Comment editor | Reply editing | Use a reply action | `comment-rail-child-editor` | Useful for nested thread spacing. |
 | Code mode | Review rail present | Open review fixture with `?editor=code` | `page-card-code`, `markdown-code-editor` | Confirms code editor and rail can coexist. |
 | Code mode | Review rail absent | Open fenced fixture with `?editor=code` | `page-card-code`, `markdown-code-editor` | Confirms fenced CriticMarkup alone does not create review rail. |
-| Error/home fallback | Non-Markdown path | Open URL with `?path=/tmp/file.txt` | homepage error message | Copy: `Roughdraft now opens one .md file at a time.` |
-| Start-up | Load failed | Open a file while `/api/status` or `GET /api/markdown-file` fails (route it to abort or 500) | `startup-error`, `startup-error-message`, `startup-error-retry-status`, `startup-error-retry` | Card reads `Could not load <name>: <what failed>`, for example `Could not load plan.md: The Roughdraft server did not answer (GET /api/markdown-file): Failed to fetch`. Status line `Trying again in N s.` during the 1, 2, 5 s automatic retries, then `Roughdraft stopped retrying on its own.` Replaces the old `Could not open that markdown file.` homepage. |
+| Start-up | Non-Markdown path | Open URL with `?path=/tmp/file.txt` | `startup-not-markdown` | Card: `Roughdraft now opens one .md file at a time. /tmp/file.txt is not one.` with an `Open documents` link. |
+| Start-up | Load failed | Open a file while `/api/status` or `GET /api/markdown-file` fails (route it to abort or 500) | `startup-error`, `startup-error-message`, `startup-error-retry-status`, `startup-error-retry` | Card reads `Could not load <name>: <what failed>`, for example `Could not load plan.md: The Roughdraft server did not answer (GET /api/markdown-file): Failed to fetch`. Status line `Trying again in N s.` during the 1, 2, 5 s automatic retries, then `Roughdraft stopped retrying on its own.` Replaces the old `Could not open that markdown file.` message. |
 | Start-up | File not found | Open a `.md` path that does not exist yet | `startup-file-missing`, `startup-file-missing-path` | `File not found at <absolute path>`; the page checks every 5 s and opens the file when it appears. |
 ## Playwright Capture Skeleton
 ```ts
@@ -183,16 +180,16 @@ const outDir = process.env.ROUGHDRAFT_SCREENSHOT_DIR ?? ".context/ui-state-scree
 const browser = await chromium.launch();
 const desktop = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
 await desktop.goto(`${baseUrl}/`);
-await desktop.screenshot({ path: `${outDir}/01-home-desktop.png`, fullPage: true });
+await desktop.screenshot({ path: `${outDir}/01-open-documents-desktop.png`, fullPage: true });
 
 const mobile = await browser.newPage({ ...devices["iPhone 13"] });
 await mobile.goto(`${baseUrl}/`);
-await mobile.screenshot({ path: `${outDir}/01-home-mobile.png`, fullPage: true });
+await mobile.screenshot({ path: `${outDir}/01-open-documents-mobile.png`, fullPage: true });
 
 await browser.close();
 ```
 
-For interaction-heavy states, prefer selectors over coordinates. The current code has stable `data-testid` hooks for the homepage storyboard, editor view toggle, mode trigger, conflict banner/actions, review rail, rich editor, code editor, selection menu, link popover, and context menu.
+For interaction-heavy states, prefer selectors over coordinates. The current code has stable `data-testid` hooks for the open documents list, editor view toggle, mode trigger, conflict banner/actions, review rail, rich editor, code editor, selection menu, link popover, and context menu.
 ## States That Need A Harness Or Mocking
 These are real product states, but they are awkward to capture deterministically through only public routes:
 

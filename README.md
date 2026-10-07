@@ -17,6 +17,17 @@ The fork is installed from a packed build, never from the npm registry. [docs/fo
 
 A Roughdraft link is the address of the Roughdraft running where the file lives plus the file's path, for example `http://localhost:7373/?path=/Users/me/notes/plan.md`. Opening a link for a file that already has a window brings that window forward. On a VPS the link is its Tailscale address with the VPS path; see [Running Roughdraft on a VPS](#running-roughdraft-on-a-vps).
 
+## Open documents
+
+The root address of a Roughdraft (`http://localhost:7373/`, no file) lists every open document, grouped by the chat session that opened it: the harness, the session's title (linked when the session registered a link), then each document with its first heading, file name and folder, and one line of state (unsaved text in a window, the latest Done, an open AI round, how many windows, "session ended" when a Claude Code session is gone). Every window's file-name menu has an **Open documents** entry that opens this page.
+
+- **Open** brings the document's window forward, or opens it when none is left.
+- **Close** closes the document's windows and ends its session in the log. The file is untouched and a Done that is still waiting stays. A document with unsaved text in a window cannot be closed from the list. A window the browser will not let a page close says "Closed from the open documents list" and stops syncing.
+- **Drop** marks a waiting Done as dropped, so `pending`, `round`, `watch` and the MCP tools stop returning it.
+- **Close all finished** closes every document whose latest Done was picked up or whose session has ended. Closed documents stay under **Earlier today**, with Reopen, until local midnight.
+
+Window titles read `<first heading> · <session title>` (the file name when the file has no heading). `roughdraft documents` prints the same list and `roughdraft close "<file>"` closes one document. When `ROUGHDRAFT_PEER_URL` is set (the Mac pointing at the VPS and the other way round), the page links to the other Roughdraft's list; see [docs/fork/install.md](docs/fork/install.md#the-other-roughdraft).
+
 ## Keeping your tab and the file in sync
 
 Each window holds one WebSocket to the local server, so any number of windows works. The server's first message on every connect or reconnect is the current file version, with a heartbeat after that, and the tab re-checks the file when it becomes visible, regains focus or comes back online. Saves go one at a time, retry on failure, and are decided on the file's content, never on its timestamp. Every write goes to a temporary file first and is renamed into place, so a reader never sees a half-written file (`ROUGHDRAFT_WRITE_MODE=inplace` turns the rename off; `scripts/check-drive-rename.mjs` checks a cloud-synced folder first).
@@ -54,7 +65,7 @@ Claude Code entry in `~/.claude.json` (see [docs/fork/install.md](docs/fork/inst
 
 | Tool | What it does | Read-only |
 | --- | --- | --- |
-| `roughdraft_get_open_documents` | Documents in the session log with their link, open tabs, listening agents, session and handoffs; from disk when the server is down | yes |
+| `roughdraft_get_open_documents` | Documents in the session log with their link, title, open tabs, listening agents, session and whether it still runs, latest Done, whether the document was closed, and handoffs; from disk when the server is down | yes |
 | `roughdraft_get_review_index` | Every comment, reply and suggestion in a file, with scope, anchors, `lines`, `quote`, `continues`, resolution and lost anchors | yes |
 | `roughdraft_get_pending_feedback` | The round list (threads with context and `needsAnswer`), `counts` and `fileVersion`, plus the older per-item list | yes |
 | `roughdraft_validate_document` | The `roughdraft doctor <file>` result; `strict` fails on warnings | yes |
@@ -87,6 +98,8 @@ roughdraft <path>                      same as open <path> when the argument is 
 | `pending [path]` | Dones no agent has acknowledged (`--ack`, `--all`) |
 | `ack <id>...` | Acknowledge Dones by handoff id |
 | `log` | The session log: each document, its session, wake route and latest Done |
+| `documents` | The open documents grouped by chat session, as on the page at `/` |
+| `close <path>` | Close a document's windows and end its session; refuses while a window has unsaved text |
 | `route list` / `add` / `remove` / `test` | Wake routes per harness ([docs/fork/routes.md](docs/fork/routes.md)) |
 | `mcp` | The stdio MCP server |
 | `doctor [path]` | Check the setup, or validate one file (`--strict` fails on warnings) |
@@ -114,6 +127,8 @@ roughdraft watch <path> [--json] [--timeout <seconds>] [--reconnect <seconds>]
 roughdraft pending [<path>] [--ack] [--all] [--json]
 roughdraft ack <handoffId>... [--json]
 roughdraft log [--json]
+roughdraft documents [--json]
+roughdraft close <path> [--json]
 roughdraft route add <harness> --command "<text>" | --claude-session | --codex-queue [--label <text>]
 roughdraft route add <harness> --url <url> [--header "Name: value"]... [--body '<JSON template>'] [--label <text>]
 roughdraft route test <harness> [--session-id <id>]

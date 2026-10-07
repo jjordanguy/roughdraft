@@ -924,6 +924,77 @@ describe("cli watch, handoffs and wake routes", () => {
     );
   });
 
+  it("documents lists open documents by session, and close closes one into Earlier today", async () => {
+    const server = await startServer();
+    const notesPath = path.join(projectDir, "notes.md");
+    fs.writeFileSync(notesPath, "No heading.\n");
+    for (const [file, label] of [
+      ["plan.md", "Fork Roughdraft"],
+      ["notes.md", "Resnick proposal"],
+    ]) {
+      await fetch(`${server.url}/api/documents/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectPath: projectDir,
+          path: file,
+          harness: file === "plan.md" ? "claude-code" : "openclaw",
+          label,
+        }),
+      });
+    }
+    await postDone(server);
+
+    const text = harness();
+    expect(await runCli(["documents"], text.deps)).toBe(0);
+    const printed = text.logs.join("\n");
+    expect(printed).toContain("Open documents: 2 sessions, 0 windows");
+    expect(printed).toContain("Claude Code · Fork Roughdraft");
+    expect(printed).toContain("OpenClaw · Resnick proposal");
+    expect(printed).toMatch(/ {2}Plan \(plan\.md, .+project\)/);
+    expect(printed).toMatch(/Done waiting since .+, 0 windows/);
+    expect(printed).toMatch(/ {2}notes\.md \(notes\.md, /);
+
+    const close = harness();
+    expect(await runCli(["close", notesPath], close.deps)).toBe(0);
+    expect(close.logs).toEqual([
+      `Closed ${notesPath} (0 windows told to close).`,
+    ]);
+
+    const json = harness();
+    expect(await runCli(["documents", "--json"], json.deps)).toBe(0);
+    const envelope = onlyEnvelope(json.logs);
+    expect(envelope).toMatchObject({
+      ok: true,
+      sessionCount: 1,
+      groups: [
+        {
+          session: { label: "Fork Roughdraft" },
+          documents: [{ documentPath, title: "Plan" }],
+        },
+      ],
+      earlier: [
+        {
+          documentPath: notesPath,
+          closedAt: expect.any(String),
+          lastSession: { label: "Resnick proposal" },
+        },
+      ],
+    });
+
+    const missing = harness();
+    expect(
+      await runCli(
+        ["close", path.join(projectDir, "never.md"), "--json"],
+        missing.deps,
+      ),
+    ).toBe(2);
+    expect(onlyEnvelope(missing.logs)).toMatchObject({
+      ok: false,
+      error: { code: "DOCUMENT_NOT_FOUND" },
+    });
+  });
+
   it("open reports existing-window only when a tab acknowledges the open request", async () => {
     const server = await startServer();
     for (const acknowledged of [false, true]) {

@@ -35,6 +35,7 @@ import {
   documentViewFromRecord,
   fetchServerStatus,
   getStateDir,
+  isUnacknowledged,
   listDocuments,
   listWakeRoutes,
   putWakeRoute,
@@ -143,7 +144,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "roughdraft_get_open_documents",
     description:
-      "List the documents in Roughdraft's session log: path, link, open tabs, tabsDirty (tabs with unsaved edits) and tabsConflict (tabs holding an unsettled conflict), listening agents, the session that opened each one, and its handoffs. Before writing to a document whose tabsDirty is above zero, wait for the tab to save (Jordan is typing). Reads the log on disk when the server is not running (server.running is then false, and the tab counts are 0).",
+      "List the documents in Roughdraft's session log: path, link, title (the file's first heading), open tabs, tabsDirty (tabs with unsaved edits) and tabsConflict (tabs holding an unsettled conflict), listening agents, the session that opened each one with sessionState (live, ended or unknown), latestHandoff (state, createdAt, wakeState, ackedAt), closedAt (set when Jordan closed it from the open documents list; its session then moves to lastSession), and its handoffs. A handoff in state dropped was dropped from that list and needs nothing. Before writing to a document whose tabsDirty is above zero, wait for the tab to save (Jordan is typing). Reads the log on disk when the server is not running (server.running is then false, and the tab counts are 0).",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1251,7 +1252,7 @@ export async function callTool(
     });
 
     const handoffIds = result.handoffs
-      .filter((handoff) => handoff.state !== "acknowledged")
+      .filter(isUnacknowledged)
       .map((handoff) => handoff.handoffId);
     if (args.ack !== false && handoffIds.length > 0) {
       try {

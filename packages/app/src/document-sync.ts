@@ -102,6 +102,8 @@ export interface DocumentSyncView {
   lastError: string | null;
   // At most one of each kind, newest last.
   notices: SyncNotice[];
+  // The open documents list closed this document; the tab should go.
+  closedByList: boolean;
 }
 
 export type FlushResult =
@@ -349,6 +351,7 @@ export class DocumentSync {
   private handoff: HandoffRecord | null = null;
   private round: RoundFlag | null = null;
   private latestSequence: number | null = null;
+  private closedByList = false;
 
   private presenceKey: string | null = null;
   private lastPresence: { visible: boolean; conflict: boolean } | null = null;
@@ -1461,7 +1464,29 @@ export class DocumentSync {
       case "ping":
         this.channel?.send({ type: "pong", seq: message.seq });
         return;
+      case "session":
+        this.session = message.session;
+        this.notify();
+        return;
+      case "close":
+        void this.closeFromList();
+        return;
     }
+  }
+
+  // The list refuses to close a tab that reported unsaved text, but a
+  // keystroke can land between its check and this message: save it first.
+  private async closeFromList(): Promise<void> {
+    if (this.closedByList || this.disposed) return;
+    if (this.draftContent !== this.base.content) {
+      try {
+        await this.flush();
+      } catch {
+        // The draft store keeps what did not reach disk.
+      }
+    }
+    this.closedByList = true;
+    this.notify();
   }
 
   // The server only needs the ack; App owns focus and navigation.
@@ -1612,6 +1637,7 @@ export class DocumentSync {
       latestSequence: this.latestSequence,
       lastError: this.lastError,
       notices: this.notices,
+      closedByList: this.closedByList,
     };
   }
 

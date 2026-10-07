@@ -339,6 +339,28 @@ describe("getReviewHandoffView", () => {
       expected: { kind: "picked-up", buttonLabel: "Picked up" },
     },
     {
+      row: "dropped from the open documents list",
+      given: input({
+        phase: "completed",
+        result: {
+          delivered: false,
+          pending: true,
+          handoff: handoff(),
+          wake: wake(),
+        },
+        handoff: handoff({
+          state: "dropped",
+          droppedAt: "2026-10-05T15:50:00.000Z",
+        }),
+      }),
+      expected: {
+        kind: "picked-up",
+        buttonLabel: "Dropped",
+        title: "You dropped this Done from the open documents list.",
+        showCopyMessage: false,
+      },
+    },
+    {
       row: "error",
       given: input({ phase: "error", watcherCount: 1 }),
       expected: {

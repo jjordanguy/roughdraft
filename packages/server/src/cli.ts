@@ -29,6 +29,11 @@ import {
   ROUGHDRAFT_LOOPBACK_HOSTS,
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
+import {
+  closeDocumentOnServer,
+  formatOpenDocuments,
+  groupOpenDocuments,
+} from "./open-documents.js";
 import { findAvailablePort } from "./ports.js";
 import {
   type ReviewCliOptions,
@@ -52,6 +57,7 @@ import {
   getServerStateFilePath,
   getStateDir,
   type HandoffRecord,
+  isUnacknowledged,
   type ListedHandoff,
   listDocuments,
   listWakeRoutes,
@@ -95,6 +101,8 @@ const KNOWN_COMMANDS = [
   "pending",
   "ack",
   "log",
+  "documents",
+  "close",
   "route",
   "mcp",
   "doctor",
@@ -1066,6 +1074,8 @@ function printHelp(log: (message: string) => void) {
   log("  pending [path]     List Dones no agent has acknowledged yet");
   log("  ack <id>...        Acknowledge Dones by handoff id");
   log("  log                Show the session log");
+  log("  documents          List open documents by chat session");
+  log("  close <path>       Close a document's windows and end its session");
   log("  route <action>     List, add, remove or test wake routes");
   log("  mcp                Start the stdio MCP server for agent tools");
   log("  doctor [path]      Diagnose setup or validate Markdown");
@@ -1290,6 +1300,32 @@ function printCommandHelp(
       "Shows the session log: each document with its session, wake route, latest",
     );
     log("Done and the result of its wake.");
+    return;
+  }
+
+  if (command === "documents") {
+    log("Usage:");
+    log("  roughdraft documents [--json]");
+    log("");
+    log(
+      "Lists the open documents grouped by the chat session that opened them, as",
+    );
+    log("the page at the root address does, with documents closed today under");
+    log("Earlier today.");
+    return;
+  }
+
+  if (command === "close") {
+    log("Usage:");
+    log("  roughdraft close <path> [--json]");
+    log("");
+    log(
+      "Closes the document's windows and ends its session in the log. The file is",
+    );
+    log(
+      "untouched, and a Done still waiting stays. Refuses (exit 4) while a window",
+    );
+    log("holds unsaved text.");
     return;
   }
 
@@ -2598,6 +2634,9 @@ function describeHandoffState(handoff: HandoffRecord): string {
     return `picked up at ${formatTime(handoff.ackedAt)}${handoff.ackedBy ? ` by ${handoff.ackedBy}` : ""}`;
   }
   if (handoff.state === "superseded") return "superseded by a later Done";
+  if (handoff.state === "dropped") {
+    return `dropped from the open documents list at ${formatTime(handoff.droppedAt)}`;
+  }
   if (handoff.state === "delivered") return "delivered, not acknowledged";
   return "waiting";
 }
@@ -2670,8 +2709,11 @@ function formatDocumentLine(view: DocumentView): string {
     );
   } else if (latest.state === "acknowledged") {
     parts.push(`Done picked up at ${formatTime(latest.ackedAt)}`);
+  } else if (latest.state === "dropped") {
+    parts.push("Done dropped");
   }
   if (view.session) parts.push(`opened by ${view.session.label}`);
+  if (view.closedAt) parts.push(`closed at ${formatTime(view.closedAt)}`);
   return `${path.basename(view.documentPath)}: ${parts.join(", ")}`;
 }
 
@@ -2811,7 +2853,7 @@ async function runWatchFlow(
   // The handoff is acknowledged only after the result is out, so a reader
   // that never got it (a closed pipe, a crash) leaves it pending.
   const handoffIds = result.handoffs
-    .filter((handoff) => handoff.state !== "acknowledged")
+    .filter(isUnacknowledged)
     .map((handoff) => handoff.handoffId);
   if (options.ack && handoffIds.length > 0) {
     try {
@@ -3038,6 +3080,58 @@ async function runAck(
   for (const id of result.acked) deps.log(`Acknowledged ${id}.`);
   for (const id of result.unknown)
     deps.error(`roughdraft: unknown handoff ${id}`);
+  return 0;
+}
+
+async function runDocuments(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+): Promise<number> {
+  if (options.positionals.length > 0) {
+    throw usageError("Usage: roughdraft documents [--json]");
+  }
+  const server = await requireLiveServer(deps, "list open documents");
+  const listed = await listDocuments(apiContext(deps, server.url));
+  if (json) {
+    const list = groupOpenDocuments(listed.documents);
+    emitJson(
+      deps.log,
+      okEnvelope({
+        serverUrl: server.publicUrl,
+        sessionCount: list.sessionCount,
+        windowCount: list.windowCount,
+        groups: list.groups,
+        earlier: list.earlier,
+      }),
+    );
+    return 0;
+  }
+  for (const line of formatOpenDocuments(listed.documents)) deps.log(line);
+  return 0;
+}
+
+async function runClose(
+  deps: CliDependencies,
+  options: ParsedCommandOptions,
+  json: boolean,
+): Promise<number> {
+  if (options.positionals.length !== 1) {
+    throw usageError('Usage: roughdraft close "<path>" [--json]');
+  }
+  const documentPath = path.resolve(deps.cwd, options.positionals[0] ?? "");
+  const server = await requireLiveServer(deps, "close a document");
+  const result = await closeDocumentOnServer(
+    apiContext(deps, server.url),
+    documentPath,
+  );
+  if (json) {
+    emitJson(deps.log, okEnvelope({ documentPath, ...result }));
+    return 0;
+  }
+  deps.log(
+    `Closed ${documentPath} (${result.closedTabs} ${result.closedTabs === 1 ? "window" : "windows"} told to close).`,
+  );
   return 0;
 }
 
@@ -4091,6 +4185,14 @@ export async function runCli(
 
     if (command === "log") {
       return await runLog(deps, options, json);
+    }
+
+    if (command === "documents") {
+      return await runDocuments(deps, options, json);
+    }
+
+    if (command === "close") {
+      return await runClose(deps, options, json);
     }
 
     if (command === "route") {

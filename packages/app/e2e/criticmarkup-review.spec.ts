@@ -230,8 +230,15 @@ async function sampleReviewLayoutAnimation(page: Page) {
     };
     const samples: ReviewLayoutAnimationSample[] = [];
     const start = performance.now();
+    // The click that starts the animation lands after this begins; under a
+    // loaded parallel run that can take longer than the animation itself.
+    // Sample for up to 1.5 s and stop shortly after the animation shows.
+    let sawAnimation: number | null = null;
 
-    while (performance.now() - start < 500) {
+    while (
+      performance.now() - start < 1_500 &&
+      (sawAnimation === null || performance.now() - sawAnimation < 150)
+    ) {
       const shell = document.querySelector(
         '[data-testid="document-page-shell"]',
       );
@@ -248,6 +255,15 @@ async function sampleReviewLayoutAnimation(page: Page) {
         shellTranslateX: readTranslateX(shell),
         headerTranslateX: readTranslateX(header),
       });
+      const last = samples.at(-1);
+      if (
+        sawAnimation === null &&
+        last?.shellAnimating &&
+        last.headerAnimating &&
+        Math.abs(last.shellTranslateX) > 1
+      ) {
+        sawAnimation = performance.now();
+      }
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
 

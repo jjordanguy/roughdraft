@@ -101,6 +101,7 @@ export {
   type RfmRoundThreadKind,
 } from "./round.js";
 export { sha256Hex } from "./sha256.js";
+export { documentTitleFromMarkdown } from "./title.js";
 export {
   type RfmEndmatterEntries,
   type RfmEndmatterEntry,

@@ -26,3 +26,6 @@ process.env.ROUGHDRAFT_CODEX_BIN = path.join(
   process.env.CODEX_HOME,
   "no-codex-in-tests",
 );
+
+// The open documents page links the other Roughdraft when this is set.
+delete process.env.ROUGHDRAFT_PEER_URL;

@@ -163,6 +163,10 @@ export function parseTabServerMessage(value: unknown): TabServerMessage | null {
     }
     case "ping":
       return { type: "ping", seq: optionalNumber(value.seq) ?? 0 };
+    case "session":
+      return { type: "session", session: parseSessionRecord(value.session) };
+    case "close":
+      return { type: "close" };
     default:
       return null;
   }

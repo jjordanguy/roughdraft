@@ -43,6 +43,7 @@ import {
 } from "./network.js";
 import {
   DocumentRegistry,
+  type DocumentView,
   documentKey,
   documentUrl,
   identityFor,
@@ -52,6 +53,7 @@ import {
   type ReviewCompletedEvent,
   ReviewEventQueue,
 } from "./review-events.js";
+import { sessionStateResolver } from "./session-state.js";
 import { TabChannel, type TargetResult } from "./tab-channel.js";
 import { resolveUpdateStatus } from "./update-status.js";
 import {
@@ -143,10 +145,12 @@ interface CreateAppOptions {
   openRequestAckMs?: number;
   deliveryWaitMs?: number;
   wakeTimeoutMs?: number;
-  /** Where Claude Code keeps its session records, for claude-session wake routes (default: CLAUDE_CONFIG_DIR, else ~/.claude). */
+  /** Where Claude Code keeps its session records, for claude-session wake routes and "session ended" (default: CLAUDE_CONFIG_DIR, else ~/.claude). */
   claudeConfigDir?: string;
   /** The codex executable for codex-queue wake routes (default: ROUGHDRAFT_CODEX_BIN, else codex on PATH). */
   codexBin?: string;
+  /** The other Roughdraft's address, linked from the open documents page. Default: ROUGHDRAFT_PEER_URL. */
+  peerUrl?: string;
   /** Document watcher stat poll (default 1 s). */
   watchPollMs?: number;
   /** Document watcher rehash while subscribed (default 10 s). */
@@ -577,7 +581,13 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     log,
     publicBaseUrl,
     roundStallMs: options.roundStallMs,
+    sessionStates: sessionStateResolver({
+      configDir: options.claudeConfigDir,
+    }),
   });
+  const peerUrl = normalizePeerUrl(
+    options.peerUrl ?? process.env[ROUGHDRAFT_PEER_URL_ENV],
+  );
   const reviewEvents = new ReviewEventQueue({
     nextSequence: log.peekNextSequence(),
     seed: log.unacknowledgedEvents(),
@@ -1385,6 +1395,27 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.json({ ok: true, handoff });
   });
 
+  // Drop from the open documents list: the Done no longer waits anywhere
+  // (pending, round, watch and the MCP tools read it like acknowledged).
+  app.post("/api/review-events/drop", (req, res) => {
+    const handoffId = optionalString(req.body?.handoffId);
+    if (!handoffId) {
+      res.status(400).json({ error: "handoffId is required", code: "USAGE" });
+      return;
+    }
+    const found = log.findHandoff({ handoffId });
+    if (!found) {
+      res
+        .status(404)
+        .json({ error: "Handoff not found", code: "HANDOFF_NOT_FOUND" });
+      return;
+    }
+    registry.touch(found.document, { keepExistingIdentity: true });
+    const handoff = log.drop(found.handoff);
+    announceHandoff(handoff);
+    res.json({ ok: true, handoff });
+  });
+
   app.get("/api/review-events/status", (req, res) => {
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
@@ -1410,6 +1441,75 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
 
   app.get("/api/documents", (_req, res) => {
     res.json({ instanceId, logId: log.logId, documents: registry.list() });
+  });
+
+  type CloseOutcome =
+    | { ok: true; closedTabs: number; document: DocumentView | null }
+    | { ok: false; code: "TAB_DIRTY"; document: DocumentView | null };
+
+  /**
+   * Closes a document from the open documents list: its tabs are told to
+   * close, its session ends in the log, handoffs stay, the file is untouched.
+   * Never closes a document a tab holds unsaved text for.
+   */
+  function closeDocument(key: string): CloseOutcome {
+    if (registry.tabsDirty(key) > 0) {
+      return { ok: false, code: "TAB_DIRTY", document: registry.view(key) };
+    }
+    const closedTabs = tabChannel.sendClose(key);
+    registry.close(key);
+    return { ok: true, closedTabs, document: registry.view(key) };
+  }
+
+  /** The latest Done was picked up (or dropped), or the session that opened it has ended. */
+  function isFinished(view: DocumentView): boolean {
+    const latest = view.handoffs.at(-1);
+    return (
+      latest?.state === "acknowledged" ||
+      latest?.state === "dropped" ||
+      view.sessionState === "ended"
+    );
+  }
+
+  app.post("/api/documents/close", (req, res) => {
+    const target = markdownTargetFromRequest(req, res, { allowMissing: true });
+    if (!target) return;
+    const key = targetIdentity(target).key;
+    if (!log.get(key)) {
+      res
+        .status(404)
+        .json({ error: "Document not tracked", code: "DOCUMENT_NOT_FOUND" });
+      return;
+    }
+    const outcome = closeDocument(key);
+    if (!outcome.ok) {
+      res.status(409).json({
+        error:
+          "A window on this document has unsaved text. Let it save, or close it there.",
+        code: "TAB_DIRTY",
+        document: outcome.document,
+      });
+      return;
+    }
+    res.json(outcome);
+  });
+
+  app.post("/api/documents/close-finished", (_req, res) => {
+    const closed: DocumentView[] = [];
+    const skipped: { document: DocumentView; reason: "TAB_DIRTY" }[] = [];
+    for (const view of registry.list()) {
+      if (view.closedAt !== null || !isFinished(view)) continue;
+      const outcome = closeDocument(view.key);
+      if (outcome.ok) {
+        if (outcome.document) closed.push(outcome.document);
+      } else {
+        skipped.push({
+          document: outcome.document ?? view,
+          reason: "TAB_DIRTY",
+        });
+      }
+    }
+    res.json({ ok: true, closed, skipped });
   });
 
   app.get("/api/documents/one", (req, res) => {
@@ -1467,7 +1567,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         .json({ error: "harness and label are required", code: "USAGE" });
       return;
     }
-    const session = log.setSession(targetIdentity(target), {
+    const session = registry.setSession(targetIdentity(target), {
       harness,
       label,
       link: optionalString(req.body?.link),
@@ -1585,6 +1685,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       instanceId,
       stateless: true,
       stateDir,
+      peerUrl,
       capabilities: {
         projectPathRequired: true,
         fileSystemBrowsing: true,
@@ -1593,6 +1694,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         handoffLog: true,
         wakeRoutes: true,
         reviewRounds: true,
+        openDocuments: true,
         tokenRequired: apiToken !== null,
       },
       warnings: [...log.warnings, ...wakeRoutes.warnings],
@@ -1855,6 +1957,22 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";
 
 export const ROUGHDRAFT_STATE_DIR_ENV = "ROUGHDRAFT_STATE_DIR";
+
+/** The other Roughdraft (Mac or VPS), linked from the open documents page. */
+export const ROUGHDRAFT_PEER_URL_ENV = "ROUGHDRAFT_PEER_URL";
+
+function normalizePeerUrl(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === "http:" || url.protocol === "https:"
+      ? url.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 export function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
   const explicitDir = env[ROUGHDRAFT_STATE_DIR_ENV]?.trim();

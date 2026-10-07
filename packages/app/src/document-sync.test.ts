@@ -1416,3 +1416,44 @@ function createSyncWithStore(
   syncs.push(sync);
   return sync;
 }
+
+describe("DocumentSync and the open documents list", () => {
+  it("takes a new session from the channel", async () => {
+    const server = new FakeServer("Start");
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    server.lastChannel().receive(hello(server));
+    await settle();
+    expect(sync.getView().session).toBeNull();
+
+    server.lastChannel().receive({
+      type: "session",
+      session: {
+        harness: "claude-code",
+        label: "Fork Roughdraft",
+        link: null,
+        sessionId: "s1",
+        routeId: null,
+        registeredAt: "2026-10-06T10:00:00.000Z",
+      },
+    });
+    expect(sync.getView().session?.label).toBe("Fork Roughdraft");
+    server.lastChannel().receive({ type: "session", session: null });
+    expect(sync.getView().session).toBeNull();
+  });
+
+  it("saves typed text before it reports the close", async () => {
+    const server = new FakeServer("Start");
+    const { sync } = createSync(server);
+    server.lastChannel().open();
+    server.lastChannel().receive(hello(server));
+    await settle();
+
+    sync.edit("Start, typed just now");
+    server.lastChannel().receive({ type: "close" });
+    await advance(0);
+
+    expect(server.content).toBe("Start, typed just now");
+    expect(sync.getView().closedByList).toBe(true);
+  });
+});

@@ -212,6 +212,17 @@ export function getReviewHandoffView(
       };
     }
 
+    // Dropped from the open documents list: settled, nothing waits on it.
+    if (handoff?.state === "dropped") {
+      return {
+        ...base,
+        kind: "picked-up",
+        buttonLabel: "Dropped",
+        icon: "check",
+        title: "You dropped this Done from the open documents list.",
+      };
+    }
+
     if (input.result.delivered) {
       return {
         ...base,

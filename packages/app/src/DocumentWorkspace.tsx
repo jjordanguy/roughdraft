@@ -6,6 +6,7 @@ import {
   Copy,
   Eye,
   FilePlus2,
+  ListTree,
   Loader2,
   MessageSquarePlus,
   MessageSquareText,
@@ -154,6 +155,14 @@ const fileCopyMenuOptions = [
   action: FileCopyAction;
   label: string;
 }[];
+
+// The open documents list in its own window; a second click reuses it.
+function openDocumentsWindow() {
+  window.open(
+    new URL("/", window.location.origin).toString(),
+    "roughdraft-open-documents",
+  );
+}
 
 function formatFileCopyPreview(value: string) {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -525,8 +534,9 @@ export function DocumentWorkspace({
   const reviewHandoffSettledKind =
     reviewHandoffPhase !== "completed" || !reviewHandoffResult
       ? null
-      : (reviewHandoffRecord ?? reviewHandoffResult.handoff)?.state ===
-          "acknowledged"
+      : ["acknowledged", "dropped"].includes(
+            (reviewHandoffRecord ?? reviewHandoffResult.handoff)?.state ?? "",
+          )
         ? "picked-up"
         : reviewHandoffResult.delivered
           ? "sent"
@@ -1394,6 +1404,32 @@ export function DocumentWorkspace({
                           ) : null}
                         </button>
                       ))}
+                      <div
+                        className="my-1 h-px bg-stone-200 dark:bg-slate-700"
+                        aria-hidden="true"
+                      />
+                      <button
+                        type="button"
+                        data-testid="document-file-menu-open-documents"
+                        className="flex items-start gap-2 rounded-md px-2 py-1.5 text-left text-[0.72rem] leading-none text-stone-700 outline-none transition hover:bg-[#EEE9E1] focus-visible:bg-[#EEE9E1] dark:text-stone-300 dark:hover:bg-slate-700 dark:focus-visible:bg-slate-700"
+                        onClick={() => {
+                          setFileCopyMenuOpen(false);
+                          openDocumentsWindow();
+                        }}
+                      >
+                        <ListTree
+                          className="mt-[0.06rem] size-4 shrink-0 text-stone-500 dark:text-slate-400"
+                          aria-hidden="true"
+                        />
+                        <span className="grid min-w-0 flex-1 gap-1">
+                          <span className="truncate font-medium">
+                            Open documents
+                          </span>
+                          <span className="truncate text-[0.66rem] leading-none text-stone-400 dark:text-slate-500">
+                            Every open window, by session
+                          </span>
+                        </span>
+                      </button>
                     </div>
                   </PopoverContent>
                 </Popover>

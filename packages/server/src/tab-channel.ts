@@ -114,6 +114,7 @@ export class TabChannel {
     options.registry.onChange((key, change) => {
       if (change === "watchers") this.sendWatchers(key);
       if (change === "round") this.broadcastRound(key);
+      if (change === "session") this.broadcastSession(key);
     });
   }
 
@@ -144,6 +145,28 @@ export class TabChannel {
     for (const client of this.clients.get(key) ?? []) {
       if (client.ready) this.send(client, { type: "round", round });
     }
+  }
+
+  /** The session that opened the document changed (registered, or ended by Close). */
+  broadcastSession(key: string): void {
+    const session = this.options.log.get(key)?.session ?? null;
+    for (const client of this.clients.get(key) ?? []) {
+      if (client.ready) this.send(client, { type: "session", session });
+    }
+  }
+
+  /**
+   * Tells every tab on the document that it was closed from the open
+   * documents list. Returns how many tabs were told.
+   */
+  sendClose(key: string): number {
+    let told = 0;
+    for (const client of this.clients.get(key) ?? []) {
+      if (!client.ready || client.socket.readyState !== 1) continue;
+      this.send(client, { type: "close" });
+      told += 1;
+    }
+    return told;
   }
 
   /**
@@ -278,6 +301,9 @@ export class TabChannel {
     });
     client.ready = true;
     opened.start();
+    // A tab that was open when the document was closed from the list, and
+    // missed the message (hidden, offline), is told now.
+    if (registry.isClosedTab(key, tabId)) this.send(client, { type: "close" });
 
     pingTimer = setInterval(() => {
       if (missedPings >= MISSED_PINGS_ALLOWED) {

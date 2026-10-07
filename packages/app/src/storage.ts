@@ -130,7 +130,11 @@ export type TabServerMessage =
   | { type: "handoff"; handoff: HandoffRecord }
   | { type: "round"; round: RoundFlag }
   | { type: "open-request"; requestId: string; url: string }
-  | { type: "ping"; seq: number };
+  | { type: "ping"; seq: number }
+  // The session that opened the document changed (registered, or ended).
+  | { type: "session"; session: SessionRecord | null }
+  // Closed from the open documents list.
+  | { type: "close" };
 
 export type TabClientMessage =
   | {
@@ -182,10 +186,12 @@ export interface HandoffRecord {
     unresolved: number;
   };
   overallComment: string | null;
-  state: "pending" | "delivered" | "acknowledged" | "superseded";
+  // "dropped": dropped from the open documents list; nothing waits on it.
+  state: "pending" | "delivered" | "acknowledged" | "superseded" | "dropped";
   deliveredTo: string[];
   ackedAt: string | null;
   ackedBy: string | null;
+  droppedAt?: string | null;
   wake: HandoffWake;
 }
 

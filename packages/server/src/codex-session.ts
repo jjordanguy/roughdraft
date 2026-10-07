@@ -12,6 +12,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { killProcessGroup } from "./process-group.js";
 
 export const CODEX_QUEUE_TIMEOUT_MS = 10_000;
 const STDERR_TAIL_CHARS = 500;
@@ -103,9 +104,12 @@ export function wakeCodexSession(
   const timeoutMs = options.timeoutMs ?? CODEX_QUEUE_TIMEOUT_MS;
   const { ROUGHDRAFT_TOKEN: _token, ...childEnv } = env;
   return new Promise((resolve) => {
+    // Its own process group, so a timeout kills codex and anything it
+    // started (a wrapper script's child would otherwise keep stderr open).
     const child = spawn(bin, ["queue", "--thread", id, "--message", text], {
       stdio: ["ignore", "ignore", "pipe"],
       env: childEnv,
+      detached: true,
     });
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -114,7 +118,7 @@ export function wakeCodexSession(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      killProcessGroup(child);
     }, timeoutMs);
     child.on("error", (error: NodeJS.ErrnoException) => {
       clearTimeout(timer);

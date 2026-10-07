@@ -74,15 +74,20 @@ describe("DocumentWatcher", () => {
   it("reports the current state on open", async () => {
     const state = await watch();
 
+    // The version carries the file's modification time as Node reports it.
+    // Linux keeps nanoseconds and reports a millisecond value that is not
+    // always the whole number `utimes` was given, so compare with `stat`.
+    const { mtimeMs } = fs.statSync(filePath);
     expect(state).toMatchObject({
       seq: 1,
       exists: true,
       available: true,
       reason: null,
       contentHash: sha256("# B\n\nalpha\n"),
-      version: `${fixed.getTime()}:11:${sha256("# B\n\nalpha\n")}`,
+      version: `${mtimeMs}:11:${sha256("# B\n\nalpha\n")}`,
     });
-    expect(state.stat).toMatchObject({ size: 11, mtimeMs: fixed.getTime() });
+    expect(state.stat).toMatchObject({ size: 11, mtimeMs });
+    expect(Math.round(mtimeMs)).toBe(fixed.getTime());
   });
 
   it("detects a same-size, same-mtime in-place write (sync probe 1)", async () => {

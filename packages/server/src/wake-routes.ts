@@ -9,6 +9,7 @@ import {
   readJsonState,
   writeJsonAtomic,
 } from "./handoff-log.js";
+import { killProcessGroup } from "./process-group.js";
 import {
   builtInRoute,
   redactRoute,
@@ -462,10 +463,14 @@ function runCommand(
 ): Promise<string | null> {
   const { ROUGHDRAFT_TOKEN: _token, ...inherited } = baseEnv;
   return new Promise((resolve) => {
+    // Its own process group, so a timeout can kill the shell and whatever
+    // the shell started. Killing the shell alone leaves a child holding the
+    // stderr pipe open on Linux, and "close" waits for it.
     const child = spawn(expandPlaceholders(command, payload), {
       shell: true,
       stdio: ["ignore", "ignore", "pipe"],
       env: { ...inherited, ...wakeEnv(payload) },
+      detached: true,
     });
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -474,7 +479,7 @@ function runCommand(
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      killProcessGroup(child);
     }, timeoutMs);
     child.on("error", (error) => {
       clearTimeout(timer);

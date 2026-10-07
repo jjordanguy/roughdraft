@@ -6,7 +6,13 @@ import process from "node:process";
 const repoRoot = process.cwd();
 const testFilePattern =
   /(?:^|\/)(?:test|e2e)\/.*\.(?:test|spec)\.tsx?$|\.e2e\/.*\.spec\.tsx?$|\.test\.tsx?$|\.spec\.tsx?$/;
-const ignoredDirs = new Set(["node_modules", "dist", "coverage", ".git"]);
+const ignoredDirs = new Set([
+  "node_modules",
+  "dist",
+  "coverage",
+  ".git",
+  ".context",
+]);
 
 const forbiddenApiPatterns = [
   /\b(?:page|screen|within\([^)]*\)|rendered|container)\.get(?:All)?By(?:Text|Role|LabelText|PlaceholderText|DisplayValue|AltText|Title)\s*\(/,

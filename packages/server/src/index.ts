@@ -22,6 +22,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const staticDir = path.resolve(__dirname, "../../app/dist");
 const defaultServerRoot = path.resolve(__dirname, "../../..");
 
+function readServerVersion(packageJsonPath?: string): string {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(
+        packageJsonPath ?? path.join(defaultServerRoot, "package.json"),
+        "utf8",
+      ),
+    ) as { version?: unknown };
+    if (typeof manifest.version === "string" && manifest.version.length > 0) {
+      return manifest.version;
+    }
+  } catch {}
+  return "0.0.0";
+}
+
 interface AssetPayload {
   filename?: string;
   mimeType?: string;
@@ -67,6 +82,7 @@ interface CreateAppOptions {
   fetchImpl?: typeof fetch;
   packageName?: string;
   remoteDocumentToken?: string;
+  version?: string;
 }
 
 interface CreateAppResult {
@@ -404,6 +420,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       ? options.remoteDocumentToken
       : null;
   const app = express();
+  const serverVersion =
+    options.version ?? readServerVersion(options.packageJsonPath);
+  const instanceId = `srv_${process.pid}_${crypto.randomUUID().slice(0, 8)}`;
   const openRequestClients = new Set<OpenRequestClient>();
   const reviewEvents = new ReviewEventQueue();
   const remoteSessions = new Map<string, RemoteSession>();
@@ -809,6 +828,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         ? path.resolve(options.projectDir)
         : undefined,
       serverRoot,
+      version: serverVersion,
+      instanceId,
       stateless: true,
       capabilities: {
         projectPathRequired: true,

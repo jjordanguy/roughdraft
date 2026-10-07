@@ -6,6 +6,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultPackageJsonPath = path.resolve(__dirname, "../../../package.json");
 const DEFAULT_PACKAGE_NAME = "roughdraft";
 
+// The fork is installed from a packed build, never from the npm registry, so
+// the "update available" notice would point at the wrong package. It stays off.
+export const UPDATE_CHECK_ENABLED = false;
+
 interface PackageManifest {
   name?: string;
   version?: string;
@@ -150,10 +154,9 @@ export async function resolveUpdateStatus(
   const packageName =
     options.packageName?.trim() || installedPackageInfo.packageName;
   const currentVersion = installedPackageInfo.currentVersion;
-  const latestVersion = await fetchLatestVersion(
-    packageName,
-    options.fetchImpl ?? fetch,
-  );
+  const latestVersion = UPDATE_CHECK_ENABLED
+    ? await fetchLatestVersion(packageName, options.fetchImpl ?? fetch)
+    : null;
 
   return {
     packageName,

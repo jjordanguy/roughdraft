@@ -34,6 +34,7 @@ const KNOWN_COMMANDS = [
   "start",
   "status",
   "stop",
+  "restart",
   "watch",
   "mcp",
   "doctor",
@@ -55,7 +56,29 @@ interface StatusPayload {
   projectDir?: string;
   serverRoot?: string;
   port?: number;
+  version?: string;
+  instanceId?: string;
 }
+
+export class CliError extends Error {
+  code: string;
+  exitCode: number;
+  hint: string | null;
+
+  constructor(
+    code: string,
+    message: string,
+    options: { exitCode?: number; hint?: string } = {},
+  ) {
+    super(message);
+    this.name = "CliError";
+    this.code = code;
+    this.exitCode = options.exitCode ?? 1;
+    this.hint = options.hint ?? null;
+  }
+}
+
+const SERVER_ERROR = 3;
 
 interface DevFrontendState {
   apiPort: number | null;
@@ -101,13 +124,7 @@ type OpenMode =
   | "none";
 
 interface EnsureRunningResult {
-  server: {
-    port: number;
-    url: string;
-    tracked: boolean;
-    pid: number | null;
-    startedAt: string | null;
-  };
+  server: ReusableServer;
   reused: boolean;
   portChanged: boolean;
 }
@@ -123,6 +140,9 @@ interface ReusableServer {
   tracked: boolean;
   pid: number | null;
   startedAt: string | null;
+  version: string | null;
+  instanceId: string | null;
+  versionMatches: boolean;
 }
 
 type KnownCommand = (typeof KNOWN_COMMANDS)[number];
@@ -850,6 +870,7 @@ function printHelp(log: (message: string) => void) {
   log("  start              Start or reuse the background server");
   log("  status             Show server status");
   log("  stop               Stop the managed background server");
+  log("  restart            Stop the managed server and start this version");
   log("  watch <path>       Wait for a Done Reviewing event");
   log("  mcp                Start the experimental stdio MCP server");
   log("  doctor [path]      Diagnose setup or validate Markdown");
@@ -952,6 +973,15 @@ function printCommandHelp(
     log("  --json               Print machine-readable output");
     log("  --state-file <path>  Server state file");
     log("  --state-dir <dir>    Directory containing server.json");
+    return;
+  }
+
+  if (command === "restart") {
+    log("Usage:");
+    log("  roughdraft restart [--port <port>] [--json]");
+    log("");
+    log("Stop the managed background server, then start one from this");
+    log("installed version. Use it after installing a new version.");
     return;
   }
 
@@ -1736,6 +1766,7 @@ async function findReusableServer(
         tracked: true,
         pid: normalizedState.pid,
         startedAt: normalizedState.startedAt,
+        ...describeServerVersion(statusPayload),
       };
     }
 
@@ -1748,6 +1779,7 @@ async function findReusableServer(
         tracked: false,
         pid: null,
         startedAt: null,
+        ...describeServerVersion(statusPayload),
       };
     }
   }
@@ -1763,7 +1795,34 @@ async function findReusableServer(
     tracked: false,
     pid: null,
     startedAt: null,
+    ...describeServerVersion(preferredStatus),
   };
+}
+
+function describeServerVersion(payload: StatusPayload): {
+  version: string | null;
+  instanceId: string | null;
+  versionMatches: boolean;
+} {
+  const version = typeof payload.version === "string" ? payload.version : null;
+  return {
+    version,
+    instanceId:
+      typeof payload.instanceId === "string" ? payload.instanceId : null,
+    versionMatches: version === readPackageVersion(),
+  };
+}
+
+function versionMismatchError(server: ReusableServer): CliError {
+  const serverVersion = server.version ?? "older than 0.2.0";
+  return new CliError(
+    "SERVER_VERSION_MISMATCH",
+    `The Roughdraft server at ${server.url} is version ${serverVersion} and this command is version ${readPackageVersion()}.`,
+    {
+      exitCode: SERVER_ERROR,
+      hint: "Run `roughdraft restart` to replace the running server with this version.",
+    },
+  );
 }
 
 export async function readRunningServerState(
@@ -1796,6 +1855,9 @@ export async function ensureServerRunning(
     serverRoot: currentServerRoot,
   });
   if (reusableServer) {
+    if (!reusableServer.versionMatches) {
+      throw versionMismatchError(reusableServer);
+    }
     return { server: reusableServer, reused: true, portChanged: false };
   }
 
@@ -1829,6 +1891,9 @@ export async function ensureServerRunning(
       tracked: true,
       pid: state.pid,
       startedAt: state.startedAt,
+      version: readPackageVersion(),
+      instanceId: null,
+      versionMatches: true,
     },
     reused: false,
     portChanged: port !== preferredPort,
@@ -1854,6 +1919,10 @@ function buildServerStatusJson(
     startedAt: server.startedAt,
     stateFile: stateFilePath,
     managed: server.tracked,
+    serverVersion: server.version,
+    cliVersion: readPackageVersion(),
+    versionMatches: server.versionMatches,
+    instanceId: server.instanceId,
   };
 }
 
@@ -2209,10 +2278,12 @@ export async function runCli(
   let deps = createCliDependencies(overrides);
   let parsed: ParsedCli;
   let shouldPrintUpdateNotice = false;
+  let jsonOutputRequested = args.includes("--json");
 
   try {
     try {
       parsed = parseGlobalArgs(args);
+      jsonOutputRequested = parsed.global.json || jsonOutputRequested;
     } catch (error) {
       deps.error(error instanceof Error ? error.message : "Invalid usage.");
       return USAGE_ERROR;
@@ -2395,6 +2466,11 @@ export async function runCli(
       }
 
       deps.log(`Roughdraft is running at ${server.url}`);
+      if (!server.versionMatches) {
+        deps.log(
+          `Version mismatch: the server is ${server.version ?? "older than 0.2.0"} and this command is ${readPackageVersion()}. Run \`roughdraft restart\`.`,
+        );
+      }
       if (server.tracked && server.pid !== null && server.startedAt !== null) {
         deps.log(`PID: ${server.pid}`);
         deps.log(`Started: ${server.startedAt}`);
@@ -2404,6 +2480,73 @@ export async function runCli(
           `This server is not managed by ${getServerStateFilePath(deps.env)}.`,
         );
       }
+      return 0;
+    }
+
+    if (command === "restart") {
+      let options: ParsedCommandOptions;
+      try {
+        options = parseCommandOptions(rest, { allowPort: true });
+      } catch (error) {
+        deps.error(error instanceof Error ? error.message : "Invalid usage.");
+        return USAGE_ERROR;
+      }
+
+      if (options.help) {
+        printCommandHelp("restart", deps.log);
+        return 0;
+      }
+
+      if (options.positionals.length > 0) {
+        deps.error("Usage: roughdraft restart [--port <port>] [--json]");
+        return USAGE_ERROR;
+      }
+
+      deps = applyCliEnvOverrides(deps, options);
+      const json = parsed.global.json || options.json;
+      const stopResult = await stopTrackedServer(deps);
+      if (stopResult.failedPid !== null) {
+        throw new CliError(
+          "SERVER_STOP_FAILED",
+          `Could not stop the Roughdraft server with PID ${stopResult.failedPid}.`,
+          {
+            exitCode: SERVER_ERROR,
+            hint: `Stop it yourself with \`kill ${stopResult.failedPid}\`, then run \`roughdraft start\`.`,
+          },
+        );
+      }
+      if (!stopResult.portIsQuiet) {
+        const preferredPort = getPreferredPort(deps.env);
+        const unmanaged = await getStatusPayload(preferredPort, deps);
+        if (unmanaged && !stopResult.persistedState) {
+          throw new CliError(
+            "SERVER_NOT_MANAGED",
+            `A Roughdraft server on port ${preferredPort} is not managed by ${getServerStateFilePath(deps.env)}.`,
+            {
+              exitCode: SERVER_ERROR,
+              hint: "Run `roughdraft stop --all` to stop it, then `roughdraft start`.",
+            },
+          );
+        }
+      }
+
+      const result = await ensureServerRunning(deps);
+      if (json) {
+        emitJson(deps.log, {
+          ...buildServerStatusJson(
+            result.server,
+            getServerStateFilePath(deps.env),
+          ),
+          restarted: true,
+          stoppedPid: stopResult.persistedState?.pid ?? null,
+        });
+        return 0;
+      }
+
+      if (stopResult.stopped && stopResult.persistedState) {
+        deps.log(`Stopped Roughdraft PID ${stopResult.persistedState.pid}.`);
+      }
+      deps.log(`Roughdraft running at ${result.server.url}`);
       return 0;
     }
 
@@ -2823,6 +2966,26 @@ export async function runCli(
     }
 
     return USAGE_ERROR;
+  } catch (error) {
+    if (error instanceof CliError) {
+      if (jsonOutputRequested) {
+        emitJson(deps.log, {
+          ok: false,
+          status: "error",
+          exitCode: error.exitCode,
+          error: {
+            code: error.code,
+            message: error.message,
+            ...(error.hint ? { hint: error.hint } : {}),
+          },
+        });
+      } else {
+        deps.error(`roughdraft: ${error.message}`);
+        if (error.hint) deps.error(`hint: ${error.hint}`);
+      }
+      return error.exitCode;
+    }
+    throw error;
   } finally {
     if (shouldPrintUpdateNotice) {
       await printUpdateNoticeIfAvailable(deps);

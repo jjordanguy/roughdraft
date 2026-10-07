@@ -206,6 +206,82 @@ describe("mcp", () => {
     await server.close();
   });
 
+  it("registers the Codex session it runs inside, and Claude Code wins when both are set", async () => {
+    const server = await startServer();
+    const codex = (await callTool(
+      "roughdraft_register_session",
+      { documentPath, label: "codex chat" },
+      { ...env(), CODEX_THREAD_ID: "thread-3" },
+      fetch,
+    )) as Json;
+    expect(codex.session).toMatchObject({
+      harness: "codex",
+      sessionId: "thread-3",
+      routeId: "codex",
+    });
+    const both = (await callTool(
+      "roughdraft_register_session",
+      { documentPath, label: "both" },
+      {
+        ...env(),
+        CODEX_SESSION_ID: "thread-3",
+        CLAUDE_CODE_SESSION_ID: "conv-7",
+      },
+      fetch,
+    )) as Json;
+    expect(both.session).toMatchObject({
+      harness: "claude-code",
+      sessionId: "conv-7",
+    });
+    await server.close();
+  });
+
+  it("adds a url route with headers and a body template and lists header names only", async () => {
+    await startServer();
+    const added = (await callTool(
+      "roughdraft_wake_routes",
+      {
+        action: "add",
+        harness: "openclaw",
+        url: "http://127.0.0.1:18789/hooks/wake",
+        headers: { Authorization: "Bearer hooks-secret" },
+        body: '{"text": {message}, "mode": "now", "agentId": "main"}',
+      },
+      env(),
+      fetch,
+    )) as Json;
+    expect(added.route).toMatchObject({
+      kind: "url",
+      headers: { Authorization: "<set>" },
+    });
+    const listed = (await callTool(
+      "roughdraft_wake_routes",
+      { action: "list" },
+      env(),
+      fetch,
+    )) as Json;
+    expect(JSON.stringify(listed)).not.toContain("hooks-secret");
+    expect(
+      listed.routes.find((route: Json) => route.harness === "openclaw"),
+    ).toMatchObject({
+      headers: { Authorization: "<set>" },
+      body: '{"text": {message}, "mode": "now", "agentId": "main"}',
+    });
+    await expect(
+      callTool(
+        "roughdraft_wake_routes",
+        {
+          action: "add",
+          harness: "openclaw",
+          url: "http://127.0.0.1:18789/hooks/wake",
+          body: '{"text": "{message}"}',
+        },
+        env(),
+        fetch,
+      ),
+    ).rejects.toThrow(/body is not JSON/);
+  });
+
   it("reports a server that is not running instead of fetch failed", async () => {
     await expect(
       callTool(

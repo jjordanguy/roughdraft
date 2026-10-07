@@ -16,7 +16,7 @@ Roughdraft opens a local Markdown file with tools on top of it, so Jordan can re
 
 ## Procedure
 
-1. At the start of a session that will hand Jordan a file, run `roughdraft route test claude-code` once. The test arrives in this session as a message a moment later. If the command fails, say so: his Done will then reach you only through the session log, so he should tell you in chat when he is done.
+1. At the start of a session that will hand Jordan a file, run `roughdraft route test claude-code` once (`roughdraft route test codex` when you are Codex). Both routes are built in, nothing to add. The test arrives in this session as a message a moment later. If the command fails, say so: his Done will then reach you only through the session log, so he should tell you in chat when he is done.
 2. Hand him the file:
 
    ```bash
@@ -55,7 +55,7 @@ Each prints the new entry's id and the doctor breakdown.
 | `roughdraft feedback <file> --json` | Read every thread without starting a round |
 | `roughdraft pending <file> --json --ack` | Dones waiting in the session log, acknowledged as listed |
 | `roughdraft status`, `roughdraft log` | Open documents and their links; sessions, wake routes and latest Dones |
-| `roughdraft route list`, `route add <harness> --command "..."`, `--url <url>` or `--claude-session`, `route test <harness>` | Wake routes (claude-code is built in) |
+| `roughdraft route list`, `route add <harness> --command "..."`, `--url <url> [--header "Name: value"] [--body '<template>']`, `--claude-session` or `--codex-queue`, `route test <harness>` | Wake routes (claude-code and codex are built in) |
 | `roughdraft doctor <file> --strict` | Validate a file before handing it back |
 | `roughdraft doctor --fix <file> --dry-run`, then without `--dry-run` | Convert an older-format file, only with Jordan's yes |
 | `roughdraft help`, `roughdraft help <command>` | Flags and exit codes |

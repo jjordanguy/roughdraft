@@ -30,7 +30,7 @@ While an agent has a round open on the document (from `roughdraft round` until `
 [docs/fork/agent-procedure.md](docs/fork/agent-procedure.md) is the procedure an agent follows (the paragraph for `~/.claude/CLAUDE.md`, why each step is there, and the optional guard hook). The Claude Code skill in [packages/skill/SKILL.md](packages/skill/SKILL.md) carries the same procedure. In short:
 
 ```bash
-roughdraft route test claude-code                      # once per session; the test lands in the session
+roughdraft route test claude-code                      # once per session (codex inside Codex); the test lands in the session
 roughdraft open "/abs/path.md" --no-watch --session-label "what this session is doing"
 # ... Done arrives in the session as a message, or Jordan says "done" in chat ...
 roughdraft round "/abs/path.md"                        # prints the round folder
@@ -38,7 +38,7 @@ roughdraft round "/abs/path.md"                        # prints the round folder
 roughdraft apply "<round folder>/response.json"
 ```
 
-The session log (`review-log.json` in the state directory, `~/.roughdraft` by default) keeps every Done until an agent acknowledges it, so a Done nobody was waiting for is not lost: `roughdraft pending "/abs/path.md" --json --ack` returns it. Wake routes, one per harness, tell Roughdraft how to reach a chat session when you click Done. Claude Code's is built in: the Done is posted into the session that opened the file, over the socket every Claude Code session listens on for messages from other sessions. [docs/fork/routes.md](docs/fork/routes.md) covers the commands, the other route kinds, the payload and the HTTP routes behind them.
+The session log (`review-log.json` in the state directory, `~/.roughdraft` by default) keeps every Done until an agent acknowledges it, so a Done nobody was waiting for is not lost: `roughdraft pending "/abs/path.md" --json --ack` returns it. Wake routes, one per harness, tell Roughdraft how to reach a chat session when you click Done. Two are built in. Claude Code's (`claude-code`) posts the Done into the session that opened the file, over the socket every Claude Code session listens on for messages from other sessions. Codex's (`codex`) queues it for the Codex session that opened the file with `codex queue`. `roughdraft open` registers either session by itself. A URL route can carry headers (a bearer token, say) and a JSON body template, which is how OpenClaw's wake hook is reached. [docs/fork/routes.md](docs/fork/routes.md) covers the commands, the other route kinds, a recipe per tool, the payload and the HTTP routes behind them.
 
 `roughdraft guard --claude-hook` is an optional Claude Code PreToolUse hook that keeps the Edit, MultiEdit and Write tools off review markup and off a file with an open round.
 
@@ -114,8 +114,9 @@ roughdraft watch <path> [--json] [--timeout <seconds>] [--reconnect <seconds>]
 roughdraft pending [<path>] [--ack] [--all] [--json]
 roughdraft ack <handoffId>... [--json]
 roughdraft log [--json]
-roughdraft route add <harness> --command "<text>" | --url <url> [--label <text>]
-roughdraft route test <harness>
+roughdraft route add <harness> --command "<text>" | --claude-session | --codex-queue [--label <text>]
+roughdraft route add <harness> --url <url> [--header "Name: value"]... [--body '<JSON template>'] [--label <text>]
+roughdraft route test <harness> [--session-id <id>]
 roughdraft route remove <harness>
 roughdraft doctor [<file>] [--strict] [--json]
 roughdraft doctor --fix <file> [--dry-run] [--json]
@@ -171,6 +172,8 @@ ROUGHDRAFT_TOKEN           Bearer token sent on every request; required when the
 ROUGHDRAFT_BIND_HOST       Comma-separated hosts the server binds (default loopback)
 ROUGHDRAFT_HARNESS, ROUGHDRAFT_SESSION_LABEL, ROUGHDRAFT_SESSION_LINK, ROUGHDRAFT_SESSION_ID
                            Defaults for open's session flags; nothing is registered without a harness
+                           (inside Claude Code or Codex the session is found by itself)
+ROUGHDRAFT_CODEX_BIN       The codex executable codex-queue routes run (default: codex on PATH)
 ROUGHDRAFT_DEBUG=1         Print stack traces on failure
 ```
 

@@ -922,6 +922,7 @@ describe("review event routes on a real listener", () => {
           harness: "claude-code",
           kind: "claude-session",
         }),
+        expect.objectContaining({ harness: "codex", kind: "codex-queue" }),
         expect.objectContaining({
           harness: "ok",
           label: "Mac",
@@ -930,6 +931,39 @@ describe("review event routes on a real listener", () => {
         }),
       ]);
       expect(fs.existsSync(path.join(stateDir, "wake-routes.json"))).toBe(true);
+    });
+
+    it("answers url routes with header names only and refuses a body that is not JSON", async () => {
+      const server = await startServer(baseOptions());
+      const saved = await putRoute(server, "openclaw", {
+        kind: "url",
+        url: "http://127.0.0.1:18789/hooks/wake",
+        headers: ["Authorization: Bearer hooks-secret"],
+        body: '{"text": {message}, "mode": "now", "agentId": "main"}',
+      });
+      const bad = await putRoute(server, "openclaw", {
+        kind: "url",
+        url: "http://127.0.0.1:18789/hooks/wake",
+        body: '{"text": {message}',
+      });
+      const routes = await getJson(`${server.url}/api/wake-routes`);
+
+      expect(saved.status).toBe(200);
+      expect(saved.body.route.headers).toEqual({ Authorization: "<set>" });
+      expect(bad.status).toBe(400);
+      expect(bad.body).toMatchObject({
+        code: "USAGE",
+        error: expect.stringContaining("body is not JSON"),
+      });
+      expect(JSON.stringify(routes.body)).not.toContain("hooks-secret");
+      expect(
+        routes.body.routes.find(
+          (route: { harness: string }) => route.harness === "openclaw",
+        ),
+      ).toMatchObject({
+        headers: { Authorization: "<set>" },
+        body: '{"text": {message}, "mode": "now", "agentId": "main"}',
+      });
     });
 
     it("refuses wake route changes from another origin", async () => {

@@ -24,7 +24,7 @@ import {
 } from "./network.js";
 import { type DocumentView, documentKey } from "./registry.js";
 import type { ReviewCompletedEvent } from "./review-events.js";
-import { withBuiltInRoutes } from "./wake-route-defaults.js";
+import { redactRoute, withBuiltInRoutes } from "./wake-route-defaults.js";
 import type { WakeRoute } from "./wake-routes.js";
 
 export type {
@@ -433,9 +433,12 @@ export async function putWakeRoute(
   ctx: ApiContext,
   harness: string,
   route: {
-    kind: "command" | "url" | "claude-session";
+    kind: WakeRoute["kind"];
     command?: string;
     url?: string;
+    /** `Name: value` lines (the CLI) or names to values (the MCP tool); the server validates them. */
+    headers?: string[] | Record<string, string>;
+    body?: string;
     label?: string | null;
   },
 ): Promise<WakeRoute> {
@@ -484,7 +487,7 @@ export async function testWakeRoute(
   ctx: ApiContext,
   harness: string,
   by: string,
-  /** For a claude-session route: the session the test is delivered into. */
+  /** For a claude-session or codex-queue route: the session the test is delivered into. */
   sessionId: string | null = null,
 ): Promise<WakeTestResult> {
   const response = await apiRequest(
@@ -502,7 +505,7 @@ export async function testWakeRoute(
       "WAKE_ROUTE_NOT_FOUND",
       `No wake route for ${harness}.`,
       {
-        hint: `Add one with \`roughdraft route add ${harness} --command "<text>"\`, \`--url <url>\` or \`--claude-session\`.`,
+        hint: `Add one with \`roughdraft route add ${harness} --command "<text>"\`, \`--url <url>\`, \`--claude-session\` or \`--codex-queue\`.`,
       },
     );
   }
@@ -560,7 +563,7 @@ export function readWakeRoutesFromDisk(stateDir: string): WakeRoute[] {
       parsed.routes && typeof parsed.routes === "object"
         ? Object.values(parsed.routes as Record<string, WakeRoute>)
         : [],
-    );
+    ).map(redactRoute);
   } catch {
     return withBuiltInRoutes([]);
   }

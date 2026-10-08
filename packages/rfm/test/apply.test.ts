@@ -393,6 +393,88 @@ describe("applyReviewResponse: anchors follow the text", () => {
     ]);
   });
 
+  it("a rewritten section keeps each highlight on its own paragraph, whole, with paragraphs added", () => {
+    // From a real round: four decisions, each highlighted by Jordan, rewritten
+    // with an update paragraph before them and a new question after D3. The
+    // highlights used to slide two paragraphs down and open inside the bold.
+    const decisions = doc(
+      [
+        "## 4. Decisions",
+        "",
+        "{==**D1. Look after a pick.** Context: the cards collapse to a name. Options: (a) keep that, (b) chips.==}{#c1}",
+        "",
+        "{==**D2. Converting old values.** Context: old packs do not say which base. Options: (a) convert, (b) leave.==}{#c2}",
+        "",
+        "{==**D3. The order page dropdown.** Context: the order page has its own dropdown. Options: (a) keep, (b) remove.==}{#c3}",
+        "",
+        "{==**D4. Wording of the shop line.** Context: documents need one line. Proposal: method, base, effects.==}{#c4}",
+        "",
+        "## 5. Assumptions to confirm",
+      ].join("\n"),
+      entry("c1", "agree") +
+        entry("c2", "b", "user", 1) +
+        entry("c3", "remove it and put the choice in the summary", "user", 2) +
+        entry("c4", "agree", "user", 3),
+    );
+    const result = run(
+      decisions,
+      {
+        c1: { skip: "-" },
+        c2: { skip: "-" },
+        c3: { skip: "-" },
+        c4: { skip: "-" },
+      },
+      {
+        clean: () =>
+          [
+            "## 4. Decisions (Updated round 2)",
+            "",
+            "**Round 2 update:** D1 and D4 locked (your c1, c4). D2 decided as (b) (your c2). D3 replaced by your ruling (your c3).",
+            "",
+            "**D1. Look after a pick. Locked:** row 1 collapses to its name with an X; rows 2 and 3 stay as chips.",
+            "",
+            "**D2. Old values. Decided (b):** old packs keep their old names and only new picks use the new rows.",
+            "",
+            "**D3. The order page. Decided, your ruling:** the separate section goes; the method is chosen inside the summary.",
+            "",
+            "**O1. Does Add options also offer the ink base swap?** Recommendation: offer both.",
+            "",
+            "**D4. Wording of the shop line. Locked:** method first, then base, then effects joined with +.",
+            "",
+            "## 5. Assumptions (Updated round 2)",
+            "",
+          ].join("\n"),
+      },
+    );
+    const markdown = ok(result);
+    expect(markdown).toContain(
+      "{==**D1. Look after a pick. Locked:** row 1 collapses to its name with an X; rows 2 and 3 stay as chips.==}{#c1}",
+    );
+    expect(markdown).toContain(
+      "{==**D2. Old values. Decided (b):** old packs keep their old names and only new picks use the new rows.==}{#c2}",
+    );
+    expect(markdown).toContain(
+      "{==**D3. The order page. Decided, your ruling:** the separate section goes; the method is chosen inside the summary.==}{#c3}",
+    );
+    expect(markdown).toContain(
+      "{==**D4. Wording of the shop line. Locked:** method first, then base, then effects joined with +.==}{#c4}",
+    );
+    expect(markdown).toContain(
+      "\n**O1. Does Add options also offer the ink base swap?** Recommendation: offer both.\n",
+    );
+    expect(markdown).toContain("\n**Round 2 update:** D1 and D4 locked");
+    expect(markdown).not.toContain("**{==");
+    expect(markdown).toContain("## 5. Assumptions (Updated round 2)\n");
+    // Each hunk is the whole paragraph and the highlight covered the whole
+    // old paragraph, so the highlight simply stays on the new text.
+    expect(result.report.anchors).toEqual([
+      { id: "c1", result: "inside" },
+      { id: "c2", result: "inside" },
+      { id: "c3", result: "inside" },
+      { id: "c4", result: "inside" },
+    ]);
+  });
+
   it("standalone: deleting all of a comment's text keeps it as a standalone comment there", () => {
     const result = run(two, all, {
       extra: { edits: [{ old: " with two people on ops", new: "" }] },

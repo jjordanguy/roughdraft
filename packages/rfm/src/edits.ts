@@ -54,7 +54,115 @@ function refine(oldText: string, newText: string): { p: number; q: number } {
   ) {
     q -= 1;
   }
+  // A cut inside a bold, italic or code run would put a highlight marker
+  // between the run's markers, which no Markdown renderer shows as a
+  // highlight. Widen to the line instead. The common prefix and suffix are
+  // the same in both texts, so the old text decides for both.
+  if (cutsInlineRun(oldText, p)) {
+    p = oldText.lastIndexOf("\n", p - 1) + 1;
+  }
+  const tailAt = oldText.length - q;
+  if (cutsInlineRun(oldText, tailAt)) {
+    const lineEnd = oldText.indexOf("\n", tailAt);
+    q = lineEnd === -1 ? 0 : oldText.length - lineEnd;
+  }
+  if (p + q > Math.min(oldText.length, newText.length)) {
+    p = 0;
+    q = 0;
+  }
   return { p, q };
+}
+
+/** True when the line is cut at `offset` with an unclosed `**`, `*`, `__` or backtick run before it. */
+function cutsInlineRun(text: string, offset: number): boolean {
+  const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
+  const before = text.slice(lineStart, offset);
+  if (!before) return false;
+  const strong = (before.match(/\*\*|__/g) ?? []).length;
+  const single = (before.replace(/\*\*|__/g, "").match(/\*/g) ?? []).length;
+  const ticks = (before.match(/`+/g) ?? []).length;
+  return strong % 2 === 1 || single % 2 === 1 || ticks % 2 === 1;
+}
+
+const LABEL =
+  /^(?:[-*+] |\d+[.)] |#{1,6} |> )?\**\s*([A-Z]{1,3}\d{1,3})(?=[.):\s*])/;
+
+function wordsOf(line: string): Set<string> {
+  return new Set(line.toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? []);
+}
+
+/**
+ * How alike two lines are, 0 to 1. Blank lines are alike to nothing, lines
+ * with the same leading label (D3, A1, Q2) are alike whatever follows, and
+ * the rest is word overlap.
+ */
+function similarity(a: string, b: string): number {
+  if (!a.trim() || !b.trim()) return 0;
+  if (a === b) return 1;
+  const labelA = a.match(LABEL)?.[1];
+  const labelB = b.match(LABEL)?.[1];
+  if (labelA && labelB) return labelA === labelB ? 1 : 0;
+  const wordsA = wordsOf(a);
+  const wordsB = wordsOf(b);
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let shared = 0;
+  for (const word of wordsA) if (wordsB.has(word)) shared += 1;
+  return (2 * shared) / (wordsA.size + wordsB.size);
+}
+
+const SIMILAR = 0.3;
+
+/**
+ * Order-keeping pairs of old and new lines inside a changed block, by content,
+ * so a rewritten paragraph pairs with its rewrite and an inserted paragraph
+ * pairs with nothing. Pairing by position let every highlight in a rewritten
+ * section slide onto the wrong paragraph.
+ */
+function pairLines(am: string[], bm: string[]): Array<[number, number]> {
+  const n = am.length;
+  const m = bm.length;
+  if (n === 0 || m === 0 || n * m > 250_000) return [];
+  const width = m + 1;
+  const best = new Float64Array((n + 1) * width);
+  const scores = new Float64Array(n * m);
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      const score = similarity(am[i] as string, bm[j] as string);
+      scores[i * m + j] = score;
+      let value = Math.max(
+        best[(i + 1) * width + j] as number,
+        best[i * width + j + 1] as number,
+      );
+      if (score >= SIMILAR) {
+        value = Math.max(
+          value,
+          score + (best[(i + 1) * width + j + 1] as number),
+        );
+      }
+      best[i * width + j] = value;
+    }
+  }
+  const pairs: Array<[number, number]> = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    const score = scores[i * m + j] as number;
+    const taken =
+      score >= SIMILAR ? score + (best[(i + 1) * width + j + 1] as number) : -1;
+    if (taken >= 0 && taken >= (best[i * width + j] as number) - 1e-9) {
+      pairs.push([i, j]);
+      i += 1;
+      j += 1;
+    } else if (
+      (best[(i + 1) * width + j] as number) >=
+      (best[i * width + j + 1] as number)
+    ) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return pairs;
 }
 
 /** Line diff of two texts, each hunk narrowed to the words that changed. */
@@ -74,26 +182,30 @@ export function diffCleanText(oldText: string, newText: string): CleanHunk[] {
   }
   const am = a.slice(head, a.length - tail);
   const bm = b.slice(head, b.length - tail);
-  // Matching line pairs in the middle (LCS); a very large middle is one hunk.
+  // Matching line pairs in the middle (LCS over lines with content; blank
+  // lines never anchor a match, or a rewritten section would be stitched to
+  // the wrong paragraphs through the blank lines between them). A very large
+  // middle is one hunk.
   const pairs: Array<[number, number]> = [];
+  const same = (x: string | undefined, y: string | undefined) =>
+    x === y && x !== undefined && x.trim() !== "";
   if (am.length > 0 && bm.length > 0 && am.length * bm.length <= 4_000_000) {
     const width = bm.length + 1;
     const table = new Uint32Array((am.length + 1) * width);
     for (let i = am.length - 1; i >= 0; i -= 1) {
       for (let j = bm.length - 1; j >= 0; j -= 1) {
-        table[i * width + j] =
-          am[i] === bm[j]
-            ? (table[(i + 1) * width + j + 1] as number) + 1
-            : Math.max(
-                table[(i + 1) * width + j] as number,
-                table[i * width + j + 1] as number,
-              );
+        table[i * width + j] = same(am[i], bm[j])
+          ? (table[(i + 1) * width + j + 1] as number) + 1
+          : Math.max(
+              table[(i + 1) * width + j] as number,
+              table[i * width + j + 1] as number,
+            );
       }
     }
     let i = 0;
     let j = 0;
     while (i < am.length && j < bm.length) {
-      if (am[i] === bm[j]) {
+      if (same(am[i], bm[j])) {
         pairs.push([i, j]);
         i += 1;
         j += 1;
@@ -128,21 +240,38 @@ export function diffCleanText(oldText: string, newText: string): CleanHunk[] {
   };
   for (const [pi, pj] of pairs) {
     if (pi > i || pj > j) {
-      if (pi - i === pj - j) {
-        // As many lines out as in: one hunk per line pair, so an edit on one
-        // line never widens a highlight on the next.
-        for (let k = 0; k < pi - i; k += 1) {
-          const oldLine = am[i + k] as string;
-          const newLine = bm[j + k] as string;
-          if (oldLine === newLine) continue;
-          const start = offsets[head + i + k] as number;
+      // Inside a changed block, a line pairs with the new line it most
+      // resembles, in order: one hunk per pair, so an edit on one line never
+      // widens a highlight on the next. What pairs with nothing is an
+      // insertion or a deletion of its own.
+      let oi = i;
+      let oj = j;
+      const gap = (oEnd: number, nEnd: number) => {
+        if (oEnd <= oi && nEnd <= oj) return;
+        const oldPart = am.slice(oi, oEnd).join("");
+        const newPart = bm.slice(oj, nEnd).join("");
+        if (oldPart === newPart) return;
+        push(
+          offsets[head + oi] as number,
+          offsets[head + oEnd] as number,
+          oldPart,
+          newPart,
+        );
+      };
+      for (const [si, sj] of pairLines(am.slice(i, pi), bm.slice(j, pj))) {
+        const ai = i + si;
+        const bj = j + sj;
+        gap(ai, bj);
+        const oldLine = am[ai] as string;
+        const newLine = bm[bj] as string;
+        if (oldLine !== newLine) {
+          const start = offsets[head + ai] as number;
           push(start, start + oldLine.length, oldLine, newLine);
         }
-      } else {
-        const start = offsets[head + i] as number;
-        const end = offsets[head + pi] as number;
-        push(start, end, am.slice(i, pi).join(""), bm.slice(j, pj).join(""));
+        oi = ai + 1;
+        oj = bj + 1;
       }
+      gap(pi, pj);
     }
     i = pi + 1;
     j = pj + 1;

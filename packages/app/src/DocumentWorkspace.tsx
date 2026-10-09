@@ -946,7 +946,8 @@ export function DocumentWorkspace({
                   </Button>
                 }
               />
-              <TooltipContent side="bottom">
+              {/* Below the header row, so the tip never sits on the mode control. */}
+              <TooltipContent side="bottom" align="end" sideOffset={20}>
                 Comment on the whole document
               </TooltipContent>
             </Tooltip>
@@ -1033,6 +1034,8 @@ export function DocumentWorkspace({
                 {reviewHandoffTooltip ? (
                   <TooltipContent
                     side="bottom"
+                    align="end"
+                    sideOffset={20}
                     data-testid="review-handoff-tooltip"
                   >
                     {reviewHandoffTooltip}

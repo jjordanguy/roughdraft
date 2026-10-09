@@ -23,7 +23,8 @@ if (!rootElement) {
 
 createRoot(rootElement).render(
   <StrictMode>
-    <TooltipProvider>
+    {/* A short delay, so sweeping the pointer across the toolbar does not stack tooltips. */}
+    <TooltipProvider delay={350}>
       <App />
     </TooltipProvider>
   </StrictMode>,

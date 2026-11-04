@@ -75,6 +75,48 @@ describe("text this tab saved", () => {
     ]);
   });
 
+  it("does not count a highlight added around existing text as typed text", () => {
+    const before = "# T\n\nDo A. Clear the cards that built up. Do B.\n";
+    const after =
+      "# T\n\nDo A. {==Clear the cards that built up.==}{#c4} Do B.\n\n---\ncomments:\n" +
+      entry("c4");
+    expect(recordSavedText([], before, after, 0)).toEqual([]);
+    // The agent then removes the sentence, as the comment asked: nothing to restore.
+    const runs = recordSavedText([], before, after, 0);
+    expect(
+      findRemovedText(runs, after, after, "# T\n\nDo A. Do B.\n", 1_000),
+    ).toEqual([]);
+  });
+
+  it("keeps the typed span, at its new offsets, when a later save only adds markup", () => {
+    let runs = recordSavedText(
+      [],
+      "# T\n\nIntro.\n",
+      "# T\n\nIntro. My point.\n",
+      0,
+    );
+    runs = recordSavedText(
+      runs,
+      "# T\n\nIntro. My point.\n",
+      "# T\n\n{==Intro.==}{#c1} My point.\n",
+      1_000,
+    );
+    expect(runs).toEqual([
+      { line: "{==Intro.==}{#c1} My point.", start: 17, end: 27, savedAt: 0 },
+    ]);
+  });
+
+  it("still records text typed in the same save as a highlight", () => {
+    const runs = recordSavedText(
+      [],
+      "# T\n\nIntro. Outro.\n",
+      "# T\n\n{==Intro.==}{#c1} New words. Outro.\n",
+      0,
+    );
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.line).toBe("{==Intro.==}{#c1} New words. Outro.");
+  });
+
   it("ignores text the agent only moved, and text older than five minutes", () => {
     const base = "# T\n\nMy point about the rollout.\n\nOther.\n";
     const runs = recordSavedText([], "# T\n\nOther.\n", base, 0);

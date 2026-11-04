@@ -147,6 +147,8 @@ roughdraft note <file> "<text>" | - [--author <name>] [--json]
 roughdraft guard --claude-hook
 ```
 
+`--print-url` prints the link and returns without opening a window or waiting; a session named with `--harness` or `--session-id` is registered first, so the link carries the agent's session either way.
+
 `open` and `watch` return a Done that is already waiting (`--no-pending` waits for the next one only) and acknowledge what they return after printing it (`--no-ack` leaves it pending). A watcher that loses the server reconnects for `--reconnect` seconds (default 120) before it gives up. `apply --wait` sets how long it waits for a tab with unsaved text (default 10 seconds). `round --dir` writes the agent's round files elsewhere; `apply` finds the round from the response's folder or by its `roundId`.
 
 Exit codes:

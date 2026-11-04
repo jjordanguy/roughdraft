@@ -20,10 +20,6 @@ import {
 } from "./errors.js";
 import { runGuardHook } from "./guard.js";
 import {
-  currentHarnessSession,
-  currentSessionIdForRoute,
-} from "./wake-route-defaults.js";
-import {
   ROUGHDRAFT_BIND_HOST,
   ROUGHDRAFT_DEFAULT_PORT,
   ROUGHDRAFT_LOOPBACK_HOSTS,
@@ -76,6 +72,10 @@ import {
   watchReviewEvents,
 } from "./review-watch-client.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
+import {
+  currentHarnessSession,
+  currentSessionIdForRoute,
+} from "./wake-route-defaults.js";
 
 export { CliError } from "./errors.js";
 export { getServerStateFilePath } from "./review-watch-client.js";
@@ -1160,7 +1160,7 @@ function printCommandHelp(
       "  --no-open                 Start/reuse the server without opening a browser",
     );
     log(
-      "  --print-url               Print only the document URL and do not open it",
+      "  --print-url               Print only the document URL and do not open it (a session named with --harness or --session-id is still registered)",
     );
     log("  --no-watch                Open the file without waiting");
     for (const line of WATCH_FLAG_HELP) log(line);
@@ -3702,23 +3702,33 @@ async function runOpen(
     }
   }
 
-  if (options.printUrl) {
-    if (json) {
-      emitJson(deps.log, okEnvelope({ path: openPath, url: targetUrl }));
-    } else {
-      deps.log(targetUrl);
-    }
-    return 0;
-  }
-
-  // The session goes on the document before the window opens, so a Done
-  // clicked in the first second already knows where to wake.
+  // The session goes on the document before the window opens (and before
+  // --print-url returns), so a Done clicked in the first second already
+  // knows where to wake, and a link printed for someone else still has
+  // the session of the agent that printed it.
   if (sessionOptions && apiBaseUrl) {
     session = await registerSession(apiContext(deps, apiBaseUrl), {
       projectPath: projectDir,
       path: path.relative(projectDir, openPath),
       ...sessionOptions,
     });
+  }
+
+  if (options.printUrl) {
+    if (json) {
+      emitJson(
+        deps.log,
+        okEnvelope({ path: openPath, url: targetUrl, session }),
+      );
+    } else {
+      deps.log(targetUrl);
+      if (session) {
+        deps.error(
+          `Registered session: ${session.label} (${session.harness}).`,
+        );
+      }
+    }
+    return 0;
   }
 
   const openWindow = async () => {

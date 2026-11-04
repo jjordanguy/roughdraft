@@ -575,6 +575,57 @@ describe("cli", () => {
     expect(test.getLastOpenedUrl()).toBeNull();
   });
 
+  it("registers the session before open --print-url returns", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, "# Draft\n");
+
+    const exitCode = await runCli(
+      [
+        "open",
+        documentPath,
+        "--print-url",
+        "--harness",
+        "scratch",
+        "--session-id",
+        "scratch-1",
+        "--session-label",
+        "A scratch session",
+      ],
+      test.deps,
+    );
+    const persisted = JSON.parse(
+      fs.readFileSync(getServerStateFilePath(test.deps.env), "utf8"),
+    ) as { port: number };
+    const listed = (await (
+      await fetch(`http://localhost:${persisted.port}/api/documents`)
+    ).json()) as {
+      documents: Array<{
+        session: {
+          harness: string;
+          sessionId: string | null;
+          label: string;
+        } | null;
+      }>;
+    };
+
+    expect(exitCode).toBe(0);
+    expect(test.logs).toEqual([
+      expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
+    ]);
+    expect(
+      test.errors.filter((line) => !line.startsWith("Preferred port")),
+    ).toEqual(["Registered session: A scratch session (scratch)."]);
+    expect(test.getLastOpenedUrl()).toBeNull();
+    expect(listed.documents.map((document) => document.session)).toEqual([
+      expect.objectContaining({
+        harness: "scratch",
+        sessionId: "scratch-1",
+        label: "A scratch session",
+      }),
+    ]);
+  });
+
   it("emits JSON from open --no-watch --json without scraping human prose", async () => {
     const test = createTestDependencies();
     const documentPath = path.join(projectDir, "draft.md");

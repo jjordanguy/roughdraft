@@ -202,9 +202,26 @@ function bodyLines(markdown: string): string[] {
   return splitRoughdraftDocument(markdown).body.split("\n");
 }
 
+// The prose of a span with the review markup taken out: highlight, change
+// and ref markers, and an older-format inline comment. Two spans with the
+// same prose differ only in markup.
+function proseOf(text: string): string {
+  return text
+    .replace(/\{>>[\s\S]*?<<\}/g, "")
+    .replace(/\{#[A-Za-z0-9_-]+\}/g, "")
+    .replace(/\{(==|\+\+|--|~~)/g, "")
+    .replace(/(==|\+\+|--|~~)\}/g, "")
+    .replace(/~>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // After a save of `saved` on top of `previous`: the body lines the save
 // wrote, each with the span this tab typed (merged with what earlier saves
 // typed on the same line). Runs older than five minutes drop out.
+// A save that only added markup (a highlight around existing text, a ref)
+// typed no text: the prose between the markers was already there, so it
+// is not recorded and cannot be "text you saved" later.
 export function recordSavedText(
   runs: SavedRun[],
   previous: string,
@@ -223,11 +240,15 @@ export function recordSavedText(
       const oldLine = oldIndex < hunk.aEnd ? (a[oldIndex] ?? null) : null;
       let start = 0;
       let end = line.length;
+      let savedAt = now;
       if (oldLine !== null) {
         const prefix = commonPrefix(oldLine, line);
         const suffix = commonSuffix(oldLine, line, prefix);
         start = prefix;
         end = line.length - suffix;
+        const markupOnly =
+          proseOf(line.slice(start, end)) ===
+          proseOf(oldLine.slice(prefix, oldLine.length - suffix));
         const earlier = next.findIndex((run) => run.line === oldLine);
         if (earlier >= 0) {
           const run = next[earlier] as SavedRun;
@@ -243,13 +264,24 @@ export function recordSavedText(
               : run.end >= oldChangeEnd
                 ? run.end + delta
                 : end;
-          start = Math.min(start, mappedStart);
-          end = Math.max(end, mappedEnd);
+          if (markupOnly) {
+            // Carry the earlier span forward at its new offsets, unchanged.
+            start = mappedStart;
+            end = mappedEnd;
+            savedAt = run.savedAt;
+          } else {
+            start = Math.min(start, mappedStart);
+            end = Math.max(end, mappedEnd);
+          }
           next.splice(earlier, 1);
+        } else if (markupOnly) {
+          continue;
         }
+      } else if (proseOf(line) === "") {
+        continue;
       }
       if (end <= start) continue;
-      next.push({ line, start, end, savedAt: now });
+      next.push({ line, start, end, savedAt });
     }
   }
   return next;

@@ -298,6 +298,40 @@ describe("review rail from the comment map", () => {
     expect(byTestId(rail(container), "comment-thread-c1")).not.toBeNull();
   });
 
+  it("keeps a resolved comment's text plain until its card is selected", async () => {
+    const { container, getEditor } = await renderDocument(
+      fixture("canonical-document-comments"),
+    );
+    const decoration = () =>
+      [
+        ...getEditor().view.dom.querySelectorAll<HTMLElement>(
+          '[data-testid="comment-decoration"]',
+        ),
+      ].find((element) => element.textContent === "this claim") ?? null;
+    const has = (className: string) =>
+      decoration()?.classList.contains(className) ?? false;
+
+    // `c1` is resolved: its anchor stays in the text with no standing highlight.
+    expect(decoration()).not.toBeNull();
+    expect(has("comment-decoration-resolved")).toBe(true);
+    expect(has("comment-decoration-active")).toBe(false);
+
+    // Selecting the folded card shows the text it refers to.
+    await click(byTestId(rail(container), "comment-threads-resolved-toggle"));
+    await click(byTestId(container, "resolved-comment-thread-c1"));
+    expect(has("comment-decoration-active")).toBe(true);
+    expect(has("comment-decoration-resolved")).toBe(false);
+
+    // Reopening makes it an open thread again, highlighted like any other.
+    vi.useFakeTimers();
+    await click(byTestId(container, "comment-rail-c1-action-reopen"));
+    await act(async () => {
+      vi.advanceTimersByTime(600);
+      await Promise.resolve();
+    });
+    expect(has("comment-decoration-resolved")).toBe(false);
+  });
+
   it("folds resolved global comments at the bottom of the global section", async () => {
     const { container } = await renderDocument(
       [

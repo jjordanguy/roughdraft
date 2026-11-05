@@ -522,6 +522,9 @@ const CriticChange = Mark.create({
 interface CommentHighlightMeta {
   selectedCommentId: string | null;
   hoveredCommentId: string | null;
+  // Resolved threads keep their anchor but lose the standing highlight; the
+  // text lights up again while the thread's card is selected or hovered.
+  resolvedCommentIds: ReadonlySet<string>;
 }
 
 interface CommentHighlightPluginState extends CommentHighlightMeta {
@@ -546,6 +549,7 @@ function createCommentHighlightDecorations(
   doc: ProseMirrorNode,
   selectedCommentId: string | null,
   hoveredCommentId: string | null,
+  resolvedCommentIds: ReadonlySet<string>,
 ) {
   const commentMarkType = doc.type.schema.marks.commentRef;
   const changeMarkType = doc.type.schema.marks.criticChange;
@@ -580,6 +584,8 @@ function createCommentHighlightDecorations(
       classNames.push("comment-decoration-active");
     } else if (isHovered) {
       classNames.push("comment-decoration-hovered");
+    } else if (commentIds.every((id) => resolvedCommentIds.has(id))) {
+      classNames.push("comment-decoration-resolved");
     }
 
     if (
@@ -606,6 +612,7 @@ function createCommentHighlightDecorations(
       doc,
       selectedCommentId,
       hoveredCommentId,
+      resolvedCommentIds,
     ),
   );
 
@@ -619,6 +626,7 @@ function createCodeCommentAnchorDecorations(
   doc: ProseMirrorNode,
   selectedCommentId: string | null,
   hoveredCommentId: string | null,
+  resolvedCommentIds: ReadonlySet<string>,
 ) {
   const decorations: Decoration[] = [];
 
@@ -659,6 +667,8 @@ function createCodeCommentAnchorDecorations(
         classNames.push("comment-decoration-active");
       } else if (hoveredCommentId === anchor.id) {
         classNames.push("comment-decoration-hovered");
+      } else if (resolvedCommentIds.has(anchor.id)) {
+        classNames.push("comment-decoration-resolved");
       }
 
       decorations.push(
@@ -687,10 +697,12 @@ const CommentHighlight = Extension.create({
           init: (_, state) => ({
             selectedCommentId: null,
             hoveredCommentId: null,
+            resolvedCommentIds: new Set<string>(),
             decorations: createCommentHighlightDecorations(
               state.doc,
               null,
               null,
+              new Set<string>(),
             ),
           }),
           apply: (tr, pluginState) => {
@@ -710,14 +722,20 @@ const CommentHighlight = Extension.create({
               meta !== undefined
                 ? meta.hoveredCommentId
                 : pluginState.hoveredCommentId;
+            const resolvedCommentIds =
+              meta !== undefined
+                ? meta.resolvedCommentIds
+                : pluginState.resolvedCommentIds;
 
             return {
               selectedCommentId,
               hoveredCommentId,
+              resolvedCommentIds,
               decorations: createCommentHighlightDecorations(
                 tr.doc,
                 selectedCommentId,
                 hoveredCommentId,
+                resolvedCommentIds,
               ),
             };
           },

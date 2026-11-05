@@ -34,6 +34,7 @@ import {
   getReviewBlockError,
   getReviewFormat,
   getThreadComments,
+  isResolvedComment,
   REVIEW_FORMAT_NOTICE,
   type ReviewFormat,
 } from "./critic-markup";
@@ -1863,6 +1864,25 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     refreshCriticChanges();
   }, [comments, hoveredCommentId, refreshCriticChanges, selectedCommentId]);
 
+  // The ids of resolved threads, as one string so the set below is rebuilt
+  // only when that list changes, not on every comment edit.
+  const resolvedCommentIdsKey = useMemo(
+    () =>
+      [...comments.values()]
+        .filter((comment) => isResolvedComment(comment))
+        .map((comment) => comment.id)
+        .sort()
+        .join("\n"),
+    [comments],
+  );
+  const resolvedCommentIds = useMemo(
+    () =>
+      new Set<string>(
+        resolvedCommentIdsKey ? resolvedCommentIdsKey.split("\n") : [],
+      ),
+    [resolvedCommentIdsKey],
+  );
+
   useEffect(() => {
     if (!editor) return;
 
@@ -1874,9 +1894,10 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
       editor.state.tr.setMeta(commentHighlightPluginKey, {
         selectedCommentId,
         hoveredCommentId: effectiveHoveredCommentId,
+        resolvedCommentIds,
       }),
     );
-  }, [editor, hoveredCommentId, selectedCommentId]);
+  }, [editor, hoveredCommentId, resolvedCommentIds, selectedCommentId]);
 
   useEffect(() => {
     if (!editor) return;

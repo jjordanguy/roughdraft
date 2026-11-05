@@ -142,6 +142,11 @@
     background-color: transparent;
   }
 
+  /* A resolved thread's text sits plain until its card is selected or hovered. */
+  .tiptap .comment-decoration.comment-decoration-resolved {
+    background-color: transparent;
+  }
+
   .tiptap .critic-change {
     box-decoration-break: clone;
     -webkit-box-decoration-break: clone;

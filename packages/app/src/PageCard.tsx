@@ -371,6 +371,19 @@ function areCommentIdListsEqual(
   return current.every((commentId, index) => commentId === next[index]);
 }
 
+// The comment ids a click or the caret may select: resolved threads are left
+// out, unless one of them is the thread already selected from its card.
+function openCommentIds(
+  commentIds: string[],
+  resolvedCommentIds: ReadonlySet<string>,
+  currentCommentId: string | null,
+): string[] {
+  return commentIds.filter(
+    (commentId) =>
+      !resolvedCommentIds.has(commentId) || commentId === currentCommentId,
+  );
+}
+
 function getSelectionCommentIds(editor: Editor | null): string[] {
   if (!editor) return [];
 
@@ -1644,9 +1657,41 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     };
   }, [editor, onEditorReady]);
 
+  // The ids of resolved threads, as one string so the set below is rebuilt
+  // only when that list changes, not on every comment edit.
+  const resolvedCommentIdsKey = useMemo(
+    () =>
+      [...comments.values()]
+        .filter((comment) => isResolvedComment(comment))
+        .map((comment) => comment.id)
+        .sort()
+        .join("\n"),
+    [comments],
+  );
+  const resolvedCommentIds = useMemo(
+    () =>
+      new Set<string>(
+        resolvedCommentIdsKey ? resolvedCommentIdsKey.split("\n") : [],
+      ),
+    [resolvedCommentIdsKey],
+  );
+
+  // Read by the anchor click and hover handlers, which are bound once.
+  const resolvedCommentIdsRef = useRef(resolvedCommentIds);
+  resolvedCommentIdsRef.current = resolvedCommentIds;
+
+  // The caret landing in a resolved thread's text does not select it; only
+  // its card does. A resolved thread already selected from its card stays.
   useEffect(() => {
     setSelectedCommentId((current) =>
-      getPreferredCommentId(activeCommentIds, current),
+      getPreferredCommentId(
+        openCommentIds(
+          activeCommentIds,
+          resolvedCommentIdsRef.current,
+          current,
+        ),
+        current,
+      ),
     );
   }, [activeCommentIds]);
 
@@ -1864,25 +1909,6 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
     refreshCriticChanges();
   }, [comments, hoveredCommentId, refreshCriticChanges, selectedCommentId]);
 
-  // The ids of resolved threads, as one string so the set below is rebuilt
-  // only when that list changes, not on every comment edit.
-  const resolvedCommentIdsKey = useMemo(
-    () =>
-      [...comments.values()]
-        .filter((comment) => isResolvedComment(comment))
-        .map((comment) => comment.id)
-        .sort()
-        .join("\n"),
-    [comments],
-  );
-  const resolvedCommentIds = useMemo(
-    () =>
-      new Set<string>(
-        resolvedCommentIdsKey ? resolvedCommentIdsKey.split("\n") : [],
-      ),
-    [resolvedCommentIdsKey],
-  );
-
   useEffect(() => {
     if (!editor) return;
 
@@ -1924,7 +1950,11 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         ".comment-anchor[data-comment-ids]",
       );
       if (!anchor || !root.contains(anchor)) return null;
-      const commentIds = parseCommentIds(anchor.dataset.commentIds);
+      const commentIds = openCommentIds(
+        parseCommentIds(anchor.dataset.commentIds),
+        resolvedCommentIdsRef.current,
+        selectedCommentIdRef.current,
+      );
       return commentIds.length > 0 ? { anchor, commentIds } : null;
     };
 

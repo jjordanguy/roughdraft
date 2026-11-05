@@ -332,6 +332,48 @@ describe("review rail from the comment map", () => {
     expect(has("comment-decoration-resolved")).toBe(false);
   });
 
+  it("ignores clicks and the caret on a resolved comment's text; only its card selects it", async () => {
+    const { container, getEditor } = await renderDocument(
+      fixture("canonical-document-comments"),
+    );
+    const activeTexts = () =>
+      [
+        ...getEditor().view.dom.querySelectorAll<HTMLElement>(
+          '[data-testid="comment-decoration"]',
+        ),
+      ]
+        .filter((element) =>
+          element.classList.contains("comment-decoration-active"),
+        )
+        .map((element) => element.textContent);
+
+    await click(
+      getEditor().view.dom.querySelector(
+        '.comment-anchor[data-comment-ids="[\\"c1\\"]"]',
+      ),
+    );
+    expect(activeTexts()).toEqual([]);
+    expect(byTestId(container, "resolved-comment-thread-c1")).toBeNull();
+
+    let caret = -1;
+    getEditor().state.doc.descendants((node, pos) => {
+      if (caret < 0 && node.isText && node.text?.includes("this claim")) {
+        caret = pos + (node.text?.indexOf("this claim") ?? 0) + 2;
+      }
+    });
+    expect(caret).toBeGreaterThan(0);
+    await act(async () => {
+      getEditor().commands.setTextSelection(caret);
+      await Promise.resolve();
+    });
+    expect(activeTexts()).toEqual([]);
+    expect(byTestId(container, "resolved-comment-thread-c1")).toBeNull();
+
+    await click(byTestId(rail(container), "comment-threads-resolved-toggle"));
+    await click(byTestId(container, "resolved-comment-thread-c1"));
+    expect(activeTexts()).toEqual(["this claim"]);
+  });
+
   it("folds resolved global comments at the bottom of the global section", async () => {
     const { container } = await renderDocument(
       [

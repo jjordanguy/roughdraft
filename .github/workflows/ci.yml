@@ -9,7 +9,9 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04 in November 2026 and Playwright
+    # 1.59 has no Chromium build for it, so the browser install step failed.
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
